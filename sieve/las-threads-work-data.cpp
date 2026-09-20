@@ -423,6 +423,15 @@ void nfs_work::prepare_for_new_q(las_info & las0, special_q_task * task, typenam
          */
         wss.lognorms = lognorm_smart(conf, las.cpoly, side, Q, conf.logI, J);
 
+        /* Rebuilt for every special-q, like lognorms itself: the
+         * approximation it evaluates depends on the q-lattice. */
+        if (las_gpu::engine()) {
+            wss.lognorms_gpu = std::make_unique<lognorm_gpu>(
+                    conf, las.cpoly, side, Q, conf.logI, J);
+        } else {
+            wss.lognorms_gpu.reset();
+        }
+
         if (las.no_fb(side)) {
             wss.fbs = nullptr;
             continue;

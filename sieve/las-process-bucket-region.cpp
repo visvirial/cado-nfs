@@ -306,7 +306,11 @@ void process_bucket_region_run::init_norms(int side)/*{{{*/
 
     int const N = first_region0_index + already_done + bucket_relative_index;
 
-    ws.sides[side].lognorms.fill(S[side], N);
+    nfs_work::side_data const & wss(ws.sides[side]);
+    if (wss.lognorms_gpu)
+        wss.lognorms_gpu->fill(S[side], N);
+    else
+        wss.lognorms.fill(S[side], N);
 
 #if defined(TRACE_K) 
     if (trace_on_spot_N(w->N))

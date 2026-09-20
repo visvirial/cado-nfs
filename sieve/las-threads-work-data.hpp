@@ -15,6 +15,7 @@
 #include "las-config.hpp"
 #include "las-dumpfile.hpp"
 #include "las-norms.hpp"
+#include "las-norms-gpu.hpp"
 #include "las-plattice.hpp"
 #include "las-siever-config.hpp"
 #include "las-smallsieve.hpp"
@@ -122,6 +123,19 @@ class nfs_work {
          *
          */
         lognorm_smart lognorms;
+
+        /* Same approximation as lognorms, but evaluated one cell at a
+         * time so that a device can do it. Non-null only when -gpu
+         * selected a backend. It is kept beside lognorms rather than
+         * replacing it because every other user of this member wants
+         * the scale, the bound, fij or norm(), none of which the
+         * offload changes.
+         *
+         * Note that the two do not agree exactly: lognorm_smart rounds
+         * per run of equal values, lognorm_gpu per cell, so the 8-bit
+         * logs may differ by one and the relation set with it.
+         */
+        std::unique_ptr<lognorm_gpu> lognorms_gpu;
 
         /* fbK depends on
          *      conf.logI

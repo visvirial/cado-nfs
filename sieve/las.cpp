@@ -54,6 +54,7 @@
 #include "las-duplicate.hpp"
 #include "las-fill-in-buckets.hpp"
 #include "las-globals.hpp"
+#include "gpu/las-gpu-select.hpp"
 #include "las-info.hpp"
 #include "las-multiobj-globals.hpp"
 #include "las-norms.hpp"
@@ -146,6 +147,8 @@ static void declare_usage(cxx_param_list & pl)/*{{{*/
     pl.declare_usage("exit-early", "once a relation has been found, go to next special-q (value==1), or exit (value==2)");
     pl.declare_usage("file-cofact", "provide file with strategies for the cofactorization step");
     pl.declare_usage("prepend-relation-time", "prefix all relation produced with time offset since beginning of special-q processing");
+    pl.declare_usage("gpu", "backend for the offloaded sieve stages"
+            " (none, cpu, cuda, cuda:<n>, auto); see sieve/gpu");
     pl.declare_usage("sync", "synchronize all threads at each special-q");
     pl.declare_usage("sync-thread-pool", "synchronize the thread pool (implies -t 1 !!)");
     where_am_I::decl_usage(pl);
@@ -1487,6 +1490,15 @@ int main (int argc0, char const * argv0[])/*{{{*/
     pl.parse("-sync", sync_at_special_q);
     pl.parse("-sync-thread-pool", sync_thread_pool);
     pl.parse("-never-discard", never_discard);
+
+    {
+        /* Throws if the spec names a backend we do not have, or a
+         * device we cannot open. Do it here, before any of the
+         * expensive setup, so that a typo costs nothing. */
+        std::string gpu_backend = "none";
+        pl.parse("gpu", gpu_backend);
+        las_gpu::select(gpu_backend);
+    }
 
     pl.parse("trialdiv-first-side", trialdiv_first_side);
     pl.parse("print-slice-statistics", print_slice_statistics);

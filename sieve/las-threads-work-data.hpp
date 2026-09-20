@@ -28,6 +28,8 @@
 class las_memory_accessor; // IWYU pragma: keep
 class nfs_aux; // IWYU pragma: keep
 class thread_pool; // IWYU pragma: keep
+struct gpu_engine; // IWYU pragma: keep
+struct gpu_survivor_task; // IWYU pragma: keep
 struct j_divisibility_helper; // IWYU pragma: keep
 struct las_info; // IWYU pragma: keep
 struct trialdiv_data; // IWYU pragma: keep
@@ -259,6 +261,22 @@ class nfs_work {
          * TODO: that makes three 64kb memory areas per thread, which
          * might be overkill ?
          */
+
+        /* Survivor-search task for the backend selected by -gpu, and
+         * the buffer its results land in. A task owns device memory, so
+         * it cannot be shared between threads; building one is
+         * expensive, so we keep it across the bucket regions of a
+         * special-q and rebuild only when J changes. ws.jd is cached by
+         * las_info per J, so its address identifies J.
+         */
+        gpu_survivor_task * gpu_survivors = nullptr;
+        gpu_engine * gpu_survivors_engine = nullptr;
+        void const * gpu_survivors_jd = nullptr;
+        std::vector<uint32_t> gpu_survivors_buf;
+
+        /* nullptr when no backend is selected. */
+        gpu_survivor_task * get_gpu_survivor_task();
+        void release_gpu_survivor_task();
 
         thread_data(nfs_work &);
 

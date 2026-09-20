@@ -99,10 +99,18 @@ struct cuda_norm_task {
     size_t d_S_bytes = 0;
 };
 
+/* How many survivors we fetch without being asked twice. A 64kB region
+ * yields a few hundred at the densities las actually sieves at, so this
+ * covers it with room to spare; the slow path below catches the rest.
+ */
+#define CUDA_SURVIVOR_PREFETCH 4096
+
 struct cuda_survivor_task {
     gpu_jdiv_entry * d_jdiv = nullptr;
     uint32_t jdiv_size = 0;
 
+    /* One allocation for both sides, so that the two sieve arrays go up
+     * in a single transfer. d_S1 is just d_S0 + capacity. */
     unsigned char * d_S0 = nullptr;
     unsigned char * d_S1 = nullptr;
     uint8_t * d_flags = nullptr;
@@ -111,6 +119,17 @@ struct cuda_survivor_task {
     void * d_temp = nullptr;
     size_t d_temp_bytes = 0;
     size_t capacity = 0;
+
+    /* Everything below exists so that one call costs one synchronisation.
+     * Staging through page-locked memory is what lets the copies be
+     * issued asynchronously; a transfer from pageable memory would be
+     * staged by the driver anyway, and would block.
+     */
+    cudaStream_t stream = nullptr;
+    unsigned char * h_stage = nullptr;  /* 2*capacity, upload */
+    unsigned char * h_Sf = nullptr;     /* capacity, download */
+    uint32_t * h_out = nullptr;         /* CUDA_SURVIVOR_PREFETCH */
+    uint32_t * h_num = nullptr;         /* 1 */
 };
 
 /* }}} */
@@ -200,11 +219,22 @@ struct cuda_engine : public gpu_engine {
         CUDA_CHECK(cudaMemcpy(t->d_jdiv, jdiv, jbytes, cudaMemcpyHostToDevice));
 
         t->capacity = max_region_size;
-        CUDA_CHECK(cudaMalloc(&t->d_S0, max_region_size));
-        CUDA_CHECK(cudaMalloc(&t->d_S1, max_region_size));
+        CUDA_CHECK(cudaMalloc(&t->d_S0, 2 * max_region_size));
+        t->d_S1 = t->d_S0 + max_region_size;
         CUDA_CHECK(cudaMalloc(&t->d_flags, max_region_size));
         CUDA_CHECK(cudaMalloc(&t->d_out, max_region_size * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&t->d_num, sizeof(uint32_t)));
+
+        CUDA_CHECK(cudaStreamCreate(&t->stream));
+        CUDA_CHECK(cudaHostAlloc(&t->h_stage, 2 * max_region_size,
+                                 cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&t->h_Sf, max_region_size,
+                                 cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&t->h_out,
+                                 CUDA_SURVIVOR_PREFETCH * sizeof(uint32_t),
+                                 cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&t->h_num, sizeof(uint32_t),
+                                 cudaHostAllocDefault));
 
         /* cub wants to be told how much scratch it needs. */
         thrust::counting_iterator<uint32_t> const indices(0);
@@ -223,12 +253,17 @@ struct cuda_engine : public gpu_engine {
             return;
         cudaSetDevice(device);
         cudaFree(t->d_jdiv);
-        cudaFree(t->d_S0);
-        cudaFree(t->d_S1);
+        cudaFree(t->d_S0);      /* d_S1 points inside this one */
         cudaFree(t->d_flags);
         cudaFree(t->d_out);
         cudaFree(t->d_num);
         cudaFree(t->d_temp);
+        cudaFreeHost(t->h_stage);
+        cudaFreeHost(t->h_Sf);
+        cudaFreeHost(t->h_out);
+        cudaFreeHost(t->h_num);
+        if (t->stream)
+            cudaStreamDestroy(t->stream);
         delete t;
     }
 
@@ -248,12 +283,27 @@ struct cuda_engine : public gpu_engine {
             abort();
         }
 
-        if (S0)
-            CUDA_CHECK(cudaMemcpy(t->d_S0, S0, region_size,
-                                  cudaMemcpyHostToDevice));
-        if (S1)
-            CUDA_CHECK(cudaMemcpy(t->d_S1, S1, region_size,
-                                  cudaMemcpyHostToDevice));
+        /* Stage both sides into one page-locked block and send them up
+         * together: two 64kB transfers cost appreciably more than one
+         * of 128kB, and the whole point here is the per-call overhead,
+         * not the bandwidth. */
+        cudaStream_t const stream = t->stream;
+        if (S0 && S1) {
+            /* contiguous on both ends, so this is a single transfer */
+            memcpy(t->h_stage, S0, region_size);
+            memcpy(t->h_stage + t->capacity, S1, region_size);
+            CUDA_CHECK(cudaMemcpyAsync(t->d_S0, t->h_stage,
+                                       t->capacity + region_size,
+                                       cudaMemcpyHostToDevice, stream));
+        } else if (S0 || S1) {
+            unsigned char const * const src = S0 ? S0 : S1;
+            unsigned char * const dst = S0 ? t->d_S0 : t->d_S1;
+            unsigned char * const stage =
+                S0 ? t->h_stage : t->h_stage + t->capacity;
+            memcpy(stage, src, region_size);
+            CUDA_CHECK(cudaMemcpyAsync(dst, stage, region_size,
+                                       cudaMemcpyHostToDevice, stream));
+        }
 
         gpu_survivor_tables tables {};
         tables.jdiv = t->d_jdiv;
@@ -264,7 +314,7 @@ struct cuda_engine : public gpu_engine {
         if (grid > 65535)
             grid = 65535;
 
-        kernel_survivor_flags<<<grid, block>>>(
+        kernel_survivor_flags<<<grid, block, 0, stream>>>(
             S0 ? t->d_S0 : nullptr, S1 ? t->d_S1 : nullptr, t->d_flags,
             uint32_t(region_size), region, tables);
         CUDA_CHECK(cudaGetLastError());
@@ -274,22 +324,42 @@ struct cuda_engine : public gpu_engine {
         thrust::counting_iterator<uint32_t> const indices(0);
         CUDA_CHECK(cub::DeviceSelect::Flagged(t->d_temp, t->d_temp_bytes,
                                               indices, t->d_flags, t->d_out,
-                                              t->d_num, int(region_size)));
-
-        uint32_t n = 0;
-        CUDA_CHECK(cudaMemcpy(&n, t->d_num, sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost));
+                                              t->d_num, int(region_size),
+                                              stream));
 
         /* Only the Sf side is modified by the kernel. */
         unsigned char * const Sf = region.side_of_Sf == 0 ? S0 : S1;
         unsigned char const * const d_Sf =
             region.side_of_Sf == 0 ? t->d_S0 : t->d_S1;
-        CUDA_CHECK(cudaMemcpy(Sf, d_Sf, region_size, cudaMemcpyDeviceToHost));
+
+        /* Queue the count, the markers and a first helping of survivors
+         * in one go. Reading the count first, as the obvious version
+         * does, costs a full round trip before the other two can even be
+         * issued -- three synchronisations per bucket region instead of
+         * one, which at this granularity is most of the cost. */
+        size_t const prefetch = out_capacity < CUDA_SURVIVOR_PREFETCH
+                              ? out_capacity : CUDA_SURVIVOR_PREFETCH;
+        CUDA_CHECK(cudaMemcpyAsync(t->h_num, t->d_num, sizeof(uint32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(t->h_Sf, d_Sf, region_size,
+                                   cudaMemcpyDeviceToHost, stream));
+        if (prefetch)
+            CUDA_CHECK(cudaMemcpyAsync(t->h_out, t->d_out,
+                                       prefetch * sizeof(uint32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        uint32_t const n = *t->h_num;
+        memcpy(Sf, t->h_Sf, region_size);
 
         size_t const ncopy = n < out_capacity ? n : out_capacity;
-        if (ncopy)
+        if (ncopy <= prefetch) {
+            memcpy(out, t->h_out, ncopy * sizeof(uint32_t));
+        } else {
+            /* Rare enough that a second round trip does not matter. */
             CUDA_CHECK(cudaMemcpy(out, t->d_out, ncopy * sizeof(uint32_t),
                                   cudaMemcpyDeviceToHost));
+        }
         return n;
     }
 };

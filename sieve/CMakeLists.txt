@@ -190,7 +190,7 @@ add_subdirectory(strategies)
 add_executable(dupsup dupsup.cpp las-where-am-i-prod.cpp)
 cado_apply_pch(dupsup)
 target_link_libraries(dupsup PRIVATE
-    las_multi_a_descent las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
+    las_gpu las_multi_a_descent las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
 
 add_executable(fake_rels EXCLUDE_FROM_ALL fake_rels.cpp)
 cado_apply_pch(fake_rels)

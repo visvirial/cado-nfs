@@ -19,6 +19,10 @@
 #include "las-special-q-task.hpp"
 #include "macros.h"
 #include "threadpool.hpp"
+#include "gpu/las-gpu-engine.hpp"
+#include "gpu/las-gpu-plan.hpp"
+#include "gpu/las-gpu-select.hpp"
+#include "las-unsieve.hpp"
 #include "verbose.hpp"
 
 class nfs_aux; // IWYU pragma: keep
@@ -26,11 +30,17 @@ class nfs_aux; // IWYU pragma: keep
 nfs_work::thread_data::thread_data(thread_data && o) noexcept
     : ws(o.ws),
     sides(std::move(o.sides)),
-    SS(o.SS)
+    SS(o.SS),
+    gpu_survivors(o.gpu_survivors),
+    gpu_survivors_engine(o.gpu_survivors_engine),
+    gpu_survivors_jd(o.gpu_survivors_jd),
+    gpu_survivors_buf(std::move(o.gpu_survivors_buf))
 {
     for(auto & s: o.sides)
         s.bucket_region = nullptr;
     o.SS = nullptr;
+    /* the task is owned by exactly one thread_data at a time */
+    o.gpu_survivors = nullptr;
 }
 
 #if 0
@@ -82,6 +92,49 @@ nfs_work::thread_data::~thread_data()
     }
     ws.local_memory.free_bucket_region(SS);
     SS = nullptr;
+    release_gpu_survivor_task();
+}
+
+void nfs_work::thread_data::release_gpu_survivor_task()
+{
+    if (!gpu_survivors)
+        return;
+    gpu_survivors_engine->survivor_task_destroy(gpu_survivors);
+    gpu_survivors = nullptr;
+    gpu_survivors_engine = nullptr;
+    gpu_survivors_jd = nullptr;
+}
+
+gpu_survivor_task * nfs_work::thread_data::get_gpu_survivor_task()
+{
+    gpu_engine * const e = las_gpu::engine();
+    if (!e)
+        return nullptr;
+
+    if (gpu_survivors && gpu_survivors_engine == e && gpu_survivors_jd == ws.jd)
+        return gpu_survivors;
+
+    release_gpu_survivor_task();
+
+    /* Mirror the whole helper, not just the first ws.J entries of it.
+     * las_info caches it under J rounded up to a power of two, so two
+     * special-q's with different ws.J share one helper -- and a table
+     * cut to the smaller ws.J would then be indexed out of bounds by
+     * the larger one, since the kernel looks up jdiv[j] directly.
+     */
+    uint32_t const jdiv_size = uint32_t(ws.jd->entries.size());
+    ASSERT_ALWAYS(ws.J <= jdiv_size);
+    std::vector<gpu_jdiv_entry> tab(jdiv_size);
+    for(uint32_t k = 0 ; k < jdiv_size ; k++) {
+        j_divisibility_helper::entry const & e2 = (*ws.jd)[int(k)];
+        tab[k] = { e2.p, e2.cof, e2.inv, e2.bound };
+    }
+
+    gpu_survivors = e->survivor_task_create(tab.data(), jdiv_size,
+                                            size_t(1) << LOG_BUCKET_REGION);
+    gpu_survivors_engine = e;
+    gpu_survivors_jd = ws.jd;
+    return gpu_survivors;
 }
 
 /* only used once a siever_config has been attached to the parent structure */

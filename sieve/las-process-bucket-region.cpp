@@ -28,6 +28,9 @@
 
 #include "gmp_aux.h"
 #include "las-process-bucket-region.hpp"
+#include "gpu/las-gpu-engine.hpp"
+#include "gpu/las-gpu-plan.hpp"
+#include "gpu/las-gpu-select.hpp"
 #include "bucket.hpp"
 #include "fb.hpp"
 #include "las-apply-buckets.hpp"
@@ -455,6 +458,58 @@ process_bucket_region_run::survivors_t process_bucket_region_run::search_survivo
     const int i1 = i0 + (1 << MIN(LOG_BUCKET_REGION, logI));
 
     ASSERT(j1 > j0); /* even when we have a line fragment */
+
+    /* {{{ offloaded path, when -gpu asked for one.
+     *
+     * The kernel does the whole bucket region in one go -- coprimality
+     * marking and compaction together -- and returns the survivors in
+     * the same increasing order as the loop below, with offsets already
+     * relative to the region. So it replaces the loop wholesale, line
+     * offsets included.
+     */
+    if (gpu_survivor_task * const gtask = tws.get_gpu_survivor_task()) {
+        gpu_engine * const eng = las_gpu::engine();
+
+        bool const has0 = S[0] != nullptr;
+        bool const has1 = S.size() > 1 && S[1] != nullptr;
+        ASSERT_ALWAYS(has0 || has1);
+
+        gpu_survivor_region R {};
+        R.nsides = (has0 && has1) ? 2 : 1;
+        /* search_survivors_in_line() writes its 255 markers into SS[0]
+         * when it has it, and falls back to SS[1] otherwise. */
+        R.side_of_Sf = has0 ? 0 : 1;
+        R.bound[0] = ws.sides[0].lognorms.bound;
+        R.bound[1] = ws.sides[S.size() > 1 ? 1 : 0].lognorms.bound;
+        R.logI = logI;
+        R.td_max = ws.conf.unsieve_thresh;
+        R.sublat_m = Q.sublat.m;
+        R.sublat_i0 = Q.sublat.i0;
+        R.sublat_j0 = Q.sublat.j0;
+        R.geo.i0 = i0;
+        R.geo.i1 = i1;
+        R.geo.j0 = j0;
+        R.geo.j1 = j1;
+        R.geo.I = I;
+        R.geo.has_origin = (j0 == 0) &&
+            (region_rank_in_line == (regions_per_line - 1) / 2);
+
+        size_t const region_size = size_t(1) << LOG_BUCKET_REGION;
+        /* A region cannot yield more survivors than it has cells, so
+         * sizing the buffer once removes any need to retry. */
+        auto & buf = tws.gpu_survivors_buf;
+        if (buf.size() < region_size)
+            buf.resize(region_size);
+
+        size_t const n = eng->survivor_search(gtask,
+                has0 ? S[0] : nullptr,
+                has1 ? S[1] : nullptr,
+                region_size, R, buf.data(), buf.size());
+        ASSERT_ALWAYS(n <= buf.size());
+
+        return { buf.begin(), buf.begin() + ptrdiff_t(n) };
+    }
+    /* }}} */
 
     for (unsigned int j = j0; j < j1; j++)
     {

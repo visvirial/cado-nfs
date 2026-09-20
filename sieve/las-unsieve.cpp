@@ -281,6 +281,13 @@ unsieve_not_coprime_line(unsigned char * line_start,
                          unsieve_data const & us)
 {
   unsigned int p, c=j;
+  /* start_idx must be computed in *signed* arithmetic: p is unsigned, so
+   * a bare (-i0) % p would promote -i0 to unsigned and give the wrong
+   * residue class for every line fragment that starts at i0 > 0, i.e.
+   * for the right half of each line when logI > LOG_BUCKET_REGION. The
+   * mod-3 and mod-5 bound patterns in las-unsieve-sse2.cpp use an int
+   * literal as the modulus and have always been right, so the two used
+   * to disagree about which cells have gcd(i,j) > 1. */
   int start_idx;
 
   if (j == 0)
@@ -294,7 +301,7 @@ unsieve_not_coprime_line(unsigned char * line_start,
       p = us.entries[c].lpf; /* set p to largest prime factor of c */
       if (p < min_p)
         return;
-      start_idx = (-i0) % p; if (start_idx < 0) start_idx += p;
+      start_idx = (-i0) % int(p); if (start_idx < 0) start_idx += int(p);
       c = us.entries[c].cof;
       if (p <= 7)
         break;
@@ -305,7 +312,7 @@ unsieve_not_coprime_line(unsigned char * line_start,
     {
       unsieve_7(line_start, start_idx, i1 - i0, us);
       p = us.entries[c].lpf;
-      start_idx = (-i0) % p; if (start_idx < 0) start_idx += p;
+      start_idx = (-i0) % int(p); if (start_idx < 0) start_idx += int(p);
       c = us.entries[c].cof;
     }
 
@@ -316,7 +323,7 @@ unsieve_not_coprime_line(unsigned char * line_start,
     {
       unsieve_5(line_start, start_idx, i1 - i0, us);
       p = us.entries[c].lpf;
-      start_idx = (-i0) % p; if (start_idx < 0) start_idx += p;
+      start_idx = (-i0) % int(p); if (start_idx < 0) start_idx += int(p);
       c = us.entries[c].cof;
     }
 

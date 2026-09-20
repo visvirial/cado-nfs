@@ -316,8 +316,21 @@ struct small_sieve_base {/*{{{*/
             jj += sublatm;
             i0ref = (-I()/2);
         }
-        spos_t x = (spos_t)jj * (spos_t)ssp.get_r();
-        x = fix_sublat_i(x, ssp.get_p());
+        /* jj*r exceeds 2^31 for the largest power-of-two ssp on the far
+         * lines of a large-I run, and computing it in spos_t is signed
+         * overflow. That is not harmless: having been told the product
+         * cannot overflow, the compiler keeps it in 64 bits and passes
+         * it to fix_sublat_i() untruncated, which is what trips the
+         * ASSERT there rather than any wraparound we could live with.
+         *
+         * Only the value mod p matters below -- p is a power of two and
+         * the next line is a mask -- and fix_sublat_i() moves its result
+         * by a multiple of p when its argument moves by a multiple of
+         * p*sublatm. So reduce, in 64 bits, before narrowing.
+         */
+        int64_t xx = int64_t(jj) * int64_t(ssp.get_r());
+        xx %= int64_t(ssp.get_p()) * sublatm;
+        spos_t x = fix_sublat_i(xx, ssp.get_p());
         x = (x - i0ref) & (ssp.get_p() - 1);
         if (x < 0) x += ssp.get_p();
         /* our target is position x in the bucket region which starts

@@ -209,6 +209,9 @@
 
 #cmakedefine HAVE_LIBSTDCXX_BUG_114153
 
+/* set when the CUDA backend of the sieve (sieve/gpu) was compiled in */
+#cmakedefine HAVE_CUDA
+
 /* see also select_mpi.h for c++ templates meant to help in determining mpi type tags */
 
 /* vim:set ft=c: */

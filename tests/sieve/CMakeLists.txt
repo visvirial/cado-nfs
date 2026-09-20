@@ -578,6 +578,7 @@ cado_define_test(test_logapprox.cpp
 cado_define_test(test_init_norms.cpp
     ${PROJECT_SOURCE_DIR}/sieve/las-multiobj-globals.cpp
     ${PROJECT_SOURCE_DIR}/sieve/las-config.cpp
+    $<TARGET_OBJECTS:las_gpu>
     $<TARGET_OBJECTS:las_core_b0>
     $<TARGET_OBJECTS:las_core_a>
     $<TARGET_OBJECTS:las_core_0>
@@ -585,6 +586,10 @@ cado_define_test(test_init_norms.cpp
     LIBRARIES utils tests
     TIMEOUT 40
 )
+target_include_directories(test_init_norms PRIVATE ${PROJECT_SOURCE_DIR}/sieve)
+if(HAVE_CUDA)
+    target_link_libraries(test_init_norms PRIVATE $<TARGET_OBJECTS:las_gpu_cuda> CUDA::cudart)
+endif()
 
 cado_divert_test(test_init_norms c120_basic
     ARGUMENTS
@@ -701,6 +706,106 @@ cado_divert_test(test_init_norms bug30107
     --check-bucket 127
     --abort-on-jitter 0,5 -B 16
 )
+
+# {{{ offloaded norm initialisation
+#
+# lognorm_gpu evaluates the very same piecewise-linear approximation as
+# lognorm_smart, but one cell at a time instead of one run at a time, so
+# the two may disagree by one unit on the cells where a run boundary
+# falls -- the same kind of disagreement that lognorm_smart already has
+# with lognorm_reference, and a much rarer one: in these tests all but a
+# couple of cells out of a million agree exactly.
+#
+# The backend defaults to "cpu", which shares its kernels with the CUDA
+# one; the cuda diversions below therefore check the device, not the
+# arithmetic.
+cado_divert_test(test_init_norms gpu
+    ARGUMENTS
+        -poly ${CMAKE_CURRENT_SOURCE_DIR}/c120.poly
+        -I 12 -lpb0 26 -lpb1 26
+        -mfb0 28 -mfb1 28
+        -q0 15350000 -q1 15360000
+        -random-sample 10
+        -random-seed 0
+        -sqside 1
+        --norm-impls smart,gpu
+        --nfills-speed-test 0
+        --abort-on-jitter 1,1
+    AVOID_CONCURRENT 2
+)
+
+# logI > LOG_BUCKET_REGION, i.e. bucket regions that are line fragments.
+cado_divert_test(test_init_norms gpu_I17
+    ARGUMENTS
+        -poly ${CMAKE_CURRENT_SOURCE_DIR}/rsa220.poly
+        -I 17 -lpb0 34 -lpb1 34 -mfb0 68 -mfb1 102
+        -q0 4000000000 -q1 4001000000
+        -random-sample 10
+        -random-seed 0
+        -sqside 1
+        --norm-impls smart,gpu
+        --nfills-speed-test 0
+        --abort-on-jitter 1,1
+    AVOID_CONCURRENT 2
+)
+
+# bug21684 gives constant approximating functions, which is a separate
+# branch of fill_rat_inner().
+cado_divert_test(test_init_norms gpu_21684
+    ARGUMENTS
+        -poly ${CMAKE_CURRENT_SOURCE_DIR}/c95_21684.poly
+        -I 13 -lpb0 24 -lpb1 25 -mfb0 48 -mfb1 50
+        -q0 310087 -rho 178382
+        -sqside 1
+        --norm-impls smart,gpu
+        --nfills-speed-test 0
+        --abort-on-jitter 1,1
+)
+
+if(HAVE_CUDA)
+    cado_divert_test(test_init_norms_gpu cuda APPEND_ARGUMENTS -gpu cuda)
+    cado_divert_test(test_init_norms_gpu_I17 cuda APPEND_ARGUMENTS -gpu cuda)
+    cado_divert_test(test_init_norms_gpu_21684 cuda APPEND_ARGUMENTS -gpu cuda)
+endif()
+# }}}
+
+# {{{ offloaded survivor search
+set(test_survivors_gpu_extra_sources
+    ${PROJECT_SOURCE_DIR}/sieve/las-unsieve.cpp
+    ${PROJECT_SOURCE_DIR}/sieve/las-config.cpp
+    ${PROJECT_SOURCE_DIR}/sieve/las-multiobj-globals.cpp
+)
+if(HAVE_SSE2)
+    list(APPEND test_survivors_gpu_extra_sources
+        ${PROJECT_SOURCE_DIR}/sieve/las-unsieve-sse2.cpp)
+endif()
+if(HAVE_AVX2)
+    list(APPEND test_survivors_gpu_extra_sources
+        ${PROJECT_SOURCE_DIR}/sieve/las-unsieve-avx2.cpp)
+endif()
+cado_define_test(test_survivors_gpu.cpp
+    ${test_survivors_gpu_extra_sources}
+    $<TARGET_OBJECTS:las_gpu>
+    $<TARGET_OBJECTS:las_core_b0>
+    $<TARGET_OBJECTS:las_core_a>
+    $<TARGET_OBJECTS:las_core_0>
+    LIBRARIES utils tests
+    TIMEOUT 120
+)
+target_include_directories(test_survivors_gpu PRIVATE ${PROJECT_SOURCE_DIR}/sieve)
+if(HAVE_CUDA)
+    target_link_libraries(test_survivors_gpu PRIVATE $<TARGET_OBJECTS:las_gpu_cuda> CUDA::cudart)
+endif()
+# the survivor search has a separate code path for the case where a
+# bucket region is only a fragment of a line.
+cado_divert_test(test_survivors_gpu B13 ARGUMENTS -B 13)
+cado_divert_test(test_survivors_gpu B14 ARGUMENTS -B 14 -seed 12345)
+if(HAVE_CUDA)
+    cado_divert_test(test_survivors_gpu cuda ARGUMENTS -gpu cuda)
+    cado_divert_test(test_survivors_gpu_B13 cuda APPEND_ARGUMENTS -gpu cuda)
+    cado_divert_test(test_survivors_gpu_B14 cuda APPEND_ARGUMENTS -gpu cuda)
+endif()
+# }}}
 
 # we have no pretense to have optimized code for these cases, so don't
 # bother.

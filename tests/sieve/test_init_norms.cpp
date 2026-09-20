@@ -21,6 +21,8 @@
 #include "las-config.hpp"
 #include "las-coordinates.hpp"
 #include "las-norms.hpp"
+#include "las-norms-gpu.hpp"
+#include "gpu/las-gpu-select.hpp"
 #include "las-siever-config.hpp"
 #include "special-q.hpp"
 #include "macros.h"
@@ -122,6 +124,7 @@ static void declare_usage(cxx_param_list & pl)/*{{{*/
   pl.declare_usage("nfills-speed-test",    "number of bucket region norm fills to simulate per special q");
   pl.declare_usage("norm-sides",    "on which sides we should check norms\n");
   pl.declare_usage("norm-impls",    "which norm implementations we should check\n");
+  pl.declare_usage("gpu",    "backend used by the 'gpu' norm implementation (none, cpu, cuda, cuda:<n>, auto)");
   pl.declare_usage("hush-max-jitter",    "as its name says, do not bother reporting when jitter is below this threshold");
   pl.declare_usage("abort-on-jitter",    "exit with failure if jitter exceeds thresholds (one per side)");
 
@@ -193,6 +196,12 @@ int main(int argc, char const * argv[])
         fprintf(stderr, "Error: please provide a full set of {lim,mfb,lpb}{0,1} parameters\n");
         pl.print_usage(stderr);
         exit(EXIT_FAILURE);
+    }
+
+    {
+        std::string gpu_backend = "cpu";
+        pl.parse("gpu", gpu_backend);
+        las_gpu::select(gpu_backend);
     }
 
     cxx_gmp_randstate rstate;
@@ -321,6 +330,8 @@ int main(int argc, char const * argv[])
                 } else if (s == "smart") {
                     lognorms[c][side] = std::make_unique<lognorm_smart>(conf, cpoly, side, Adj.Q, Adj.logI, Adj.J);
                     impl_stats[c][side] += dynamic_cast<lognorm_smart*>(lognorms[c][side].get())->G.endpoints.size();
+                } else if (s == "gpu") {
+                    lognorms[c][side] = std::make_unique<lognorm_gpu>(conf, cpoly, side, Adj.Q, Adj.logI, Adj.J);
                 } else {
                     fprintf(stderr, "no such implementation: %s\n", s.c_str());
                     exit(EXIT_FAILURE);

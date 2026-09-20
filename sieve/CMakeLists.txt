@@ -74,6 +74,40 @@ add_library(las_core_b OBJECT
 )
 cado_apply_pch(las_core_b)
 
+# {{{ offloaded sieve stages (norm initialisation, survivor search)
+#
+# las_gpu always provides the "cpu" backend, which is the portable
+# reference implementation of the kernels and doubles as the oracle that
+# the device code is tested against. The CUDA backend is compiled in
+# only when configured with ENABLE_CUDA=1 (see config/cuda.cmake).
+#
+# -ffp-contract=off is not cosmetic: the whole design rests on the two
+# backends evaluating the same expressions bit for bit, and an fma
+# contraction on one side only would move the last bit of the lognorms.
+add_library(las_gpu OBJECT
+        gpu/las-gpu-cpu.cpp
+        gpu/las-gpu-select.cpp
+        las-norms-gpu.cpp
+)
+target_include_directories(las_gpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/gpu)
+target_link_libraries(las_gpu PUBLIC las_core_b0 las_core_a utils)
+target_compile_options(las_gpu PRIVATE -ffp-contract=off)
+cado_apply_pch(las_gpu)
+
+if(HAVE_CUDA)
+    add_library(las_gpu_cuda OBJECT gpu/las-gpu-cuda.cu)
+    target_include_directories(las_gpu_cuda PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/gpu)
+    target_link_libraries(las_gpu_cuda PUBLIC CUDA::cudart)
+    target_link_libraries(las_gpu PUBLIC las_gpu_cuda CUDA::cudart)
+    # An object library that links another object library gets its usage
+    # requirements but *not* its object files, and the omission is only
+    # diagnosed at link time in whoever consumes las_gpu. Hand the device
+    # objects down through the interface instead.
+    target_sources(las_gpu INTERFACE $<TARGET_OBJECTS:las_gpu_cuda>)
+endif()
+# }}}
+
 add_library(las_core_c OBJECT las-arith.cpp)
 target_link_libraries(las_core_c PUBLIC las_core_b)
 cado_apply_pch(las_core_c)
@@ -119,7 +153,7 @@ add_executable(las
     las.cpp
     )
 target_link_libraries(las PRIVATE
-    las_multi_a_prod las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
+    las_gpu las_multi_a_prod las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
 cado_apply_pch(las)
 
 add_executable(las_tracek
@@ -127,25 +161,25 @@ add_executable(las_tracek
     las.cpp
     )
 target_link_libraries(las_tracek PRIVATE
-    las_multi_a_debug las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
+    las_gpu las_multi_a_debug las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
 cado_apply_pch(las_tracek)
 set_property(TARGET las_tracek PROPERTY COMPILE_DEFINITIONS TRACE_K=1)
 
 add_executable(siqs las-where-am-i-prod.cpp las.cpp)
 target_link_libraries(siqs PRIVATE
-    siqs_multi_a_prod las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
+    las_gpu siqs_multi_a_prod las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
 cado_apply_pch(siqs)
 set_property(TARGET siqs PROPERTY COMPILE_DEFINITIONS SUPPORT_LARGE_Q=1 SIQS_SIEVE=1)
 
 add_executable(siqs_tracek las-where-am-i-debug.cpp las.cpp)
 target_link_libraries(siqs_tracek PRIVATE
-    siqs_multi_a_debug las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
+    las_gpu siqs_multi_a_debug las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
 cado_apply_pch(siqs_tracek)
 set_property(TARGET siqs_tracek PROPERTY COMPILE_DEFINITIONS SUPPORT_LARGE_Q=1 SIQS_SIEVE=1 TRACE_K=1)
 
 add_executable(las_descent las-where-am-i-prod.cpp las.cpp)
 target_link_libraries(las_descent PRIVATE
-    las_multi_a_descent las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
+    las_gpu las_multi_a_descent las_core_c las_core_b las_core_b0 las_core_a las_core_0 trialdiv facul utils)
 cado_apply_pch(las_descent)
 set_property(TARGET las_descent PROPERTY COMPILE_DEFINITIONS DLP_DESCENT SUPPORT_LARGE_Q)
 

@@ -1,4 +1,0 @@
-[submodule "ci"]
-	path = ci/ci
-	url = https://gitlab.inria.fr/thome/ci-backend.git
-	branch = main

@@ -8,6 +8,8 @@
 #include "gmp_aux.h"
 #include "parallelizing_info.hpp"
 #include "arith-generic.hpp"
+#include "bwc_device_arena.hpp"
+#include "bwc_file.hpp"
 #include "macros.h"
 
 struct matmul_top_data;
@@ -58,7 +60,7 @@ struct mmt_vec {
     mmt_vec(matmul_top_data & mmt, arith_generic * abase, pi_datatype * pitype, int d, int flags, unsigned int n);
     mmt_vec(mmt_vec const &) = delete;
     mmt_vec& operator=(mmt_vec const &) = delete;
-    ~mmt_vec() = default;
+    ~mmt_vec() { if (owned_v) bwc_dev_unregister(owned_v.get()); }
 
     mmt_vec& operator=(mmt_vec &&) = delete;
 
@@ -115,10 +117,60 @@ extern void matmul_top_fill_random_source_generic(matmul_top_data & mmt, size_t 
 #endif
 extern int mmt_vec_load(mmt_vec & v, std::string const & name, unsigned int itemsondisk, unsigned int block_position) ATTRIBUTE_WARN_UNUSED_RESULT;
 extern int mmt_vec_save(mmt_vec & v, std::string const & name, unsigned int itemsondisk, unsigned int block_position);
+/* the files that mmt_vec_save writes; data is at the leader only */
+extern std::vector<bwc_file> mmt_vec_gather(mmt_vec & v, std::string const & name, unsigned int itemsondisk, unsigned int block_position);
+/* its two halves, as pi_gather_stage and pi_gather_exchange: the pieces
+ * of the job (thread 0; the other threads get empty data), then the
+ * exchange over comm that thread 0 of every job runs, in a thread of
+ * its own if it likes */
+struct mmt_vec_staged {
+    std::vector<bwc_file> files;
+    size_t outsize;
+    int d;
+};
+extern mmt_vec_staged mmt_vec_stage(mmt_vec & v, std::string const & name, unsigned int itemsondisk, unsigned int block_position);
+extern std::vector<bwc_file> mmt_vec_exchange(parallelizing_info & pi, MPI_Comm comm, mmt_vec_staged st);
+/* f holds the 64-bit items of a gathered twisted vector; it becomes the
+ * unpadded items of the untwisted vector (perm from mmt_untwist_perm) */
+extern void mmt_vec_untwist_file(bwc_file & f, std::vector<uint32_t> const & perm, size_t unpadded);
 extern void mmt_vec_clear_padding(mmt_vec & v, size_t unpadded, size_t padded);
 
 static inline int mmt_vec_is_shared(mmt_vec const & v) {
     return v.siblings.get() == nullptr;
+}
+
+/* device arena coherence, for host code around the vector data; both
+ * are no-ops when no arena covers the vector (bwc_device_arena.hpp).
+ * The threads of the wiring share one buffer and one arena when the
+ * vector is shared, so only thread 0 touches the arena; every call
+ * site serializes the threads before another thread reads the data. */
+static inline void mmt_vec_dev_fetch(mmt_vec const & v) {
+    if (mmt_vec_is_shared(v) && v.pi.wr[v.d].trank)
+        return;
+    bwc_dev_fetch(v.v, v.abase->vec_elt_stride(v.i1 - v.i0));
+}
+static inline void mmt_vec_dev_invalidate(mmt_vec const & v) {
+    if (mmt_vec_is_shared(v) && v.pi.wr[v.d].trank)
+        return;
+    bwc_dev_invalidate(v.v);
+}
+static inline void mmt_vec_dev_mirror(mmt_vec const & v, mmt_vec const & like) {
+    if (mmt_vec_is_shared(v) && v.pi.wr[v.d].trank)
+        return;
+    bwc_dev_mirror(v.v, v.abase->vec_elt_stride(v.i1 - v.i0), like.v);
+}
+
+/* copy sz items, on the device mirrors when both sides hold their
+ * current data there, else on the host */
+static inline void mmt_vec_copy_items(arith_generic * A,
+        arith_generic::elt * dst, arith_generic::elt const * src, size_t sz)
+{
+    size_t const bytes = A->vec_elt_stride(sz);
+    if (bwc_dev_copy(dst, src, bytes))
+        return;
+    bwc_dev_fetch(src, bytes);
+    A->vec_set(dst, src, sz);
+    bwc_dev_push(dst, bytes);
 }
 
 extern void mmt_vec_share_across_threads(mmt_vec & v);

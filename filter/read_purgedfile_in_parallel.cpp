@@ -6,13 +6,19 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <algorithm>
+#include <limits>
+#include <vector>
+
 #include "filter_config.h"
+#include "gzip.h"
 #include "macros.h"
 #include "merge_heap.h"
 #include "merge_replay_matrix.h"
 #include "omp_proxy.h"
 #include "read_purgedfile_in_parallel.hpp"
 #include "sparse.h"
+#include "staged_rows.hpp"
 #include "timing.h"
 #include "typedefs.h"
 
@@ -104,166 +110,107 @@ static inline char * hacked_strtoul16(index_t * px, char * p)/*{{{*/
 }
 /*}}}*/
 
-struct vector_of_typerow_pointer_s {
-    typerow_t ** x;
-    size_t size;
-    size_t alloc;
-};
+/* The rows read by one thread: staged with their original columns
+   (factorization), or in the heap. */
+#ifndef FOR_DL
+typedef staged_rows local_rows;
+#else
+typedef std::vector<typerow_t *> local_rows;
+#endif
 
-typedef struct vector_of_typerow_pointer_s vector_of_typerow_pointer[1];
-typedef struct vector_of_typerow_pointer_s * vector_of_typerow_pointer_ptr;
-typedef const struct vector_of_typerow_pointer_s * vector_of_typerow_pointer_srcptr;
-
-void vector_of_typerow_pointer_init(vector_of_typerow_pointer_ptr V)
+/* Parses one line of the purged file into its sorted columns in [col0,
+   colmax). The columns below col0 go to the mask of the row in buried
+   instead (buried != NULL requires col0 <= 64). */
+static void parse_row(char * line, index_t col0, index_t colmax,
+                      std::vector<index_t> & cols, std::vector<uint64_t> * buried)
 {
-    V->x = NULL;
-    V->size = V->alloc = 0;
-}
-
-void vector_of_typerow_pointer_clear(vector_of_typerow_pointer_ptr V)
-{
-    free(V->x);
-    V->x = NULL;
-    V->size = V->alloc = 0;
-}
-
-void vector_of_typerow_pointer_push_back(vector_of_typerow_pointer_ptr V, typerow_t * p)
-{
-    if (V->size >= V->alloc) {
-        size_t newalloc = MAX(V->size * 2, 16);
-        checked_realloc(V->x, newalloc);
-        V->alloc = newalloc;
+    cols.clear();
+    uint64_t buried_mask = 0;
+    char * p = line;
+    char * z = p + strlen(line) - 1; /* the EOL delimiter */
+    for( ; *p && *p != ':' ; p++);
+    for( ; p++ != z ; ) {
+        index_t x;
+        p = hacked_strtoul16(&x, p);
+        if (x < col0) {
+            if (buried) buried_mask ^= (uint64_t) 1 << x;
+            continue;
+        }
+        if (x >= colmax) continue;
+        cols.push_back(x);
     }
-    V->x[V->size++] = p;
+    std::sort(cols.begin(), cols.end());
+    if (buried) buried->push_back(buried_mask);
 }
 
-struct vector_of_typerow_s {
-    typerow_t * x;
-    size_t size;
-    size_t alloc;
-};
-
-typedef struct vector_of_typerow_s vector_of_typerow[1];
-typedef struct vector_of_typerow_s * vector_of_typerow_ptr;
-typedef const struct vector_of_typerow_s * vector_of_typerow_srcptr;
-
-void vector_of_typerow_init(vector_of_typerow_ptr V)
+#ifndef FOR_DL
+/* A column that appears an even number of times cancels. */
+static void store_row(local_rows & V, size_t i, std::vector<index_t> & cols)
 {
-    V->x = NULL;
-    V->size = V->alloc = 0;
-}
-
-void vector_of_typerow_clear(vector_of_typerow_ptr V)
-{
-    free(V->x);
-    V->x = NULL;
-    V->size = V->alloc = 0;
-}
-
-void vector_of_typerow_empty(vector_of_typerow_ptr V)
-{
-    V->size = 0;
-}
-
-void vector_of_typerow_push_back(vector_of_typerow_ptr V, const typerow_t * p)
-{
-    if (V->size >= V->alloc) {
-        size_t newalloc = MAX(V->size * 2, 16);
-        checked_realloc(V->x, newalloc);
-        V->alloc = newalloc;
+    size_t jt = 0;
+    for (size_t it = 0; it < cols.size(); ) {
+        size_t kt = it + 1;
+        for (; kt < cols.size() && cols[kt] == cols[it]; kt++);
+        cols[jt] = cols[it];
+        jt += (kt - it) & 1;
+        it = kt;
     }
-    memcpy(V->x + V->size++, p, sizeof(typerow_t));
+    V.add(i, cols.data(), jt);
 }
+#else
+/* One cell per distinct column, with the multiplicity as exponent. The
+   row index is written later, when the rows of all threads are counted. */
+static void store_row(local_rows & V, size_t, std::vector<index_t> & cols)
+{
+    std::vector<typerow_t> buf(1);
+    for (size_t it = 0; it < cols.size(); ) {
+        size_t kt = it + 1;
+        for (; kt < cols.size() && cols[kt] == cols[it]; kt++);
+        typerow_t x;
+        setCell(&x, 0, cols[it], (exponent_t) (kt - it));
+        buf.push_back(x);
+        it = kt;
+    }
+    index_t const z = buf.size() - 1;
+    setCell(buf.data(), 0, z, 0);
+    typerow_t *newrow = heap_alloc_row(0, z);
+    compressRow(newrow, buf.data(), z);
+    V.push_back(newrow);
+}
+#endif
 
-void read_local_rows(vector_of_typerow_pointer_ptr V, FILE * fi, off_t bytes_to_read, uint64_t skip)
+/* Returns the number of rows read. buried != NULL: gets one mask per row
+   with the columns below col0 */
+static size_t read_local_rows(local_rows & V, std::vector<uint64_t> * buried,
+                              FILE * fi, off_t bytes_to_read, index_t col0, index_t colmax)
 {
     size_t local_next_report = 256;
     size_t local_nrows_at_last_report = 0;
     size_t local_bytes_at_last_report = 0;
-
-    /* reuse local variables ; this avoids frequent roundtrips to the
-     * malloc layer */
+    size_t nrows = 0;
 
     char line[4096];
-    vector_of_typerow primes;
-    vector_of_typerow_init(primes);
+    std::vector<index_t> cols;
 
     long start = ftell(fi);
 
     for (long pos ; ((pos = ftell(fi)) - start)  < bytes_to_read ; ) {
+        if (fgets(line, sizeof(line), fi) == NULL) break;
+        if (line[0] == '#') continue;
+        /* otherwise 4096 is not enough ! */
+        ASSERT_ALWAYS(strlen(line) < (sizeof(line) - 1));
 
-        vector_of_typerow_empty(primes);
-        line[0]='\0';
-
-        /* Insert a temporary marker. We'll use it for storing the
-         * size, eventually */
-        typerow_t zz;
-        setCell(&zz, 0, 0, 0);
-        vector_of_typerow_push_back(primes, & zz);
-        {
-            /* this is going to be a bit ugly, I know */
-            if (fgets(line, sizeof(line), fi) == NULL) break;
-
-            if (line[0] == '#') continue;
-
-            /* see "BAD IDEAS FOR PARSING LOOP" below for things that
-             * I tried and didn't play out well.  */
-            char * p = line;
-            char * z = p + strlen(line);
-            /* otherwise 4096 is not enough ! */
-            ASSERT_ALWAYS((size_t) (z - p) < (sizeof(line) - 1));
-            /* we want to point to the EOL delimiter */
-            z--;
-
-            for( ; *p && *p != ':' ; p++);
-            for( ; p++ != z ; ) {
-                index_t x;
-                p = hacked_strtoul16(&x, p);
-                if (x < skip)
-                    continue;
-                typerow_t xx;
-                setCell(&xx, 0, x, 1);
-                vector_of_typerow_push_back(primes, &xx);
-            }
-        }
-
-        qsort(primes->x + 1, primes->size - 1, sizeof(typerow_t), cmp_typerow_t);
-
-        unsigned int jt = 1;
-        for (unsigned int it = 1; it != primes->size;) {
-            primes->x[jt] = primes->x[it];
-            unsigned int kt = it;
-            ++kt;
-#ifdef FOR_DL
-            for (; kt != primes->size && primes->x[kt].id == primes->x[jt].id; ++kt)
-                primes->x[jt].e += primes->x[kt].e;
-            jt++;
-#else
-            for (; kt != primes->size && primes->x[kt] == primes->x[jt]; ++kt);
-            jt += ((kt - it) & 1);
-#endif
-            it = kt;
-        }
-        primes->size = jt;
-
-        /* Pay attention to the special marker ! and update it, too. */
-        unsigned int z = primes->size - 1;
-        setCell(primes->x, 0, z, 0);
-
-        /* 0 here must eventually become the row index, but we can't
-         * write it right now. We'll do so later on.  */
-        typerow_t *newrow = heap_alloc_row(0, z);
-        compressRow(newrow, &primes->x[0], z);
-        vector_of_typerow_pointer_push_back(V, newrow);
+        parse_row(line, col0, colmax, cols, buried);
+        store_row(V, nrows++, cols);
 
         /* At this point we should consider reporting. */
         size_t local_bytes = pos - start;
-        if (V->size >= local_next_report) {
+        if (nrows >= local_next_report) {
 #pragma omp critical
             {
-                global_nrows += V->size - local_nrows_at_last_report;
+                global_nrows += nrows - local_nrows_at_last_report;
                 global_bytes += local_bytes - local_bytes_at_last_report;
-                local_nrows_at_last_report = V->size;
+                local_nrows_at_last_report = nrows;
                 local_bytes_at_last_report = local_bytes;
                 if (global_nrows >= global_next_report)
                     global_print_report();
@@ -273,16 +220,36 @@ void read_local_rows(vector_of_typerow_pointer_ptr V, FILE * fi, off_t bytes_to_
     }
 #pragma omp critical
     {
-        global_nrows += V->size - local_nrows_at_last_report;
+        global_nrows += nrows - local_nrows_at_last_report;
         size_t local_bytes = ftell(fi) - start;
         global_bytes += local_bytes - local_bytes_at_last_report;
     }
-    vector_of_typerow_clear(primes);
+    return nrows;
 }
 
-uint64_t read_purgedfile_in_parallel(filter_matrix_t * mat,
-				     const char *filename)
+int purgedfile_is_seekable(const char * filename)
 {
+    FILE * f = fopen_maybe_compressed(filename, "r");
+    ASSERT_ALWAYS(f != NULL);
+    int t = fseek(f, 0, SEEK_END) == 0;
+    fclose_maybe_compressed(f, filename);
+    return t;
+}
+
+#ifndef FOR_DL
+uint64_t read_purgedfile_in_parallel(const char * filename, index_t col0,
+                                     index_t colmax, uint64_t * buried,
+                                     staged_rows & staged)
+#else
+uint64_t read_purgedfile_in_parallel(filter_matrix_t * mat,
+				     const char *filename, uint64_t * buried)
+#endif
+{
+#ifdef FOR_DL
+    index_t col0 = mat->skip;
+    index_t colmax = std::numeric_limits<index_t>::max();
+#endif
+    ASSERT_ALWAYS(buried == NULL || col0 <= 64);
     off_t endpos;
 
     {
@@ -329,10 +296,9 @@ uint64_t read_purgedfile_in_parallel(filter_matrix_t * mat,
 #pragma omp barrier
 
         off_t bytes_to_read = spos_tab[i + 1] - spos_tab[i];
-        vector_of_typerow_pointer V;
-        vector_of_typerow_pointer_init(V);
-        read_local_rows(V, fi, bytes_to_read, mat->skip);
-        rows_per_thread[i] = V->size;
+        local_rows V;
+        std::vector<uint64_t> local_buried;
+        rows_per_thread[i] = read_local_rows(V, buried ? &local_buried : NULL, fi, bytes_to_read, col0, colmax);
 
 #pragma omp barrier
 
@@ -342,13 +308,16 @@ uint64_t read_purgedfile_in_parallel(filter_matrix_t * mat,
         uint64_t index = 0;
         for(int j = 0 ; j < i ; j++)
             index += rows_per_thread[j];
-        for (size_t s = 0 ; s < V->size ; s++) {
-            typerow_t * r = V->x[s];
+        if (buried) std::copy(local_buried.begin(), local_buried.end(), buried + index);
+#ifndef FOR_DL
+#pragma omp critical
+        staged.append(V, index);
+#else
+        for (typerow_t * r : V) {
             rowCell((r - 1), 0) = index;
-            mat->rows[index] = r;
-            index++;
+            mat->rows[index++] = r;
         }
-        vector_of_typerow_pointer_clear(V);
+#endif
 
         fclose(fi);
     }

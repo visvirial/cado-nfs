@@ -90,10 +90,13 @@ set(bwc_base_sources
     bw-common.cpp
     async.cpp
     rolling.cpp
+    bwc_file.cpp
     matmul.cpp
     matmul_top.cpp
     matmul_top_vec.cpp
     matmul_top_comm.cpp
+    matmul_top_comm_plugin.cpp
+    bwc_device_arena.cpp
     random_matrix.cpp
     mmt_vector_pair.cpp
     mf_bal.cpp
@@ -106,6 +109,7 @@ set(bwc_base_sources
 )
 
 mpi_add_library(bwc_base ${CADO_SHARED} ${bwc_base_sources})
+mark_targets_as_openmp(bwc_base)
 
 target_link_libraries(bwc_base bwc_parallelization)
 
@@ -150,6 +154,10 @@ if(BUILD_DYNAMICALLY_LINKABLE_BWC)
     set(SOLIB_PREFIX ${CMAKE_SHARED_LIBRARY_PREFIX})
     set(SOLIB_SUFFIX ${CMAKE_SHARED_LIBRARY_SUFFIX})
     configure_file(solib-naming.h.in solib-naming.h ESCAPE_QUOTES @ONLY)
+
+    add_library(bwccomm_mpiref SHARED bwccomm_mpiref.cpp)
+    mark_targets_as_mpi(bwccomm_mpiref)
+    install(TARGETS bwccomm_mpiref DESTINATION ${LIBSUFFIX}/linalg/bwc)
 endif()
 
 include_directories (${CMAKE_CURRENT_BINARY_DIR})
@@ -435,10 +443,12 @@ bwc_program(acollect acollect.cpp)
 bwc_program(prep prep.cpp xdotprod.cpp)
 target_link_libraries(prep bitlinalg)
 target_link_libraries(prep bblas)
-bwc_program(krylov krylov.cpp xdotprod.cpp)
+bwc_program(krylov krylov.cpp krylov_common.cpp xdotprod.cpp)
+bwc_program(gkrylov gkrylov.cpp krylov_common.cpp xdotprod.cpp)
 bwc_program(bwccheck bwccheck.cpp xdotprod.cpp bwc_filenames.cpp)
 bwc_program(dispatch dispatch.cpp xdotprod.cpp)
-bwc_program(mksol mksol.cpp xdotprod.cpp)
+bwc_program(mksol mksol.cpp mksol_common.cpp)
+bwc_program(gmksol gmksol.cpp mksol_common.cpp)
 bwc_program(det_from_lingen det_from_lingen.cpp)
 bwc_program(gather gather.cpp)
 bwc_program(secure secure.cpp)
@@ -503,6 +513,7 @@ add_library(lingen_common_support
     lingen_platform.cpp
     lingen_hints.cpp
     lingen_call_companion.cpp
+    lingen_ft_plugin.cpp
     )
 if(ENABLE_SHARED)
     set_property(TARGET lingen_common_support PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -592,7 +603,10 @@ foreach(v ${internal_arithmetic_backends_gfp} b64)
     target_link_libraries(lingen_${v}_core lingen_${v}_support)
 
     target_link_libraries(lingen_${v}_support 
-        lingen_common_support utils)
+        lingen_common_support utils dl)
+    # lingen_ft_plugin_init dlopens libbwclingenft_<impl>.so from here
+    set_target_properties(lingen_${v}_support PROPERTIES BUILD_RPATH
+        "${CMAKE_CURRENT_BINARY_DIR}")
 
     if (v STREQUAL "b64")
         if(NOT HAVE_GF2X)
@@ -623,6 +637,21 @@ foreach(v ${internal_arithmetic_backends_gfp} b64)
         APPEND PROPERTY COMPILE_OPTIONS ${our_compile_flags})
 endforeach(v)
 
+# glingen: lingen_b64 with the recursion, the products and the base case
+# on the GPU of the lingen_ft_impl plugin (-DLINGEN_GPU, see lingen_gpu.hpp)
+parse_arith_layer(b64 glingen_compile_flags)
+add_executable(glingen
+    ${lingen_b64_core_sources}
+    ${lingen_b64_main_sources}
+    lingen_gpu.cpp
+    )
+target_link_libraries(glingen lingen_b64_support)
+mark_targets_as_mpi(glingen)
+mark_targets_as_openmp(glingen)
+set_property(TARGET glingen APPEND PROPERTY COMPILE_OPTIONS
+    ${glingen_compile_flags} -DLINGEN_BINARY -DLINGEN_GPU)
+install(TARGETS glingen RUNTIME DESTINATION ${LIBSUFFIX}/linalg/bwc)
+
 add_custom_target(bwc_matmul_gf2)
 add_custom_target(bwc_matmul_gfp)
 if(BUILD_DYNAMICALLY_LINKABLE_BWC)
@@ -634,11 +663,11 @@ endif()
 
 add_custom_target(bwc_full_common)
 add_dependencies(bwc_full_common mf_bal random_matrix acollect
-    prep krylov dispatch mksol gather secure bwc_base
+    prep krylov gkrylov dispatch mksol gmksol gather secure bwc_base
     bwccheck)
 
 add_custom_target(bwc_full_gf2)
-add_dependencies(bwc_full_gf2 bwc_full_common bwc_matmul_gf2 lingen_b64 cleanup)
+add_dependencies(bwc_full_gf2 bwc_full_common bwc_matmul_gf2 lingen_b64 glingen cleanup)
 add_custom_target(bwc_full_gfp)
 add_dependencies(bwc_full_gfp bwc_full_common bwc_matmul_gfp)
 if(BWC_GFP_ARITHMETIC_BACKENDS)

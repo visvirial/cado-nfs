@@ -16,6 +16,7 @@
 
 #ifdef HAVE_HWLOC
 #include <hwloc.h>
+#include "hwloc-aux.hpp"
 #endif
 
 #include "fmt/base.h"
@@ -354,7 +355,7 @@ int main(int argc, char const * argv[])
     /* Detect hardware */
     hwloc_topology_t topology;
     hwloc_topology_init(&topology);
-    hwloc_topology_load(topology);
+    hwloc_aux_topology_load(topology);
     int const depth = hwloc_topology_get_depth(topology);
     unsigned int const npu = hwloc_get_nbobjs_by_depth(topology, depth-1);
     hwloc_obj_t root = hwloc_get_root_obj(topology);

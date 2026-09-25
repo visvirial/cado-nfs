@@ -1,6 +1,7 @@
 #include "cado.h" // IWYU pragma: keep
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "typedefs.h"
 #include "merge_heap.h"
 #include "merge_replay_matrix.h"  // typerow_t, index_t, 
@@ -23,6 +24,10 @@
   row allocation and deallocation are thread-local operations that are very
   fast. The last allocated row can easily be shrunk (by diminishing [[ptr]]).
 
+  The heap holds two kinds of data: the matrix rows and the relation sets of
+  the index. A page holds one kind, and each thread has one active page of
+  each kind, so that the collection knows which pointer array owns a row.
+
   After each pass, memory is garbage-collected. All threads do the following
   procedure in parallel, while possible: grab a full page that was not created
   during this pass; copy all non-deleted rows to the current active page; mark the
@@ -40,6 +45,7 @@ struct page_t {
         struct pagelist_t *list;     /* the pagelist_t structure associated with this page */
         int i;                       /* page number, for debugging purposes */
         int generation;              /* pass in which this page was filled. */
+        enum heap_kind kind;         /* what the rows of this page are */
         int ptr;                     /* data[ptr:PAGE_DATA_SIZE] is available*/
         typerow_t data[PAGE_DATA_SIZE];
 };
@@ -60,7 +66,7 @@ int heap_config_get_PAGE_DATA_SIZE()
 static int n_pages, n_full_pages, n_empty_pages;
 static struct pagelist_t headnode;                  // dummy node for the list of full pages
 static struct pagelist_t *full_pages, *empty_pages; // head of the page linked lists
-static struct page_t **active_page; /* active page of each thread */
+static struct page_t **active_page[HEAP_KINDS]; /* active page of each thread, per kind */
 static long long *heap_waste;       /* space wasted, per-thread. Can be negative! The sum over all threads is correct. */
 static int current_generation;
 
@@ -162,12 +168,16 @@ heap_setup()
 
         empty_pages = NULL;
         int T = omp_get_max_threads();
-        active_page = malloc(T * sizeof(*active_page));
         heap_waste = malloc(T * sizeof(*heap_waste));
+        for (int kind = 0; kind < HEAP_KINDS; kind++)
+            active_page[kind] = malloc(T * sizeof(**active_page));
 
         #pragma omp parallel for
         for(int t = 0 ; t < T ; t++) {
-            active_page[t] = heap_get_free_page();
+            for (int kind = 0; kind < HEAP_KINDS; kind++) {
+                active_page[kind][t] = heap_get_free_page();
+                active_page[kind][t]->kind = kind;
+            }
             heap_waste[t] = 0;
         }
 }
@@ -177,9 +187,12 @@ heap_clear ()
 {
   /* clear active pages */
   int T = omp_get_max_threads ();
-  for (int t = 0 ; t < T ; t++) {
-    free(active_page[t]->list);
-    free(active_page[t]);
+  for (int kind = 0; kind < HEAP_KINDS; kind++) {
+    for (int t = 0 ; t < T ; t++) {
+      free(active_page[kind][t]->list);
+      free(active_page[kind][t]);
+    }
+    free (active_page[kind]);
   }
 
   /* clear empty pages */
@@ -204,24 +217,23 @@ heap_clear ()
     free(item->page);
     free(item);
   }
-  free (active_page);
   free (heap_waste);
 }
 
 
 /* Returns a pointer to allocated space holding a size-s array of typerow_t.
    This function is thread-safe. */
-static inline typerow_t * heap_malloc (size_t s)
+static inline typerow_t * heap_malloc (enum heap_kind kind, size_t s)
 {
-  ASSERT(s <= PAGE_DATA_SIZE);
+  ASSERT_ALWAYS(s <= PAGE_DATA_SIZE);
   int t = omp_get_thread_num();
-  struct page_t *page = active_page[t];
-  // ASSERT(page != NULL);
+  struct page_t *page = active_page[kind][t];
   /* enough room in active page ?*/
   if (page->ptr + s >= PAGE_DATA_SIZE) {
         heap_release_page(page);
         page = heap_get_free_page();
-        active_page[t] = page;
+        page->kind = kind;
+        active_page[kind][t] = page;
   }
   typerow_t *alloc = page->data + page->ptr;
   page->ptr += s;
@@ -229,20 +241,32 @@ static inline typerow_t * heap_malloc (size_t s)
 }
 
 
-typerow_t *
-heap_alloc_row (index_t i, size_t s)
+static typerow_t *
+heap_alloc (enum heap_kind kind, index_t i, size_t s)
 {
-  typerow_t *alloc = heap_malloc(s + 2);
+  typerow_t *alloc = heap_malloc(kind, s + 2);
   rowCell(alloc, 0) = i;
   rowCell(alloc, 1) = s;
   return alloc + 1;
+}
+
+typerow_t *
+heap_alloc_row (index_t i, size_t s)
+{
+  return heap_alloc(HEAP_ROWS, i, s);
+}
+
+typerow_t *
+heap_alloc_relset (index_t i, size_t s)
+{
+  return heap_alloc(HEAP_RELSETS, i, s);
 }
 
 void
 heap_resize_last_row (typerow_t *row, index_t new_size)
 {
   int t = omp_get_thread_num();
-  struct page_t *page = active_page[t];
+  struct page_t *page = active_page[HEAP_ROWS][t];
   index_t old_size = rowCell(row, 0);
   ASSERT(row + old_size + 1 == page->data + page->ptr);
   int delta = old_size - new_size;
@@ -252,11 +276,19 @@ heap_resize_last_row (typerow_t *row, index_t new_size)
 
 
 
+/* the row number that marks a destroyed row: all bits set in the cell */
+static index_t destroyed_row_marker()
+{
+  typerow_t cell;
+  memset(&cell, 0xff, sizeof(cell));
+  return rowCell(&cell, 0);
+}
+
 void
 heap_destroy_row(typerow_t *row)
 {
   int t = omp_get_thread_num();
-  rowCell(row, -1) = (index_signed_t) -1;
+  rowCell(row, -1) = destroyed_row_marker();
   heap_waste[t] += rowCell(row, 0) + 2;
 }
 
@@ -264,24 +296,25 @@ heap_destroy_row(typerow_t *row)
    return the page to the freelist. Thread-safe.
    Warning: this may fill the current active page and release it. */
 static int
-collect_page(typerow_t **rows, struct page_t *page)
+collect_page(typerow_t **rows, typerow_t **relsets, struct page_t *page)
 {
+        typerow_t **owner = page->kind == HEAP_ROWS ? rows : relsets;
         int garbage = 0;
         int bot = 0;
         int top = page->ptr;
         typerow_t *data = page->data;
         while (bot < top) {
-                index_signed_t i = rowCell(data, bot);
+                index_t i = rowCell(data, bot);
                 typerow_t *old = data + bot + 1;
                 index_t size = rowCell(old, 0);
-                if (i == (index_signed_t) -1) {
+                if (i == destroyed_row_marker()) {
                         garbage += size + 2;
                 } else {
-                        ASSERT(rows[i] == old);
-                        typerow_t * new = heap_alloc_row(i, size);
+                        ASSERT(owner[i] == old);
+                        typerow_t * new = heap_alloc(page->kind, i, size);
                         memcpy(new, old, (size + 1) * sizeof(typerow_t));
                         setCell(new, -1, rowCell(old, -1), 0);
-                        rows[i] = new;
+                        owner[i] = new;
                 }
                 bot += size + 2;
         }
@@ -291,7 +324,7 @@ collect_page(typerow_t **rows, struct page_t *page)
         return garbage;
 }
 
-static double
+double
 heap_waste_ratio()
 {
         int T = omp_get_max_threads();
@@ -303,8 +336,10 @@ heap_waste_ratio()
 }
 
 void
-heap_garbage_collection(typerow_t **rows)
+heap_garbage_collection(typerow_t **rows, typerow_t **relsets)
 {
+        if (n_full_pages == 0)
+                return;
         double waste = heap_waste_ratio();
         printf("Starting collection with %.0f%% of waste...", 100 * waste);
         fflush(stdout);
@@ -318,7 +353,7 @@ heap_garbage_collection(typerow_t **rows)
         long long collected_garbage = 0;
         #pragma omp parallel reduction(+:i, collected_garbage) private(page)
         while ((page = heap_get_full_page()) != NULL) {
-                collected_garbage += collect_page(rows, page);
+                collected_garbage += collect_page(rows, relsets, page);
                 i++;
         }
 

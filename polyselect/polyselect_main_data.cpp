@@ -11,6 +11,7 @@
 #include <gmp.h>
 #ifdef HAVE_HWLOC
 #include <hwloc.h>
+#include "hwloc-aux.hpp"
 #endif
 
 #include "gmp_aux.h"
@@ -51,7 +52,7 @@ void polyselect_main_data_init_defaults(polyselect_main_data_ptr main)
     main->idx = 0;
 #ifdef HAVE_HWLOC
     hwloc_topology_init(&main->topology);
-    hwloc_topology_load(main->topology);
+    hwloc_aux_topology_load(main->topology);
 #endif
     main->nthreads = 0;
     main->finer_grain_threads = 1;

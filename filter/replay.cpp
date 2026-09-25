@@ -28,7 +28,10 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
 #include <cinttypes>
 #include <cstdint>
 
+#include <algorithm>
+#include <future>
 #include <string>
+#include <vector>
 
 #include "fmt/base.h"
 
@@ -36,7 +39,6 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
 #include "typedefs.h"
 #include "filter_config.h"
 #include "filter_io.hpp"
-#include "fix-endianness.h"
 #include "gzip.h"
 #include "misc.h"
 #include "params.hpp"
@@ -46,10 +48,15 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
 #include "verbose.hpp"
 #include "portability.h"
 #include "macros.h"
+#include "matrix_output.hpp"
+#include "merge_heap.h"
 #include "merge_replay_matrix.h"
 #include "runtime_numeric_cast.hpp"
+#include "read_purgedfile_in_parallel.hpp"
+#include "staged_rows.hpp"
 
 #include "utils_cxx.hpp"
+#include "omp_proxy.h"
 
 #define DEBUG 0
 
@@ -59,328 +66,16 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
 // After computing newrows, we deduce for all old rows the list of newrows
 // containing it.
 
-static unsigned long
-flushSparse(const char *sparsename, typerow_t **sparsemat, index_t small_nrows,
-            index_t small_ncols, const index_t * code, index_t skip, int bin)
-{
-#ifdef FOR_DL
-  ASSERT_ALWAYS (skip == 0);
-#endif
-    const struct {
-        const char * ext;
-        const char * smat;
-        const char * srw;
-        const char * scw;
-        const char * dmat;
-        const char * drw;
-        const char * dcw;
-    } suffixes[2] = {
-        {
-          .ext = ".txt",
-          .smat = "txt",
-          .srw = "rw.txt",
-          .scw = "cw.txt",
-          .dmat = "dense.txt",
-          .drw = "dense.rw.txt",
-          .dcw = "dense.cw.txt",
-        },
-        {
-          .ext = ".bin",
-          .smat = "bin",
-          .srw = "rw.bin",
-          .scw = "cw.bin",
-          .dmat = "dense.bin",
-          .drw = "dense.rw.bin",
-          .dcw = "dense.cw.bin",
-        },
-    }, * suf = &(suffixes[bin]);
-
-    unsigned long W = 0;
-    unsigned long DW = 0;
-    const char * zip = has_suffix(sparsename, ".gz") ? ".gz" : NULL;
-    index_t * weights = (index_t *) malloc(small_ncols * sizeof(index_t));
-    ASSERT_ALWAYS(weights != NULL);
-    memset(weights, 0, small_ncols * sizeof(index_t));
-
-    char wmode[3] = "w";
-
-    char * base = strdup(sparsename);
-    if (zip) { base[strlen(base)-3]='\0'; }
-    if (has_suffix(base, suf->ext)) { base[strlen(base)-4]='\0'; }
-
-    char * smatname = nullptr;
-    FILE * smatfile = nullptr;
-    char * srwname  = nullptr;
-    FILE * srwfile  = nullptr;
-    char * scwname  = nullptr;
-    FILE * scwfile  = nullptr;
-
-    {
-        smatname = derived_filename(base, suf->smat, zip);
-        srwname  = derived_filename(base, suf->srw, zip);
-        scwname = derived_filename(base, suf->scw, zip);
-        smatfile = fopen_maybe_compressed(smatname, wmode);
-        srwfile  = fopen_maybe_compressed(srwname, wmode);
-        /* XXX sm-outside-matrix creates a square matrix here */
-        if (!bin) fprintf(smatfile, "%" PRIu64 " %" PRIu64 "\n",
-                          (uint64_t) small_nrows,
-                          (uint64_t) small_ncols - skip);
+/* Row source for the matrix output: the rows of replay */
+struct replay_rows {
+    typerow_t ** rows;
+    bool empty(index_t i) const { return rows[i] == NULL; }
+    template<typename F>
+    void for_each(index_t i, F && f) const {
+        for (unsigned int j = 1; j <= rowLength(rows, i); j++)
+            f(rowFullCell(rows[i], j));
     }
-
-    char * dmatname = nullptr;
-    FILE * dmatfile = nullptr;
-    char * drwname  = nullptr;
-    FILE * drwfile  = nullptr;
-    char * dcwname  = nullptr;
-    FILE * dcwfile  = nullptr;
-
-    if (skip) {
-        /* arrange so that we don't get file names like .sparse.dense */
-        char * dbase = strdup(base);
-        char * tmp = strstr(dbase, ".sparse");
-        if (tmp) {
-            memmove(tmp, tmp + 7, strlen(tmp + 7) + 1);
-        }
-        dmatname = derived_filename(dbase, suf->dmat, zip);
-        drwname  = derived_filename(dbase, suf->drw, zip);
-        dcwname = derived_filename(dbase, suf->dcw, zip);
-        dmatfile = fopen_maybe_compressed(dmatname, wmode);
-        drwfile  = fopen_maybe_compressed(drwname, wmode);
-        if (!bin)
-            fprintf(dmatfile, "%" PRIu64 " %" PRIu64 "\n",
-                    (uint64_t) small_nrows, (uint64_t) skip);
-        free(dbase);
-    }
-
-    for (index_t i = 0; i < small_nrows; i++){
-//#ifdef FOR_DL
-#if 0
-        /* this is for sm-outside-matrix */
-        if (i == small_ncols) {
-            printf("Rotating file names\n");
-            char * base2;
-            int rc = asprintf(&base2, "%s.tail", base);
-            ASSERT_ALWAYS(rc >= 0);
-            fclose_maybe_compressed (smatfile, smatname);
-            free(smatname);
-            smatname = derived_filename(base2, suf->smat, zip);
-            smatfile = fopen_maybe_compressed(smatname, wmode);
-            free(base2);
-            if (!bin) {
-                fprintf(smatfile, "%d %d\n", small_nrows - small_ncols, small_ncols - skip);
-            }
-            fclose_maybe_compressed(srwfile, srwname); srwfile = NULL;
-        }
-#endif
-
-	if(sparsemat[i] == NULL) {
-          /* this should not happen, unless the corresponding combination of
-             relations yields a square, thus we have found a dependency in the
-             merge process */
-            if (bin) {
-                const uint32_t x = 0;
-                fwrite32_little(&x, 1, smatfile);
-                if (skip) fwrite32_little(&x, 1, dmatfile);
-            } else {
-                fprintf(smatfile, "0");
-                if (skip) fprintf(dmatfile, "0");
-            }
-        } else {
-            uint32_t dw = 0;
-            uint32_t sw = 0;
-	    for(unsigned int j = 1; j <= rowLength(sparsemat, i); j++){
-		if (code[rowCell(sparsemat[i], j)]-1 < skip) {
-                    dw++;
-                    DW++;
-                } else {
-                    sw++;
-                    W++;
-                }
-            }
-            if (bin) {
-                fwrite32_little(&sw, 1, smatfile);
-                if (srwfile) fwrite32_little(&sw, 1, srwfile);
-                if (skip) fwrite32_little(&dw, 1, dmatfile);
-                if (skip) fwrite32_little(&dw, 1, drwfile);
-            } else {
-                fprintf(smatfile, "%" PRIu32 "", sw);
-                if (srwfile) fprintf(srwfile, "%" PRIu32 "\n", sw);
-                if (skip) fprintf(dmatfile, "%" PRIu32 "", dw);
-                if (skip) fprintf(drwfile, "%" PRIu32 "\n", dw);
-            }
-
-
-#if 0 //#ifdef FOR_DL //for DL sort the index
-      for (int k = 1; k < rowLength(sparsemat, i); k++)
-        {
-          for (int l = k+1; l <= rowLength(sparsemat, i); l++)
-            {
-              index_t x = code[rowCell(sparsemat[i], k)]-1;
-              index_t y = code[rowCell(sparsemat[i], l)]-1;
-              if (x > y)
-                {
-                  typerow_t tmp = sparsemat[i][k];
-                  sparsemat[i][k] = sparsemat[i][l];
-                  sparsemat[i][l] = tmp;
-                }
-            }
-        }
-#endif
-
-	    for(unsigned int j = 1; j <= rowLength(sparsemat, i); j++){
-#if DEBUG >= 1
-		ASSERT(code[rowCell(sparsemat[i], j)] > 0);
-#endif
-		ASSERT_ALWAYS(code[rowCell(sparsemat[i], j)]-1 <= (index_t) UINT32_MAX);
-		uint32_t x = code[rowCell(sparsemat[i], j)]-1;
-                if (srwfile) weights[x]++;
-                if (x < skip) {
-                    ASSERT_ALWAYS(skip);
-                    if (bin) {
-                        fwrite32_little(&x, 1, dmatfile);
-                    } else {
-		        fprintf(dmatfile, " %" PRIu32 "", x);
-                    }
-                } else {
-                    x-=skip;
-                    if (bin) {
-                        fwrite32_little(&x, 1, smatfile);
-#ifdef FOR_DL
-			/* exponents are always int32_t */
-                        uint32_t e = (uint32_t) sparsemat[i][j].e;
-                        fwrite32_little(&e, 1, smatfile);
-#endif
-                    } else {
-		        fprintf(smatfile, " %" PRIu32 "", x);
-#ifdef FOR_DL
-                        fprintf(smatfile, ":%d", sparsemat[i][j].e);
-#endif
-                    }
-                }
-	    }
-	}
-	if (!bin) {
-            fprintf(smatfile, "\n");
-            if (skip) fprintf(dmatfile, "\n");
-        }
-    }
-
-    {
-        fclose_maybe_compressed (smatfile, smatname);
-        if (srwfile) fclose_maybe_compressed (srwfile, srwname);
-    }
-    if (skip) {
-        printf("%lu coeffs (out of %lu total) put into %s (%.1f%%)\n",
-                DW, DW+W, dmatname,
-                100.0 * (double) DW / (DW+W+(DW==0&&W==0)));
-        fflush(stdout);
-
-        fclose_maybe_compressed (dmatfile, dmatname);
-        fclose_maybe_compressed (drwfile, drwname);
-    }
-
-    if (skip) {
-        dcwfile = fopen_maybe_compressed(dcwname, wmode);
-        for (unsigned int j = 0; j < skip; j++){
-	    ASSERT_ALWAYS(weights[j] <= (index_t) UINT32_MAX);
-            uint32_t x = weights[j];
-            if (bin) {
-                fwrite32_little(&x, 1, dcwfile);
-            } else {
-                fprintf(dcwfile, "%" PRIu32 "\n", x);
-            }
-        }
-        fclose_maybe_compressed(dcwfile, dcwname);
-    }
-
-    {
-        scwfile = fopen_maybe_compressed(scwname, wmode);
-        for(index_t j = skip; j < small_ncols; j++){
-	    ASSERT_ALWAYS(weights[j] <= (index_t) UINT32_MAX);
-            uint32_t x = weights[j];
-            if (bin) {
-                fwrite32_little(&x, 1, scwfile);
-            } else {
-                fprintf(scwfile, "%" PRIu32 "\n", x);
-            }
-        }
-        fclose_maybe_compressed(scwfile, scwname);
-    }
-
-    {
-        free(smatname);
-        free(srwname);
-        free(scwname);
-    }
-    if (skip) {
-        free(dmatname);
-        free(drwname);
-        free(dcwname);
-    }
-
-    free(base);
-    free(weights);
-
-    return W;
-}
-
-
-// on input, colweight[j] contains the weight; on exit, colweight[j]
-// contains the new index for j. Heavier columns are in front of the new
-// matrix.
-static void
-renumber (index_t small_ncols, index_t *colweight, index_t ncols,
-          MAYBE_UNUSED const char *idealsfilename)
-{
-    index_t k, nb;
-    index_t *tmp;
-
-#ifdef FOR_DL
-    FILE *renumberfile = fopen_maybe_compressed (idealsfilename, "w");
-    if (renumberfile == NULL)
-    {
-      fprintf (stderr, "Error while opening file to save permutation of"
-                       "ideals\n");
-      exit(EXIT_FAILURE);
-    }
-#endif
-
-    ASSERT_ALWAYS(small_ncols);
-    tmp = (index_t *) malloc ((small_ncols << 1) * sizeof(index_t));
-    ASSERT_ALWAYS(tmp != NULL);
-    memset(tmp, 0, (small_ncols << 1) * sizeof(index_t));
-    for (k = 0, nb = 0; k < ncols; k++)
-      if (colweight[k] > 0)
-	{
-	  tmp[nb++] = colweight[k];
-	  tmp[nb++] = k;
-	}
-    ASSERT_ALWAYS(nb == 2 * small_ncols);
-#ifdef FOR_DL
-    fprintf (renumberfile, "# %" PRIu64 "\n", (uint64_t) small_ncols);
-#endif
-    printf ("Sorting %" PRIu64 " columns by decreasing weight\n",
-            (uint64_t) small_ncols);
-    fflush (stdout);
-    qsort (tmp, small_ncols, 2*sizeof(index_t), cmp_index2);
-    memset (colweight, 0, ncols * sizeof(index_t));
-    // useful for BW + skipping heavy part only...
-    index_signed_t j;
-    ASSERT_ALWAYS(nb >= 1);
-    for (j = (index_signed_t) (nb - 1), k = 1; j >= 0; j -= 2)
-      {
-        colweight[tmp[j]] = k++; // always this +1 trick
-#ifdef FOR_DL
-        fprintf (renumberfile, "%" PRIu64 " %" PRIx64 "\n",
-                 (uint64_t) colweight[tmp[j]]-1, (uint64_t) tmp[j]);
-#endif
-      }
-
-#ifdef FOR_DL
-    fclose_maybe_compressed (renumberfile, idealsfilename);
-#endif
-    free(tmp);
-}
+};
 
 // A line is "i i1 ... ik [#j]".
 // If i >= 0 then
@@ -391,48 +86,43 @@ renumber (index_t small_ncols, index_t *colweight, index_t ncols,
 //     row[-i-1] is to be added to rows i1...ik and NOT destroyed.
 //
 // If given, j is the index of the column used for pivoting (used in DL).
+struct his_line {
+    index_signed_t ind[MERGE_LEVEL_MAX];
+    int ni;
+    index_t j;
+
+    his_line() = default;
+    /* a comment line gives ni == 0 */
+    explicit his_line(char const * str) {
+        ni = *str == '#' ? 0 : parse_hisfile_line(ind, str, &j);
+    }
+    bool destroy() const { return ind[0] >= 0; }
+    index_t source() const { return destroy() ? ind[0] : -ind[0]-1; }
+};
+
 // If newrows=NULL, we only compute the index.
 static void
-doAllAdds(typerow_t **newrows, char *str, index_data_t index_data)
+doAllAdds(typerow_t **newrows, his_line const & line, index_data_t index_data)
 {
-  index_t j;
-  index_signed_t ind[MERGE_LEVEL_MAX], i0;
-  int ni, destroy;
+  index_t i0 = line.source();
 
-  ni = parse_hisfile_line (ind, str, &j);
+  for (int k = 1; k < line.ni; k++)
+    addRowsUpdateIndex(newrows, index_data, line.ind[k], i0, line.j);
 
-  if (ind[0] < 0)
+  if (!line.destroy())
+    return;
+
+  //destroy initial row!
+  if (newrows != NULL)
     {
-      destroy = 0;
-      i0 = -ind[0]-1;
+      heap_destroy_row(newrows[i0]);
+      newrows[i0] = NULL;
     }
-  else
+
+  if (index_data != NULL) // ie we want an index
     {
-      destroy = 1;
-      i0 = ind[0];
-    }
-#if DEBUG >= 1
-    fprintf(stderr, "first i is %d in %s", i0, str);
-#endif
-
-  for (int k = 1; k < ni; k++)
-    addRowsUpdateIndex(newrows, index_data, ind[k], i0, j);
-
-  if(destroy)
-    {
-      //destroy initial row!
-      if (newrows != NULL)
-        {
-          free(newrows[i0]);
-          newrows[i0] = NULL;
-        }
-
-      if (index_data != NULL) // ie we want an index
-      {
-        index_data[i0].n = 0;
-        free(index_data[i0].rels);
-        index_data[i0].rels = NULL;
-      }
+      heap_destroy_row(index_data[i0]);
+      index_data[i0] = NULL;
     }
 }
 
@@ -450,7 +140,7 @@ toFlush (const char *sparsename, typerow_t **sparsemat, index_t *colweight,
 
     printf("Renumbering columns (including sorting w.r.t. weight)\n");
     fflush(stdout);
-    renumber (small_ncols, colweight, ncols, idealsfilename);
+    renumber (small_ncols, colweight, ncols, NULL, idealsfilename);
 
     printf ("Sparse submatrix: nrows=%" PRIu64 " ncols=%" PRIu64 "\n",
             (uint64_t) small_nrows, (uint64_t) small_ncols - skip);
@@ -465,12 +155,14 @@ toFlush (const char *sparsename, typerow_t **sparsemat, index_t *colweight,
     }
 
     double tt = seconds();
+    double wt = wct_seconds();
     printf("Writing sparse representation to %s\n", sparsename);
     fflush(stdout);
-    W = flushSparse(sparsename, sparsemat,
+    W = flushSparse(sparsename, replay_rows { sparsemat },
                     nsquare_matrices ? small_ncols : small_nrows,
                     small_ncols, colweight, skip, bin);
-    printf("# Writing matrix took %.1lfs\n", seconds()-tt);
+    printf("# Writing matrix took %.1lfs (cpu), %.1lfs (wct)\n",
+           seconds()-tt, wct_seconds()-wt);
     printf("# Weight of the sparse submatrix: %lu\n", W);
     fflush(stdout);
 
@@ -484,13 +176,15 @@ toFlush (const char *sparsename, typerow_t **sparsemat, index_t *colweight,
         for (unsigned int i = 1; i < nsquare_matrices; i++)
         {
             double tt = seconds();
+            double wt = wct_seconds();
             char * smatname = derived_filename(sparsename, istr, ext);
             printf("Writing sparse representation to %s\n", smatname);
             fflush(stdout);
-            W = flushSparse(smatname, sparsemat+i, small_ncols, small_ncols,
+            W = flushSparse(smatname, replay_rows { sparsemat+i }, small_ncols, small_ncols,
                             colweight, skip, bin);
             istr[0]++;
-            printf("# Writing matrix took %.1lfs\n", seconds()-tt);
+            printf("# Writing matrix took %.1lfs (cpu), %.1lfs (wct)\n",
+                   seconds()-tt, wct_seconds()-wt);
             printf("# Weight of the sparse submatrix: %lu\n", W);
             fflush(stdout);
             free(smatname);
@@ -498,47 +192,217 @@ toFlush (const char *sparsename, typerow_t **sparsemat, index_t *colweight,
     }
 }
 
+/* A merge is a group of consecutive history lines. Its last line destroys
+ * the source row of the merge. merge writes the history pass by pass, and
+ * the merges of one pass touch disjoint rows.
+ *
+ * his_reader reads the history in blocks of whole merges. One thread
+ * reads the next block from the file while the other threads parse the
+ * lines of the current block in parallel. The reader then groups the
+ * parsed lines merge by merge into batches. All merges of one batch
+ * touch disjoint rows, so replay can apply the merges of one batch in
+ * parallel. A batch ends when the next merge touches a row that is busy
+ * in the batch, at max_lines lines, or at the end of the block. */
+struct his_reader {
+    static constexpr size_t max_lines = 1 << 18;
+    static constexpr size_t block_bytes = size_t(64) << 20;
+    FILE * hisfile;
+    index_t nrows;
+    index_t Nmax;
+    uint64_t addread = 0;
+    stats_data_t stats; /* struct for printing progress */
+    std::vector<char> block, next_block; /* whole merges of the history */
+    std::future<void> prefetch; /* the read of next_block */
+    std::vector<his_line> parsed; /* the lines of block, comments dropped */
+    size_t pend = 0; /* parsed[pend, next) is the merge read last, not yet in a batch */
+    size_t next = 0; /* the first line of parsed not yet read */
+    std::vector<uint8_t> busy; /* busy[i] != 0 if row i is in the batch */
+    std::vector<index_t> busy_rows;
+
+    his_reader(FILE * hisfile, index_t nrows, index_t Nmax)
+        : hisfile(hisfile), nrows(nrows), Nmax(Nmax), busy(nrows, 0)
+    {
+        /* will print report at 2^10, 2^11, ... 2^23 computed primes and every
+         * 2^23 primes after that */
+        stats_init (stats, stdout, &addread, 23, "Read", "row additions", "", "lines");
+        start_prefetch();
+    }
+    ~his_reader() { prefetch.wait(); }
+
+    /* Fills buf with the next block_bytes of the history, extended to the
+     * end of its last merge. An empty buf is the end of the history. */
+    void read_block(std::vector<char> & buf)
+    {
+        buf.resize(block_bytes);
+        buf.resize(fread(buf.data(), 1, block_bytes, hisfile));
+        if (buf.empty())
+            return;
+        char const * nl = (char const *) memrchr(buf.data(), '\n', buf.size());
+        size_t line = nl ? nl + 1 - buf.data() : 0;
+        for (;;) {
+            /* read the first byte of the line at buf[line] if it is not in */
+            if (line == buf.size()) {
+                int c = getc(hisfile);
+                if (c == EOF)
+                    return;
+                buf.push_back(c);
+            }
+            /* complete the line */
+            while (buf.back() != '\n') {
+                int c = getc(hisfile);
+                if (c == EOF) {
+                    buf.push_back('\n');
+                    return;
+                }
+                buf.push_back(c);
+            }
+            bool destroy = buf[line] != '-' && buf[line] != '#';
+            if (destroy)
+                return;
+            line = buf.size();
+        }
+    }
+
+    void start_prefetch()
+    {
+        prefetch = std::async(std::launch::async,
+                              [this]() { read_block(next_block); });
+    }
+
+    /* Parses the next block into parsed. Returns false at the end of the
+     * history. */
+    bool parse_block()
+    {
+        prefetch.get();
+        block.swap(next_block);
+        start_prefetch();
+        if (block.empty())
+            return false;
+        std::vector<char const *> lines;
+        char const * end = block.data() + block.size();
+        for (char const * p = block.data(); p < end;
+             p = (char const *) memchr(p, '\n', end - p) + 1)
+            lines.push_back(p);
+        parsed.resize(lines.size());
+#pragma omp parallel for schedule(static)
+        for (size_t l = 0; l < lines.size(); l++)
+            parsed[l] = his_line(lines[l]);
+        auto comment = [](his_line const & l) { return l.ni == 0; };
+        parsed.erase(std::remove_if(parsed.begin(), parsed.end(), comment),
+                     parsed.end());
+        pend = next = 0;
+        return true;
+    }
+
+    /* Reads one merge of the block into parsed[pend, next). Returns false
+     * when the number of rows is below Nmax. */
+    bool read_merge()
+    {
+        while (next < parsed.size() && nrows >= Nmax)
+        {
+            his_line const & line = parsed[next++];
+            addread++;
+
+            if (stats_test_progress(stats))
+                stats_print_progress (stats, addread, 0, 0, 0);
+
+            /* a merge that destroys its source row removes one row */
+            nrows -= line.destroy();
+            if (line.destroy())
+                return true;
+        }
+        return pend != next;
+    }
+
+    template<typename F> void for_each_pending_row(F f) const
+    {
+        for (size_t l = pend; l < next; l++) {
+            f(parsed[l].source());
+            for (int k = 1; k < parsed[l].ni; k++)
+                f((index_t) parsed[l].ind[k]);
+        }
+    }
+
+    /* Fills lines with the next merges that touch disjoint rows. The
+     * pointers are valid until the next call. merge_start[m] is the first
+     * line of merge m; the last entry is lines.size(). Returns false when
+     * there is no merge left. */
+    bool next_batch(std::vector<his_line const *> & lines,
+                    std::vector<size_t> & merge_start)
+    {
+        lines.clear();
+        merge_start.clear();
+        for (index_t i : busy_rows) busy[i] = 0;
+        busy_rows.clear();
+        while (lines.size() < max_lines) {
+            if (pend == next) {
+                if (next == parsed.size()) {
+                    /* the next block replaces parsed: end the batch here */
+                    if (!lines.empty()) break;
+                    if (!parse_block()) break;
+                }
+                if (!read_merge()) break;
+            }
+            bool conflict = false;
+            for_each_pending_row([&](index_t i) { conflict |= busy[i]; });
+            if (conflict) break;
+            for_each_pending_row([&](index_t i) {
+                    busy[i] = 1;
+                    busy_rows.push_back(i);
+                    });
+            merge_start.push_back(lines.size());
+            for (size_t l = pend; l < next; l++)
+                lines.push_back(&parsed[l]);
+            pend = next;
+        }
+        merge_start.push_back(lines.size());
+        return !lines.empty();
+    }
+};
+
 /* If newrows = NULL, only compute the index */
 static void
 build_newrows_from_file(typerow_t **newrows, FILE *hisfile,
                         index_data_t index_data, index_t nrows, index_t Nmax)
 {
-    uint64_t addread = 0;
-    char str[STRLENMAX];
-
     printf("Reading row additions\n");
     fflush(stdout);
-    stats_data_t stats; /* struct for printing progress */
-    /* will print report at 2^10, 2^11, ... 2^23 computed primes and every
-     * 2^23 primes after that */
-    stats_init (stats, stdout, &addread, 23, "Read", "row additions", "", "lines");
-    while(fgets(str, STRLENMAX, hisfile) && nrows >= Nmax)
-    {
-        if (str[0] == '#') continue;
-
-      addread++;
-
-      if (stats_test_progress(stats))
-        stats_print_progress (stats, addread, 0, 0, 0);
-
-      if(str[strlen(str)-1] != '\n')
-      {
-        fprintf(stderr, "Gasp: not a complete a line!");
-        fprintf(stderr, " I stop reading and go to the next phase\n");
-        break;
-      }
-      doAllAdds(newrows, str, index_data);
-      /* if the line starts with a negative index, the number of rows remains
-         unchanged, otherwise it decreases by one */
-      nrows -= str[0] != '-';
+    his_reader reader(hisfile, nrows, Nmax);
+    std::vector<his_line const *> lines;
+    std::vector<size_t> merge_start;
+    double t_read = 0, t_add = 0, t_gc = 0;
+    size_t nbatches = 0, nlines = 0;
+    auto lap = [t = wct_seconds()](double & acc) mutable {
+        double now = wct_seconds(); acc += now - t; t = now;
+    };
+    while (reader.next_batch(lines, merge_start)) {
+        lap(t_read);
+        nbatches++;
+        nlines += lines.size();
+        size_t nmerges = merge_start.size() - 1;
+#pragma omp parallel for schedule(dynamic, 16)
+        for (size_t m = 0; m < nmerges; m++)
+            for (size_t l = merge_start[m]; l < merge_start[m+1]; l++)
+                doAllAdds(newrows, *lines[l], index_data);
+        lap(t_add);
+        if (heap_waste_ratio() > 0.25)
+            heap_garbage_collection(newrows, index_data);
+        lap(t_gc);
     }
-    stats_print_progress (stats, addread, 0, 0, 1);
+    stats_print_progress (reader.stats, reader.addread, 0, 0, 1);
+    printf("Row additions: read %.1fs, add %.1fs, collect %.1fs (wct)\n",
+           t_read, t_add, t_gc);
+    printf("Row additions: %zu batches of %.0f lines on average\n",
+           nbatches, nbatches ? (double) nlines / nbatches : 0.0);
 }
 
 /* TODO: refactor with purged_file_reader in merge.cpp !!!
  */
 struct replay_read_data {
     typerow_t **mat = nullptr; // not owned
+#ifndef FOR_DL
+    staged_rows staged;
+#endif
     parameter<std::string,
         "purged",
         "input purged file">
@@ -595,6 +459,7 @@ struct replay_read_data {
             colmax() = std::numeric_limits<index_t>::max();
     }
 
+#ifdef FOR_DL
     template<typename relation_type>
     void fill_in_rows (relation_type & rel)
     {
@@ -605,45 +470,71 @@ struct replay_read_data {
             index_t h = pe.h;
             if (h < col0 || h >= colmax) continue;
             nb++;
-#ifdef FOR_DL
             exponent_t e = pe.e;
             buf[nb] = (ideal_merge_t) {.id = h, .e = e};
-#else
-            ASSERT_ALWAYS (pe.e == 1);
-            buf[nb] = h;
-#endif
             ASSERT (h < ncols);
         }
-#ifdef FOR_DL
         buf[0].id = nb;
-#else
-        buf[0] = nb;
-#endif
 
         qsort (&(buf[1]), nb, sizeof(typerow_t), cmp_typerow_t);
 
-        mat[rel.num] = mallocRow (nb + 1);
+        mat[rel.num] = heap_alloc_row (rel.num, nb);
         compressRow (mat[rel.num], buf, nb);
     }
 
+    void build_rows() {}
+#else
     template<typename relation_type>
-    size_t filter() {
-        using R = relation_type;
+    void fill_in_rows (relation_type & rel)
+    {
+        index_t buf[UMAX(weight_t)];
+
+        unsigned int nb = 0;
+        for (auto const & pe : rel.primes) {
+            index_t h = pe.h;
+            if (h < col0 || h >= colmax) continue;
+            ASSERT_ALWAYS (pe.e == 1);
+            ASSERT (h < ncols);
+            buf[nb++] = h;
+        }
+        std::sort(buf, buf + nb);
+        staged.add(rel.num, buf, nb);
+    }
+
+    void build_rows() {
+        ncols = ::build_rows(staged, ncols, mat);
+        fmt::print("{} columns appear in the matrix\n", ncols);
+        fflush(stdout);
+    }
+#endif
+
+    size_t read_serial() {
+        using R = cado::relation_building_blocks::primes_block<
+            prime_type_for_indexed_relations,
+            cado::relation_building_blocks::ab_ignore<16>>;
         return filter_rels<R>(purgedname, nullptr, nullptr,
                 [&](R & rel) { fill_in_rows(rel); });
     }
+
+#ifdef FOR_DL
+    size_t read_rows() { return read_serial(); }
+#else
+    size_t read_rows() {
+        if (!purgedfile_is_seekable(purgedname().c_str()))
+            return read_serial();
+        return read_purgedfile_in_parallel(purgedname().c_str(), col0,
+                colmax, NULL, staged);
+    }
+#endif
 
     size_t read(typerow_t ** newrows)
     {
         mat = newrows;
         fmt::print("Reading sparse matrix from {}\n", purgedname());
         fflush(stdout);
-        using relation_type =
-            cado::relation_building_blocks::primes_block<
-            prime_type_for_indexed_relations,
-            cado::relation_building_blocks::ab_ignore<16>>;
-        size_t nread = filter<relation_type>();
+        size_t nread = read_rows();
         ASSERT_ALWAYS (nread == nrows);
+        build_rows();
         return nread;
     }
 
@@ -655,9 +546,8 @@ struct replay_read_data {
            the purged file, to get the number of relations-sets. */
 
         for (index_t i = 0; i < nrows; i++) {
-            mat[i] = (typerow_t *) malloc(2 * sizeof(typerow_t));
+            mat[i] = heap_alloc_row(i, 1);
             setCell(mat[i], 1, i, 1);
-            setCell(mat[i], 0, 1, 1);
         }
     }
 };
@@ -675,31 +565,6 @@ struct replay_read_data {
    i1 is the index of the first relation in the first relation-set
    (should correspond to line i1+2 in *.purged.gz), and so on */
 
-static void
-writeIndex(const char *indexname, index_data_t index_data, index_t small_nrows)
-{
-    FILE *indexfile = NULL;
-    indexfile = fopen_maybe_compressed(indexname, "w");
-    ASSERT_ALWAYS (indexfile != NULL);
-    fprintf(indexfile, "%" PRIu64 "\n", (uint64_t) small_nrows);
-
-    for (index_t i = 0; i < small_nrows; ++i) {
-        ASSERT (index_data[i].n > 0);
-        fprintf(indexfile, "%d", index_data[i].n);
-        for (unsigned int j = 0; j < index_data[i].n; ++j) {
-#ifdef FOR_DL
-            fprintf(indexfile, " %" PRIx64 ":%d",
-                    (uint64_t) index_data[i].rels[j].ind_row,
-                    index_data[i].rels[j].e);
-#else
-            fprintf(indexfile, " %" PRIx64 "",
-                    (uint64_t) index_data[i].rels[j].ind_row);
-#endif
-        }
-        fprintf(indexfile, "\n");
-    }
-    fclose_maybe_compressed(indexfile, indexname);
-}
 
 static void
 generate_cyc (const char *outname, typerow_t **rows, index_t nrows)
@@ -738,6 +603,10 @@ fasterVersion (typerow_t **newrows, const char *sparsename,
   index_t *colweight = NULL;
   index_t small_nrows = 0, small_ncols;
   index_data_t index_data = NULL;
+  auto phase = [t0 = wct_seconds()](char const * what) {
+      printf("# %s at %.1fs (wct)\n", what, wct_seconds() - t0);
+      fflush(stdout);
+  };
 
   hisfile = fopen_maybe_compressed (hisname, "r");
   ASSERT_ALWAYS(hisfile != NULL);
@@ -748,22 +617,17 @@ fasterVersion (typerow_t **newrows, const char *sparsename,
      * relations.*/
     index_data = (relset_t *) malloc (nrows * sizeof(relset_t));
     ASSERT_ALWAYS (index_data != NULL);
+#pragma omp parallel for schedule(static)
     for (index_t i = 0; i < nrows; ++i)
-    {
-      index_data[i].n = 1;
-      index_data[i].rels = (multirel_t *) malloc (sizeof(multirel_t));
-      ASSERT_ALWAYS (index_data[i].rels != NULL);
-      index_data[i].rels[0].ind_row = i;
-#ifdef FOR_DL
-      index_data[i].rels[0].e = 1;
-#endif
-     }
+      index_data[i] = relset_singleton(i);
   }
   else
     index_data = NULL;
 
   /* read merges in the *.merge.his file and replay them */
+  phase("row additions start");
   build_newrows_from_file (newrows, hisfile, index_data, nrows, Nmax);
+  phase("row additions done");
 
   if (sparsename != NULL)
     {
@@ -784,21 +648,20 @@ fasterVersion (typerow_t **newrows, const char *sparsename,
     index_t j = 0;
     for (index_t i = 0; i < nrows; i++)
     {
-      if (index_data[i].n > 0)
+      if (index_data[i] != NULL)
         index_data[j++] = index_data[i];
-      else
-        free(index_data[i].rels);
     }
     if (sparsename != NULL)
       ASSERT_ALWAYS (j == small_nrows);
     else
       small_nrows = j;
 
+    phase("index write start");
     writeIndex (indexname, index_data, small_nrows);
+    phase("index write done");
 
-    for (index_t i = 0; i < small_nrows; ++i)
-      free (index_data[i].rels);
     free (index_data);
+    phase("index freed");
   }
 
   if (sparsename == NULL)
@@ -808,15 +671,20 @@ fasterVersion (typerow_t **newrows, const char *sparsename,
   colweight = (index_t*) malloc (ncols * sizeof(index_t));
   ASSERT_ALWAYS (colweight != NULL);
   memset (colweight, 0, ncols * sizeof(index_t));
-  for (index_t i = small_ncols = 0; i < small_nrows; i++)
+#pragma omp parallel for schedule(dynamic, 1024)
+  for (index_t i = 0; i < small_nrows; i++)
     for(unsigned int k = 1; k <= rowLength(newrows, i); k++)
     {
       index_t j = rowCell(newrows[i], k);
-      small_ncols += (colweight[j] == 0);
+#pragma omp atomic
       colweight[j] ++;
     }
   /* small_ncols is the number of columns with non-empty weight,
      i.e., the number of columns of the final matrix */
+  small_ncols = 0;
+#pragma omp parallel for reduction(+:small_ncols)
+  for (index_t j = 0; j < ncols; j++)
+    small_ncols += (colweight[j] != 0);
 
 #if defined FOR_DL && defined STAT_DL
   index_t count[11] = {0,0,0,0,0,0,0,0,0,0,0};
@@ -840,6 +708,7 @@ fasterVersion (typerow_t **newrows, const char *sparsename,
                    100 * (double) count[0]/nonzero);
 #endif
 
+  phase("column weights done");
   if (for_msieve)
     {
       /* generate the <dat_file_name>.cyc file in "indexname" */
@@ -860,11 +729,12 @@ fasterVersion (typerow_t **newrows, const char *sparsename,
     toFlush (sparsename, newrows, colweight, ncols, small_nrows, small_ncols,
              skip, bin, idealsfilename, nsquare_matrices);
 
+  phase("matrix written");
   /* Free */
   free (colweight);
-  for (index_t i = 0; i < small_nrows; i++)
-    free (newrows[i]);
+  heap_clear ();
   free (newrows);
+  phase("rows freed");
 
  close_and_exit:
   fclose_maybe_compressed (hisfile, hisname);
@@ -888,6 +758,7 @@ static void declare_usage(cxx_param_list & pl)
 
   pl.declare_usage("nsquare_matrices", "if non-zero, output that many "
                                 "square matrices by skipping rows (default 0)");
+  pl.declare_usage("t", "number of threads (default 1)");
 
   verbose_decl_usage(pl);
 }
@@ -904,6 +775,7 @@ int main(int argc, char const * argv[])
     uint64_t Nmax = 0;
     typerow_t **newrows;
     int bin = -1, skip = DEFAULT_MERGE_SKIP, for_msieve = 0;
+    int nthreads = 1;
     double cpu0 = seconds ();
     double wct0 = wct_seconds ();
 
@@ -933,6 +805,10 @@ int main(int argc, char const * argv[])
     pl.parse("skip", skip);
 #endif
     pl.parse("Nmax", Nmax);
+    pl.parse("t", nthreads);
+    ASSERT_ALWAYS(nthreads >= 1);
+    omp_set_num_threads(nthreads);
+    heap_setup();
     const char * path_antebuffer = pl.lookup_old("path_antebuffer");
 
 
@@ -963,16 +839,9 @@ int main(int argc, char const * argv[])
 #endif
     if (sparsename != NULL)
     {
-        if (has_suffix(sparsename, ".bin") || has_suffix(sparsename, ".bin.gz"))
-        {
-            bin = 1;
-            printf ("# Output matrices will be written in binary format\n");
-        }
-        else
-        {
-            bin = 0;
-            printf ("# Output matrices will be written in text format\n");
-        }
+        bin = matrix_name_is_binary(sparsename);
+        printf ("# Output matrices will be written in %s format\n",
+                bin ? "binary" : "text");
     }
 
     set_antebuffer_path (argv0, path_antebuffer);
@@ -988,8 +857,6 @@ int main(int argc, char const * argv[])
             rr.read_for_msieve(newrows);
         else
             rr.read(newrows);
-        fmt::print("The biggest index appearing in a relation is {}\n", rr.ncols);
-        fflush(stdout);
 #if DEBUG >=1
         for (index_t i = 0; i < nrows; i++)
         {

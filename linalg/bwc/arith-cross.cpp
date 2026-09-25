@@ -16,6 +16,7 @@
 #include "bblas_level3c.hpp"
 #include "bblas_mat64.hpp"
 #include "macros.h"
+#include "misc.h"
 
 /* code for add_dotprod {{{ */
 /* Parameter L may be fixed at the template level, and used as a way to
@@ -224,6 +225,144 @@ struct addmul_tiny {
             w0 += L;
         }
 #endif
+    }
+};
+
+/* The L == 1 case computes w[j] ^= u[j] * F for each of the n rows
+ * u[j], where F is the 64 by 64 bit matrix at v (row i of F is v[i]).
+ * mksol calls this once per iteration on the local vector block, so
+ * this case carries most of the mksol CPU time.  The table path
+ * (method of four Russians) works on every processor; the GFNI path
+ * replaces it at run time on processors with GFNI and AVX-512. */
+
+static void addmul_tiny_64_64_m4r(uint64_t * w, const uint64_t * u,
+        const uint64_t * v, unsigned int n)
+{
+    /* T[b][x] holds the product of byte value x by rows 8b..8b+7 */
+    uint64_t T[8][256];
+    for (unsigned int b = 0; b < 8; b++) {
+        T[b][0] = 0;
+        for (unsigned int x = 1; x < 256; x++) {
+            unsigned int const lsb = x & -x;
+            T[b][x] = T[b][x ^ lsb] ^ v[8 * b + cado_ctz(lsb)];
+        }
+    }
+    for (unsigned int j = 0; j < n; j++) {
+        uint64_t const a = u[j];
+        w[j] ^= T[0][a & 0xff]
+              ^ T[1][(a >> 8) & 0xff]
+              ^ T[2][(a >> 16) & 0xff]
+              ^ T[3][(a >> 24) & 0xff]
+              ^ T[4][(a >> 32) & 0xff]
+              ^ T[5][(a >> 40) & 0xff]
+              ^ T[6][(a >> 48) & 0xff]
+              ^ T[7][(a >> 56) & 0xff];
+    }
+}
+
+#if defined(__x86_64__) && defined(__GNUC__) && defined(HAVE_SSE2)
+#define ADDMUL_TINY_HAVE_GFNI 1
+
+static bool addmul_tiny_use_gfni()
+{
+    static bool const yes = __builtin_cpu_supports("gfni")
+        && __builtin_cpu_supports("avx512f")
+        && __builtin_cpu_supports("avx512bw")
+        && __builtin_cpu_supports("avx512vbmi");
+    return yes;
+}
+
+/* Pack the 8x8 bit block B (y = x * B, bit k = 2^k) into the operand
+ * qword of gf2p8affineqb.  The instruction computes, for output bit j,
+ * the parity of (operand byte (7 - j)) AND the input byte; so operand
+ * byte (7 - j) holds column j of B. */
+static uint64_t addmul_tiny_pack_affine(const uint8_t B[8])
+{
+    uint64_t A = 0;
+    for (unsigned int j = 0; j < 8; j++) {
+        uint8_t col = 0;
+        for (unsigned int k = 0; k < 8; k++)
+            col |= ((B[k] >> j) & 1) << k;
+        A |= (uint64_t) col << (8 * (7 - j));
+    }
+    return A;
+}
+
+/* Eight rows per step: one byte transpose, eight affine products (one
+ * per output byte column), and three vpermt2q rounds that fold the
+ * eight qword lanes of the eight affine outputs into one vector. */
+__attribute__((target("gfni,avx512f,avx512bw,avx512vbmi")))
+static void addmul_tiny_64_64_gfni(uint64_t * w, const uint64_t * u,
+        const uint64_t * v, unsigned int n)
+{
+    __m512i M[8];
+    for (unsigned int c = 0; c < 8; c++) {
+        uint64_t m[8];
+        for (unsigned int l = 0; l < 8; l++) {
+            uint8_t B[8];
+            for (unsigned int k = 0; k < 8; k++)
+                B[k] = (uint8_t) (v[8 * l + k] >> (8 * c));
+            m[l] = addmul_tiny_pack_affine(B);
+        }
+        M[c] = _mm512_loadu_si512(m);
+    }
+    /* qword l byte r of the transpose takes byte l of row r */
+    uint8_t tp[64];
+    for (unsigned int l = 0; l < 8; l++)
+        for (unsigned int r = 0; r < 8; r++)
+            tp[8 * l + r] = (uint8_t) (8 * r + l);
+    __m512i const TP = _mm512_loadu_si512(tp);
+    __m512i const EV = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    __m512i const OD = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+
+    unsigned int j = 0;
+    for (; j + 8 <= n; j += 8) {
+        __m512i const T = _mm512_permutexvar_epi8(TP,
+                _mm512_loadu_si512(u + j));
+        __m512i Y[8], A[4], B[2];
+        for (unsigned int c = 0; c < 8; c++)
+            Y[c] = _mm512_gf2p8affine_epi64_epi8(T, M[c], 0);
+        for (unsigned int c = 0; c < 4; c++)
+            A[c] = _mm512_xor_si512(
+                _mm512_permutex2var_epi64(Y[2*c], EV, Y[2*c+1]),
+                _mm512_permutex2var_epi64(Y[2*c], OD, Y[2*c+1]));
+        for (unsigned int c = 0; c < 2; c++)
+            B[c] = _mm512_xor_si512(
+                _mm512_permutex2var_epi64(A[2*c], EV, A[2*c+1]),
+                _mm512_permutex2var_epi64(A[2*c], OD, A[2*c+1]));
+        __m512i const G = _mm512_xor_si512(
+                _mm512_permutex2var_epi64(B[0], EV, B[1]),
+                _mm512_permutex2var_epi64(B[0], OD, B[1]));
+        _mm512_storeu_si512(w + j, _mm512_xor_si512(
+                    _mm512_loadu_si512(w + j),
+                    _mm512_permutexvar_epi8(TP, G)));
+    }
+    if (j < n)
+        addmul_tiny_64_64_m4r(w + j, u + j, v, n - j);
+}
+#endif
+
+template<>
+struct addmul_tiny<0,1> {
+    void operator()(
+            uint64_t * w,
+            const uint64_t * u,
+            const uint64_t * v,
+            unsigned int n,
+            unsigned int K,
+            unsigned int L) const
+    {
+        if (K != 1) {
+            ::addmul_tiny<0,0>()(w, u, v, n, K, L);
+            return;
+        }
+#ifdef ADDMUL_TINY_HAVE_GFNI
+        if (addmul_tiny_use_gfni()) {
+            addmul_tiny_64_64_gfni(w, u, v, n);
+            return;
+        }
+#endif
+        addmul_tiny_64_64_m4r(w, u, v, n);
     }
 };
 /* }}} */

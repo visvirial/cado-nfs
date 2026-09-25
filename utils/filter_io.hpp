@@ -612,6 +612,7 @@ namespace cado::relation_building_blocks {
 
             for( ; c && c != ':' ; c = *it++) ;
 
+            weight = 0;
             for(bool first = true ; first || (c && c != delim_after_primes) ; first = false) {
                 if (c == ':') {
                     /* skip over sides */

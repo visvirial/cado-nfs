@@ -17,6 +17,7 @@
 #include <unistd.h>     // pread
 #endif
 
+#include "bblas_level3a.hpp"
 #include "lingen_io_matpoly.hpp"
 #include "lingen_matpoly_select.hpp"
 #include "macros.h"
@@ -92,56 +93,90 @@ int lingen_io_matpoly<false>::write(matpoly<false>::arith_hard * ab, std::ostrea
     return k1 - k0;
 }
 #else
+/* In the file, one coefficient matrix is ns rows of pc words, each word
+ * packing 64 entries of the other dimension (the transpose flag swaps
+ * the roles of the rows and columns of M). In memory, the 64
+ * coefficients 64*kq..64*kq+63 of an entry are the word kq of that
+ * entry, so the word kq of 64 consecutive packed entries is a 64x64 bit
+ * matrix whose transpose has the file word of coefficient 64*kq+kr in
+ * row kr. The conversion goes 64 coefficients at a time through that
+ * transpose.
+ */
+static_assert(ULONG_BITS == 64, "the block transpose uses mat64");
+struct packed_layout {
+    unsigned int ns, np, pc;
+    bool transpose;
+    packed_layout(matpoly<true> const & M, int transpose)
+        : ns(transpose ? M.n : M.m)
+        , np(transpose ? M.m : M.n)
+        , pc(iceildiv(np, 64))
+        , transpose(transpose)
+    {}
+    size_t ulongs_per_mat() const { return ns * pc; }
+    unsigned long const * part(matpoly<true> const & M, unsigned int s, unsigned int p) const {
+        return transpose ? M.part(p, s) : M.part(s, p);
+    }
+    unsigned long * part(matpoly<true> & M, unsigned int s, unsigned int p) const {
+        return transpose ? M.part(p, s) : M.part(s, p);
+    }
+};
+
+/* the coefficients k0..k1-1, all with the same word index kq, as
+ * consecutive file matrices in buf */
+static void pack_block(packed_layout const & P, matpoly<true> const & M, unsigned int k0, unsigned int k1, unsigned long * buf)
+{
+    unsigned int const kq = k0 / 64;
+    for(unsigned int s = 0 ; s < P.ns ; s++) {
+        for(unsigned int pq = 0 ; pq < P.pc ; pq++) {
+            mat64 A, T;
+            for(unsigned int pr = 0 ; pr < 64 ; pr++) {
+                unsigned int const p = pq * 64 + pr;
+                A[pr] = p < P.np ? P.part(M, s, p)[kq] : 0;
+            }
+            mat64_transpose(T, A);
+            for(unsigned int k = k0 ; k < k1 ; k++)
+                buf[(k - k0) * P.ulongs_per_mat() + s * P.pc + pq] = T[k % 64];
+        }
+    }
+}
+
+static void unpack_block(packed_layout const & P, matpoly<true> & M, unsigned int k0, unsigned int k1, unsigned long const * buf)
+{
+    unsigned int const kq = k0 / 64;
+    unsigned long const keep = ~(((k1 - k0 == 64) ? ~0UL : ((1UL << (k1 - k0)) - 1)) << (k0 % 64));
+    for(unsigned int s = 0 ; s < P.ns ; s++) {
+        for(unsigned int pq = 0 ; pq < P.pc ; pq++) {
+            mat64 A, T;
+            for(unsigned int kr = 0 ; kr < 64 ; kr++) {
+                unsigned int const k = kq * 64 + kr;
+                A[kr] = (k0 <= k && k < k1) ? buf[(k - k0) * P.ulongs_per_mat() + s * P.pc + pq] : 0;
+            }
+            mat64_transpose(T, A);
+            for(unsigned int pr = 0 ; pr < 64 && pq * 64 + pr < P.np ; pr++) {
+                unsigned long & w = P.part(M, s, pq * 64 + pr)[kq];
+                w = (w & keep) | T[pr];
+            }
+        }
+    }
+}
+
 template<>
 int lingen_io_matpoly<true>::write(matpoly<true>::arith_hard *, std::ostream& os, matpoly<true> const & M, unsigned int k0, unsigned int k1, int ascii, int transpose)
 {
-    unsigned int const m = M.m;
-    unsigned int const n = M.n;
+    /* do we have an endian-robust wordsize-robust convention for
+     * printing bitstrings in hex ? it's not even clear that we should
+     * care -- after all, as long as mksol follows a consistent
+     * convention too, we should be fine. */
+    ASSERT_ALWAYS(!ascii);
     ASSERT_ALWAYS(k0 == k1 || (k0 < M.get_size() && k1 <= M.get_size()));
-    unsigned int const mc = iceildiv(M.m, ULONG_BITS);
-    unsigned int const nc = iceildiv(M.n, ULONG_BITS);
-    size_t const ulongs_per_mat = transpose ? (M.n * mc) : (M.m * nc);
-    std::vector<unsigned long> buf(ulongs_per_mat);
-    for(unsigned int k = k0 ; k < k1 ; k++) {
-        buf.assign(ulongs_per_mat, 0);
-        bool err = false;
-        size_t const kq = k / ULONG_BITS;
-        size_t const kr = k % ULONG_BITS;
-        unsigned long const km = 1UL << kr;
-        if (!transpose) {
-            for(unsigned int i = 0 ; i < m ; i++) {
-                unsigned long * v = &(buf[i * nc]);
-                for(unsigned int j = 0 ; j < n ; j++) {
-                    unsigned int const jq = j / ULONG_BITS;
-                    unsigned int const jr = j % ULONG_BITS;
-                    unsigned long const bit = (M.part(i, j)[kq] & km) != 0;
-                    v[jq] |= bit << jr;
-                }
-            }
-        } else {
-            for(unsigned int j = 0 ; j < n ; j++) {
-                unsigned long * v = &(buf[j * mc]);
-                for(unsigned int i = 0 ; i < m ; i++) {
-                    unsigned int const iq = i / ULONG_BITS;
-                    unsigned int const ir = i % ULONG_BITS;
-                    unsigned long const bit = (M.part(i, j)[kq] & km) != 0;
-                    v[iq] |= bit << ir;
-                }
-            }
-        }
-        if (ascii) {
-            /* do we have an endian-robust wordsize-robust convention for
-             * printing bitstrings in hex ?
-             *
-             * it's not even clear that we should care -- after all, as
-             * long as mksol follows a consistent convention too, we
-             * should be fine.
-             */
-            abort();
-        } else {
-            err = !(os.write((const char*) buf.data(), ulongs_per_mat * sizeof(unsigned long)));
-        }
-        if (err) return -1;
+    packed_layout const P(M, transpose);
+    std::vector<unsigned long> buf(P.ulongs_per_mat() * 64);
+    for(unsigned int k = k0 ; k < k1 ; ) {
+        unsigned int const kk = MIN(k1, (k / 64 + 1) * 64);
+        pack_block(P, M, k, kk, buf.data());
+        if (!os.write((const char*) buf.data(), (kk - k) * P.ulongs_per_mat() * sizeof(unsigned long)))
+            return -1;
+        k = kk;
     }
     return k1 - k0;
 }
@@ -274,141 +309,30 @@ int lingen_io_matpoly<false>::read(matpoly<false>::arith_hard * ab, FILE * f, ma
     return k1 - k0;
 }
 #else
-static int matpoly_read_inner(matpoly<true>::arith_hard *, FILE * f, matpoly<true> & M, unsigned int k0, unsigned int k1, int ascii, int transpose, off_t base, unsigned int batch = 1)
-{
-    /* Internally, the dimension of the matrix that are most packed
-     * (i.e., rows when in row-major order) are padded to multiples of
-     * ULONG_BITS
-     */
-    unsigned int const m = M.m;
-    unsigned int const n = M.n;
-    ASSERT_ALWAYS(k0 == k1 || (k0 < M.get_size() && k1 <= M.get_size()));
-    unsigned int const mc = iceildiv(M.m, ULONG_BITS);
-    unsigned int const nc = iceildiv(M.n, ULONG_BITS);
-    size_t const ulongs_per_mat = transpose ? (M.n * mc) : (M.m * nc);
-    batch = MIN(batch, k1 - k0);
-    std::vector<unsigned long> buf(ulongs_per_mat * batch);
-    for(unsigned int k = k0 ; k < k1 ; k+=batch) {
-        if (k + batch > k1) batch = k1 - k;
-        unsigned int good;
-        if (ascii) {
-            /* do we have an endian-robust wordsize-robust convention for
-             * printing bitstrings in hex ?
-             *
-             * it's not even clear that we should care -- after all, as long as
-             * mksol follows a consistent convention too, we should be fine.
-             */
-            abort();
-        } else {
-            int rc;
-            if (base < 0) {
-                rc = fread(buf.data(), sizeof(unsigned long), ulongs_per_mat * batch, f);
-                if (rc != (int) (ulongs_per_mat * batch) && ferror(f))
-                    return k - k0;
-            } else {
-                /* use pread -- good for multithreading */
-                size_t const one = ulongs_per_mat * sizeof(unsigned long);
-                off_t const off = base + (k - k0) * one;
-                ssize_t const r = pread(fileno(f), buf.data(), one * batch, off);
-                if (r < 0) rc = 0;
-                else rc = r / sizeof(unsigned long);
-            }
-            good = rc / ulongs_per_mat;
-        }
-        for(unsigned int b = 0 ; b < good ; b++) {
-            size_t const kq = (k + b) / ULONG_BITS;
-            size_t const kr = (k + b) % ULONG_BITS;
-            if (!transpose) {
-                for(unsigned int i = 0 ; i < m ; i++) {
-                    unsigned long * v = &(buf[b * ulongs_per_mat + i * nc]);
-                    for(unsigned int j = 0 ; j < n ; j++) {
-                        unsigned int const jq = j / ULONG_BITS;
-                        unsigned int const jr = j % ULONG_BITS;
-                        unsigned long const bit = (v[jq] >> jr) & 1;
-                        M.part(i, j)[kq] &= ~(1UL << kr);
-                        M.part(i, j)[kq] |= bit << kr;
-                    }
-                }
-            } else {
-                for(unsigned int j = 0 ; j < n ; j++) {
-                    unsigned long * v = &(buf[b * ulongs_per_mat + j * mc]);
-                    for(unsigned int i = 0 ; i < m ; i++) {
-                        unsigned int const iq = i / ULONG_BITS;
-                        unsigned int const ir = i % ULONG_BITS;
-                        unsigned long const bit = (v[iq] >> ir) & 1;
-                        M.part(i, j)[kq] &= ~(1UL << kr);
-                        M.part(i, j)[kq] |= bit << kr;
-                    }
-                }
-            }
-        }
-        if (good < batch) {
-            return k - k0 + good;
-        }
-    }
-    return k1 - k0;
-}
 template<>
-int lingen_io_matpoly<true>::read(matpoly<true>::arith_hard * ab, FILE * f, matpoly<true> & M, unsigned int k0, unsigned int k1, int ascii, int transpose)
+int lingen_io_matpoly<true>::read(matpoly<true>::arith_hard *, FILE * f, matpoly<true> & M, unsigned int k0, unsigned int k1, int ascii, int transpose)
 {
-    int rc = 0;
-    if (k0 % ULONG_BITS) {
-        unsigned int const fk0 = MIN(k1, k0 + ULONG_BITS - (k0 % ULONG_BITS));
-        rc += matpoly_read_inner(ab, f, M, k0, fk0, ascii, transpose, -1);
-        if (rc < (int) (fk0 - k0) || fk0 == k1)
-            return rc;
-        return rc + read(ab, f, M, fk0, k1, ascii, transpose);
-    }
-    if (k1 % ULONG_BITS) {
-        unsigned int const fk1 = MAX(k0, k1 - (k1 % ULONG_BITS));
-        if (k0 < fk1) {
-            /* recurse and to the bulk of the processing on aligned
-             * values */
-            rc += read(ab, f, M, k0, fk1, ascii, transpose);
-            if (rc < (int) (fk1 - k0))
-                return rc;
-        }
-        return rc + matpoly_read_inner(ab, f, M, fk1, k1, ascii, transpose, -1);
-    }
-
-    ASSERT_ALWAYS(!(k0 % ULONG_BITS));
-    ASSERT_ALWAYS(!(k1 % ULONG_BITS));
-
+    ASSERT_ALWAYS(!ascii);
+    ASSERT_ALWAYS(!M.check_pre_init());
+    ASSERT_ALWAYS(k0 == k1 || (k0 < M.get_size() && k1 <= M.get_size()));
+    packed_layout const P(M, transpose);
+    size_t const one = P.ulongs_per_mat() * sizeof(unsigned long);
     off_t const pos0 = ftell(f);
-    unsigned int const mc = iceildiv(M.m, ULONG_BITS);
-    unsigned int const nc = iceildiv(M.n, ULONG_BITS);
-    size_t const ulongs_per_mat = transpose ? (M.n * mc) : (M.m * nc);
-    size_t const one = ulongs_per_mat * sizeof(unsigned long);
-
+    unsigned int rc = 0;
+    /* one block of (at most) 64 coefficients per iteration, read with
+     * pread so that the blocks go in parallel */
 #ifdef HAVE_OPENMP
-#pragma omp parallel
+#pragma omp parallel for reduction(+:rc)
 #endif
-    {
-#ifdef HAVE_OPENMP
-        unsigned int nth = omp_get_num_threads();
-#else
-        unsigned int const nth = 1;
-#endif
-        unsigned int const dk = ((k1 - k0)/ULONG_BITS) / nth;
-        unsigned int const mk = ((k1 - k0)/ULONG_BITS) % nth;
-        unsigned int idx = 0;
-#ifdef HAVE_OPENMP
-        idx = omp_get_thread_num();
-#endif
-        unsigned int lk0 = k0 / ULONG_BITS + idx * dk + MIN(idx, mk);
-        unsigned int lk1 = lk0 + dk + (idx < mk);
-        lk0 *= ULONG_BITS;
-        lk1 *= ULONG_BITS;
-
-        off_t const base = pos0 + (lk0 - k0) * one;
-        int const my_rc = matpoly_read_inner(ab, f, M, lk0, lk1, ascii, transpose, base, UINT_MAX);
-
-#ifdef HAVE_OPENMP
-#pragma omp critical
-#endif
-        rc += my_rc;
+    for(unsigned int kq = k0 / 64 ; kq < iceildiv(k1, 64) ; kq++) {
+        unsigned int const a = MAX(k0, kq * 64);
+        unsigned int const b = MIN(k1, (kq + 1) * 64);
+        std::vector<unsigned long> buf(P.ulongs_per_mat() * (b - a));
+        ssize_t const r = pread(fileno(f), buf.data(), (b - a) * one, pos0 + (a - k0) * one);
+        unsigned int const good = r < 0 ? 0 : r / one;
+        unpack_block(P, M, a, a + good, buf.data());
+        rc += good;
     }
-
     fseek(f, pos0 + rc * one, SEEK_SET);
     return rc;
 }

@@ -17,6 +17,7 @@
 
 extern "C" {
 int hwloc_aux_get_depth_from_string(hwloc_topology_t topology, const char * desc);
+int hwloc_aux_topology_load(hwloc_topology_t topology);
 }
 
 /* Note that most hwloc structures are pimpls (hwloc_topology_t is a

@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -24,6 +26,7 @@
 #include "cxx_mpz.hpp"
 #include "misc.h"
 #include "getprime.h"
+#include "mmap_allocator.hpp"
 #include "gmp_aux.h"
 #include "fstream_maybe_compressed.hpp"
 #include "arith/mod_ul.h"
@@ -153,14 +156,12 @@ static renumber_t::corrupted_table prime_is_too_large(p_r_values_t p) {/*{{{*/
 #endif
     return renumber_t::corrupted_table(msg);
 }/*}}}*/
-static renumber_t::corrupted_table prime_maps_to_garbage(int format, p_r_values_t p, index_t i, p_r_values_t q)/*{{{*/
+static renumber_t::corrupted_table prime_maps_to_garbage(p_r_values_t p, index_t i, p_r_values_t q)/*{{{*/
 {
     auto msg = fmt::format("cached index for prime p=0x{:x} is 0x{:x},"
-            " which points to q=0x{:x} (should be {}) ;"
+            " which points to q=0x{:x} ;"
             " note: isprime(p)=={}",
-            p, i, q,
-            format == renumber_t::format_flat ? "p" : "vp",
-            ulong_isprime(p));
+            p, i, q, ulong_isprime(p));
     return renumber_t::corrupted_table(msg);
 }/*}}}*/
 static renumber_t::corrupted_table prime_maps_to_garbage(int format, p_r_values_t p, index_t i)/*{{{*/
@@ -297,16 +298,12 @@ renumber_t::cooked renumber_t::cook(unsigned long p, std::vector<std::vector<uns
          */
         for (auto it = roots[side].rbegin() ; it != roots[side].rend() ; ++it) {
             p_r_side const x { (p_r_values_t) p, (p_r_values_t) *it, side };
-            C.flat.emplace_back(
-                    std::array<p_r_values_t, 2> {{
-                    (p_r_values_t) p,
-                    compute_vr_from_p_r_side (x)
-                    }});
+            C.flat.emplace_back(p, compute_vr_from_p_r_side (x));
         }
     }
     C.text.clear();
     for(auto x : C.flat)
-        C.text += fmt::format("{} {}\n", x[0], x[1]);
+        C.text += fmt::format("{} {}\n", p, x.vr());
     return C;
 }
 
@@ -360,9 +357,8 @@ int renumber_t::is_bad (index_t & first, index_t i) const
  * if p is a non-prime, we return a lower bound for the first entry that
  * is >= p.
  */
-auto renumber_t::get_first_iterator_from_p(p_r_values_t p) const -> const_iterator
+index_t renumber_t::first_entry_from_p(p_r_values_t p) const
 {
-    // p_r_values_t side = x.side;
     if (p < index_from_p_cache.size()) {
         index_t i;
         /* Do this loop so that we can safely return something that is
@@ -370,19 +366,16 @@ auto renumber_t::get_first_iterator_from_p(p_r_values_t p) const -> const_iterat
          */
         for( ; ; p++) {
             if (p >= index_from_p_cache.size())
-                return get_first_iterator_from_p(p);
+                return first_entry_from_p(p);
             i = index_from_p_cache[p];
             if (i != std::numeric_limits<index_t>::max())
                 break;
         }
         if (UNLIKELY((above_bad + i) >= size()))
             throw prime_maps_to_garbage(format, p, i);
-        if (format == format_flat) {
-            if (UNLIKELY(flat_data[i][0] != p))
-                throw prime_maps_to_garbage(format, p, i, flat_data[i][0]);
-        }
-        index_t const outer_idx = i + above_bad;
-        return { *this, outer_idx };
+        if (UNLIKELY(flat_p(i) != p))
+            throw prime_maps_to_garbage(p, i, flat_p(i));
+        return i;
     }
 
     /* Note that if lpbmax is > the width of the type, then
@@ -397,27 +390,22 @@ auto renumber_t::get_first_iterator_from_p(p_r_values_t p) const -> const_iterat
     if (lpbmax < (8 * sizeof(p_r_values_t)) && UNLIKELY(p >> lpbmax))
         throw prime_is_too_large(p);
 
-    std::array<p_r_values_t, 2> const p0 {{ p, 0 }};
-    {
-        auto it = std::lower_bound(flat_data.begin(), flat_data.end(), p0);
-        if (it == flat_data.end())
-            throw prime_is_too_large(p);
-        if ((*it)[0] != p) {
-            /* we can reach here if p is not prime and we simply want a
-             * good lower bound on the entries that are >= p. For this,
-             * std::lower_bound really is the thing that we want.
-             *
-             * Here, (*it)[0] is a prime larger than p. But by the
-             * definition of lower_bound, (*--it)[0] is a prime that
-             * is less than p, and we definitely don't want to return
-             * that. So the good answer is really the thing that is
-             * pointed to by the iterator it.
-             */
-            //throw prime_maps_to_garbage(format, p, i, (*it)[0]);
-        }
-        index_t const outer_idx = it - flat_data.begin() + above_bad;
-        return { *this, outer_idx };
-    }
+    /* if p is not prime, this is the first entry above p, which is
+     * exactly the lower bound that we want */
+    size_t const b = p >> flat_index_shift;
+    auto it = std::lower_bound(
+            flat_data.begin() + flat_index[b],
+            flat_data.begin() + flat_index[b + 1],
+            flat_entry(p, 0));
+    if (it == flat_data.end())
+        throw prime_is_too_large(p);
+    return it - flat_data.begin();
+}
+
+p_r_values_t renumber_t::flat_p(index_t i) const
+{
+    size_t const b = std::upper_bound(flat_index.begin(), flat_index.end(), i) - flat_index.begin() - 1;
+    return (p_r_values_t(b) << flat_index_shift) | flat_data[i].p_low();
 }
 
 index_t renumber_t::index_from_p_r (p_r_side x) const
@@ -443,11 +431,12 @@ index_t renumber_t::index_from_p_r (p_r_side x) const
         }
         throw cannot_find_pr(x);
     }
-    p_r_values_t const vr = compute_vr_from_p_r_side(x);
-
-    for(auto it = get_first_iterator_from_p(x.p) ; it.raw()[0] == x.p ; ++it) {
-        if (it.raw()[1] == vr)
-            return it.i;
+    /* the entries of p are consecutive within its bucket */
+    flat_entry const e(x.p, compute_vr_from_p_r_side(x));
+    index_t const end = flat_index[(x.p >> flat_index_shift) + 1];
+    for(index_t i = first_entry_from_p(x.p) ; i < end && flat_data[i].p_low() == e.p_low() ; i++) {
+        if (flat_data[i].value() == e.value())
+            return above_bad + i;
     }
     throw cannot_find_pr(x);
 }
@@ -472,7 +461,7 @@ renumber_t::const_iterator renumber_t::iterator_from_p(p_r_values_t p0) const
         return end();
     const_iterator it = begin();
     if (p0 >= bad_ideals_max_p)
-        it = get_first_iterator_from_p(p0);
+        it = { *this, above_bad + first_entry_from_p(p0) };
     for( ; it != end() && (*it).p < p0 ; ++it);
     return it;
 }
@@ -622,10 +611,7 @@ renumber_t::p_r_side renumber_t::p_r_from_index (index_t i) const
         throw corrupted_table("bad bad ideals");
     }
     i -= above_bad;
-
-    p_r_values_t const p = flat_data[i][0];
-    p_r_values_t const vr = flat_data[i][1];
-    return compute_p_r_side_from_p_vr(p, vr);
+    return compute_p_r_side_from_p_vr(flat_p(i), flat_data[i].vr());
 }
 
 static uint64_t previous_prime_of_powers_of_2[65] = { 0x0, 0x0, 0x3, 0x7, 0xd,
@@ -648,17 +634,18 @@ static void check_needed_bits(unsigned int nbits)
     if (nbits > 8 * sizeof(p_r_values_t))
         throw std::overflow_error("p_r_values_t is too small to store ideals, "
                 "recompile with FLAGS_SIZE=\"-DSIZEOF_P_R_VALUES=8\"\n");
+    if (nbits > renumber_t::flat_entry::vr_bits)
+        throw std::overflow_error(fmt::format(
+                    "the renumber table entries hold {} bits, "
+                    "the large prime bounds need {}\n",
+                    renumber_t::flat_entry::vr_bits, nbits));
 }
 
+/* the bits of the largest vp, given the lpbs and the number of sides */
 unsigned int renumber_t::needed_bits() const
 {
-    /* based on the lpbs and the number of sides, return 32 or 64 */
     uint64_t const p = previous_prime_of_powers_of_2[get_max_lpb()];
-    uint64_t const vp = vp_from_p(p, get_nb_polys(), get_rational_side() >= 0, format);
-    if (nbits (vp) <= 32)
-        return 32;
-    else
-        return 64;
+    return nbits(vp_from_p(p, get_nb_polys(), get_rational_side() >= 0, format));
 }
 
 void renumber_t::set_format(int f)
@@ -903,7 +890,9 @@ void renumber_t::use_cooked(p_r_values_t p, cooked const & C)
      */
     index_t const pos_hard = flat_data.size();
     above_all = use_cooked_nostore(above_all, p, C);
-    flat_data.insert(flat_data.end(), C.flat.begin(), C.flat.end());
+    flat_index_push(pos_hard, p);
+    for(auto const & x : C.flat)
+        flat_data.push_back(x);
     if (!(p >> RENUMBER_MAX_LOG_CACHED) && p >= index_from_p_cache.size()) {
         index_from_p_cache.insert(index_from_p_cache.end(),
                 p - index_from_p_cache.size(),
@@ -928,29 +917,101 @@ void renumber_t::read_table(std::istream& is)
     stats_init(stats, stdout, &nprimes, 23, "Read", "primes", "", "p");
     for(std::string s; std::ws(is).peek() == '#' ; getline(is, s) ) ;
     for(p_r_values_t p, r ; is >> p >> r ; ) {
-        flat_data.emplace_back(std::array<p_r_values_t, 2> {{ p, r }});
+        flat_index_push(flat_data.size(), p);
+        flat_data.emplace_back(p, r);
         above_all++;
         nprimes++;
     }
     stats_print_progress(stats, nprimes, 0, 0, 1);
+    flat_index_finish(flat_data.size());
+    build_index_from_p_cache();
+}
 
-    {
-        index_t i = 0;
-        for( ; i < flat_data.size() ; i++)  {
-            auto pvr = flat_data[i];
-            p_r_values_t const p = pvr[0];
-            if (p >> RENUMBER_MAX_LOG_CACHED)
-                break;
-            if (p < index_from_p_cache.size())
-                continue;
-            index_from_p_cache.insert(index_from_p_cache.end(),
-                    p - index_from_p_cache.size(),
-                    std::numeric_limits<index_t>::max());
-            ASSERT_ALWAYS(index_from_p_cache.size() == p);
-            index_from_p_cache.push_back(i);
-        }
-        above_cache = above_bad + i;
+/* Buckets are 2^flat_index_shift wide in p, so they hold about
+ * 2^flat_index_shift * nsides / log(p) entries each: 10 to 40 at the
+ * large prime bounds in use, and a lookup reads one or two cache lines
+ * of flat_data instead of walking a binary search over the whole table.
+ */
+void renumber_t::flat_index_push(index_t i, p_r_values_t p)
+{
+    size_t const b = p >> flat_index_shift;
+    ASSERT_ALWAYS(b < flat_index_nbuckets());
+    for( ; flat_index.size() <= b ; )
+        flat_index.push_back(i);
+}
+
+void renumber_t::flat_index_finish(index_t nflat)
+{
+    for( ; flat_index.size() <= flat_index_nbuckets() ; )
+        flat_index.push_back(nflat);
+}
+
+void renumber_t::build_index_from_p_cache()
+{
+    index_t i = 0;
+    for( ; i < flat_data.size() ; i++)  {
+        p_r_values_t const p = flat_p(i);
+        if (p >> RENUMBER_MAX_LOG_CACHED)
+            break;
+        if (p < index_from_p_cache.size())
+            continue;
+        index_from_p_cache.insert(index_from_p_cache.end(),
+                p - index_from_p_cache.size(),
+                std::numeric_limits<index_t>::max());
+        ASSERT_ALWAYS(index_from_p_cache.size() == p);
+        index_from_p_cache.push_back(i);
     }
+    above_cache = above_bad + i;
+}
+
+auto renumber_t::read_flat_table_trailer(std::string const & filename) -> std::optional<flat_table_trailer>
+{
+    static_assert(sizeof(flat_table_trailer) == 40);
+    std::ifstream is(filename, std::ios::binary | std::ios::ate);
+    if (is.tellg() < std::streamoff(sizeof(flat_table_trailer)))
+        return {};
+    flat_table_trailer T;
+    is.seekg(-std::streamoff(sizeof(T)), std::ios::end);
+    is.read(reinterpret_cast<char *>(&T), sizeof(T));
+    if (T.magic == flat_table_trailer::magic_value || T.magic == flat_table_trailer::magic_v1)
+        return T;
+    /* a binary table of another version, not a text table */
+    if (std::equal(T.magic.begin(), T.magic.end() - 1, flat_table_trailer::magic_value.begin()))
+        throw corrupted_table(fmt::format("{} holds a binary table of version {}, not {}",
+                    filename, T.magic.back(), flat_table_trailer::magic_value.back()));
+    return {};
+}
+
+void renumber_t::read_table_v1(std::string const & filename, flat_table_trailer const & T)
+{
+    ASSERT_ALWAYS(T.sizeof_p_r_values == sizeof(p_r_values_t));
+    std::ifstream is(filename, std::ios::binary);
+    is.seekg(T.offset);
+    std::vector<std::array<p_r_values_t, 2>> buf(size_t(1) << 20);
+    flat_data.reserve(T.nflat);
+    for(index_t n = 0 ; n < T.nflat ; ) {
+        size_t const k = std::min(buf.size(), size_t(T.nflat - n));
+        ASSERT_ALWAYS(is.read(reinterpret_cast<char *>(buf.data()), k * sizeof(buf[0])));
+        for(size_t j = 0 ; j < k ; j++, n++) {
+            flat_index_push(n, buf[j][0]);
+            flat_data.emplace_back(buf[j][0], buf[j][1]);
+        }
+    }
+    above_all = above_bad + T.nflat;
+    flat_index_finish(T.nflat);
+    build_index_from_p_cache();
+}
+
+void renumber_t::mmap_table(std::string const & filename, flat_table_trailer const & T)
+{
+    ASSERT_ALWAYS(T.sizeof_p_r_values == sizeof(p_r_values_t));
+    ASSERT_ALWAYS(T.sizeof_index == sizeof(index_t));
+    ASSERT_ALWAYS(T.nindex == flat_index_nbuckets() + 1);
+    using mmap_allocator_details::READ_ONLY;
+    flat_data.mmap_file(filename, READ_ONLY, T.offset, T.nflat);
+    flat_index.mmap_file(filename, READ_ONLY, T.flat_index_offset(), T.nindex);
+    above_all = above_bad + T.nflat;
+    build_index_from_p_cache();
 }
 
 void renumber_t::read_from_file(std::string const & filename, bool for_dl)
@@ -962,7 +1023,16 @@ void renumber_t::read_from_file(std::string const & filename, bool for_dl)
         use_additional_columns_for_dl();
     read_header(is);
     info(std::cout);
-    read_table(is);
+    auto const T = read_flat_table_trailer(filename);
+    if (!T) {
+        read_table(is);
+    } else if (T->magic == flat_table_trailer::magic_v1) {
+        fmt::print("# Reading the version 1 binary renumber table ({} entries) from {}\n", T->nflat, filename);
+        read_table_v1(filename, *T);
+    } else {
+        fmt::print("# Mapping the binary renumber table ({} entries) from {}\n", T->nflat, filename);
+        mmap_table(filename, *T);
+    }
     more_info(std::cout);
     
     /* It's used by inertia_from_p_r */
@@ -1003,7 +1073,7 @@ std::string renumber_t::debug_data(index_t i) const
         s += fmt::format(" above ({},{}) on side {}", x.p, x.r, x.side);
     } else {
         i -= above_bad;
-        s += fmt::format(" (0x{:x},0x{:x})", flat_data[i][0], flat_data[i][1]);
+        s += fmt::format(" (0x{:x},0x{:x})", flat_p(i), flat_data[i].vr());
         if (x.side == get_rational_side()) {
             s += fmt::format(" p=0x{:x} rat side {}", x.p, x.side);
         } else {
@@ -1212,11 +1282,16 @@ struct renumber_t::builder{/*{{{*/
 
     renumber_t & R;
     std::ostream * os_p;
+    /* An uncompressed output file gets the table in binary form, so
+     * that readers can mmap it. The index is built in R.flat_index as
+     * the entries are written, and stored after them.
+     */
+    std::optional<flat_table_trailer> trailer;
     renumber_t::hook * hook;
     stats_data_t stats;
     uint64_t nprimes = 0; // sigh... *must* be ulong for stats().
     index_t R_max_index; // we *MUST* follow it externally, since we're not storing the table in memory.
-    builder(renumber_t & R, std::ostream * os_p, renumber_t::hook * hook)
+    builder(renumber_t & R, ofstream_maybe_compressed * os_p, renumber_t::hook * hook)
         : R(R)
         , os_p(os_p)
         , hook(hook)
@@ -1225,6 +1300,24 @@ struct renumber_t::builder{/*{{{*/
         /* will print report at 2^10, 2^11, ... 2^23 computed primes
          * and every 2^23 primes after that */
         stats_init(stats, stdout, &nprimes, 23, "Processed", "primes", "", "p");
+        if (!os_p || os_p->is_pipe())
+            return;
+        for( ; os_p->tellp() % 4096 ; ) os_p->put('\n');
+        trailer.emplace();
+        trailer->offset = os_p->tellp();
+        trailer->nflat = 0;
+    }
+    void write_table_end() {
+        R.flat_index_finish(trailer->nflat);
+        trailer->nindex = R.flat_index.size();
+        ASSERT_ALWAYS(uint64_t(os_p->tellp()) == trailer->offset + trailer->nflat * sizeof(flat_entry));
+        for( ; uint64_t(os_p->tellp()) < trailer->flat_index_offset() ; ) os_p->put('\0');
+        write_raw(R.flat_index);
+        os_p->write(reinterpret_cast<char const *>(&*trailer), sizeof(*trailer));
+    }
+    template<typename T> void write_raw(T const & v) {
+        os_p->write(reinterpret_cast<char const *>(v.data()),
+                v.size() * sizeof(v[0]));
     }
     void progress() {
         if (stats_test_progress(stats))
@@ -1313,13 +1406,18 @@ void renumber_t::builder::postprocess(prime_chunk & P)/*{{{*/
 
         if (hook) (*hook)(R, p, R_max_index, C);
 
-        if (os_p) {
-            R_max_index = R.use_cooked_nostore(R_max_index, p, C);
-            (*os_p) << C.text;
-        } else {
+        if (!os_p) {
             ASSERT_ALWAYS(R_max_index == R.get_max_index());
             R.use_cooked(p, C);
             R_max_index = R.get_max_index();
+        } else if (!trailer) {
+            R_max_index = R.use_cooked_nostore(R_max_index, p, C);
+            (*os_p) << C.text;
+        } else {
+            R_max_index = R.use_cooked_nostore(R_max_index, p, C);
+            R.flat_index_push(trailer->nflat, p);
+            trailer->nflat += C.flat.size();
+            write_raw(C.flat);
         }
 
         nprimes++;
@@ -1383,6 +1481,11 @@ index_t renumber_t::builder::operator()()/*{{{*/
         }
     }
 
+    if (trailer)
+        write_table_end();
+    else if (!os_p)
+        R.flat_index_finish(R.flat_data.size());
+
     return R_max_index;
 }/*}}}*/
 
@@ -1416,7 +1519,7 @@ index_t renumber_t::build(cxx_param_list & pl, bool for_dl, hook * f)
 
     check_needed_bits(needed_bits());
 
-    std::unique_ptr<std::ostream> out;
+    std::unique_ptr<ofstream_maybe_compressed> out;
 
     if (renumberfilename) {
         out.reset(new ofstream_maybe_compressed(renumberfilename));
@@ -1476,7 +1579,8 @@ std::array<p_r_values_t, 2> renumber_t::const_iterator::raw() const
 {
     ASSERT_ALWAYS(i >= table->above_bad);
     ASSERT_ALWAYS(i < table->get_max_index());
-        return table->flat_data[i - table->above_bad];
+    index_t const j = i - table->above_bad;
+    return {{ table->flat_p(j), table->flat_data[j].vr() }};
 }
 
 renumber_t::const_iterator renumber_t::const_iterator::operator++(int)
@@ -1500,11 +1604,11 @@ renumber_t::const_iterator& renumber_t::const_iterator::operator++()
 
 int renumber_t::inertia_from_p_r(p_r_side x) const
 {
-    cxx_mpz_poly const f(cpoly[x.side]);
-    if (f.degree() == 1) return 1;
+    if (get_poly_deg(x.side) == 1) return 1;
 
     for(auto const & y : small_primes[x.side]) {
         if (x.p == y.first) {
+            cxx_mpz_poly const f(cpoly[x.side]);
             static std::mutex m;
             {
                 std::lock_guard<std::mutex> const dummy(m);

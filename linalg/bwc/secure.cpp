@@ -354,11 +354,18 @@ static void * sec_prog(parallelizing_info & pi, cxx_param_list & pl, void * arg 
             arith_generic::elt * Rdata = A->vec_subvec(Rdata_stream, (k-k0) * nchecks);
             /* At this point Rdata should be consistent across all
              * threads */
+            bwc_dev_fetch(mmt_my_own_subvec(my),
+                    A->vec_elt_stride(mmt_my_own_size_in_items(my)));
+            /* addmul_tiny reads and writes the accumulator */
+            bwc_dev_fetch(mmt_my_own_subvec(dvec),
+                    A->vec_elt_stride(mmt_my_own_size_in_items(my)));
             AxA->addmul_tiny(
                     mmt_my_own_subvec(dvec),
                     mmt_my_own_subvec(my),
                     Rdata,
                     mmt_my_own_size_in_items(my));
+            bwc_dev_push(mmt_my_own_subvec(dvec),
+                    A->vec_elt_stride(mmt_my_own_size_in_items(my)));
             /* addmul_tiny degrades consistency ! */
             dvec.consistency = 1;
             mmt_vec_broadcast(dvec);

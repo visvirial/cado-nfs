@@ -21,7 +21,8 @@ target_link_libraries(purge utils_with_io)
 
 add_executable(merge merge.cpp merge_heap.c merge_bookkeeping.c
     merge_compute_weights.c
-    read_purgedfile_in_parallel.cpp mst.c merge_replay_matrix.c sparse.c)
+    read_purgedfile_in_parallel.cpp mst.c merge_replay_matrix.c sparse.c
+    matrix_output.cpp)
 target_link_libraries(merge utils_with_io)
 mark_targets_as_openmp(merge)
 
@@ -31,17 +32,21 @@ endmacro()
 
 add_executable(merge-dl merge.cpp merge_heap.c merge_bookkeeping.c
     merge_compute_weights.c
-    read_purgedfile_in_parallel.cpp mst.c merge_replay_matrix.c sparse.c)
+    read_purgedfile_in_parallel.cpp mst.c merge_replay_matrix.c sparse.c
+    matrix_output.cpp)
 target_link_libraries(merge-dl utils_with_io)
 mark_targets_as_dl(merge-dl)
 mark_targets_as_openmp(merge-dl)
 
-add_executable(replay replay.cpp sparse.c)
+add_executable(replay replay.cpp sparse.c matrix_output.cpp merge_heap.c
+    read_purgedfile_in_parallel.cpp)
 target_link_libraries(replay utils_with_io)
+mark_targets_as_openmp(replay)
 
-add_executable(replay-dl replay.cpp sparse.c)
+add_executable(replay-dl replay.cpp sparse.c matrix_output.cpp merge_heap.c)
 target_link_libraries(replay-dl utils_with_io)
 mark_targets_as_dl(replay-dl)
+mark_targets_as_openmp(replay-dl)
 
 add_executable(reconstructlog-dl reconstructlog.cpp)
 target_link_libraries(reconstructlog-dl utils_with_io)

@@ -538,6 +538,32 @@ cado_define_test(c60_fakereltest
     TIMEOUT 60
 )
 
+# Chunks of one chunk list take their seed from the optional fifth field
+cado_define_test(c60_fakerels_chunklist
+    PROVIDE_TEMPORARY_WDIR
+    SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/c60.fakerels.chunklist.sh
+    TARGET_DEPENDENCIES fake_rels freerel
+    TIMEOUT 60
+)
+
+# -shrink-factor can map an index of each side to the same column; the
+# output holds every column at most once
+cado_define_test(c60_fakerels_shrink
+    PROVIDE_TEMPORARY_WDIR
+    SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/c60.fakerels.shrink.sh
+    TARGET_DEPENDENCIES fake_rels freerel
+    TIMEOUT 60
+)
+
+cado_define_test(fakerels_noargs
+    SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/fakerels.noargs.sh
+    TARGET_DEPENDENCIES fake_rels
+    TIMEOUT 60
+)
+
 # Try with default TRIALDIV_MAXLEN, whatever it may be
 # tests in debug mode tend to take very long when used with GLIBCXX_DEBUG
 cado_define_test(test_trialdiv.cpp

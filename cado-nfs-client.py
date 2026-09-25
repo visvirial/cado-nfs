@@ -25,6 +25,8 @@ import logging
 import socket
 import signal
 import re
+import threading
+import queue
 import json
 from io import BytesIO
 from string import Template
@@ -476,10 +478,11 @@ class NoMoreServers(Exception):
 
 
 class Server(object):
-    def __init__(self, index, url, cafile=None, certdigest=None):
+    def __init__(self, index, url, timeout, cafile=None, certdigest=None):
         print(f"url={url}")
         self.index = index
         self.url = url
+        self.timeout = timeout
         assert (cafile is None) == (certdigest is None)
         self.cafile = cafile
         self.certdigest = certdigest
@@ -517,7 +520,9 @@ class Server(object):
 
         If the fingerprint check fails, exits with error.
 
-        If the server refuses connections and retry is False, returns False;
+        If the server refuses connections or does not complete the
+        download within the network timeout, and retry is False,
+        returns False;
 
         If retry is a nonzero value, keeps trying indefinitely.
         """
@@ -545,8 +550,12 @@ class Server(object):
                 """
                 try:
                     cert = ssl.get_server_certificate((self.ip, self.port),
-                                                      ca_certs=None)
+                                                      ca_certs=None,
+                                                      timeout=self.timeout)
                     break
+                except TimeoutError:
+                    if not retry:
+                        return False
                 except socket.error as err:
                     if err.errno != errno.ECONNREFUSED:
                         raise
@@ -583,6 +592,7 @@ class Server(object):
 
     def _req(self, req, ep, *args, **kwargs):
         kwargs['verify'] = self.cafile if self.cafile else False
+        kwargs['timeout'] = self.timeout
         logging.debug(f"arguments to {req} {ep}: %s", kwargs)
         resp = getattr(requests, req)(self.get_url(ep), *args, **kwargs)
         self.worked_once = True
@@ -601,6 +611,7 @@ class ServerPool(object):  # {{{
         self.has_https = False
         self.current_index = 0
         self.wait = float(settings["DOWNLOADRETRY"])
+        timeout = float(settings["NETWORK_TIMEOUT"])
 
         self.has_https = any([urlparse(ss)[0] == "https"
                               for ss in settings["SERVER"]])
@@ -612,7 +623,7 @@ class ServerPool(object):  # {{{
                 logging.warning("Option --certsha1 makes sense only with"
                                 " https URLs, ignoring it.")
             for i, ss in enumerate(settings["SERVER"]):
-                self.servers.append(Server(i, ss))
+                self.servers.append(Server(i, ss, timeout))
             return
 
         if settings["CERTSHA1"] is None and not settings["NO_CN_CHECK"]:
@@ -625,7 +636,7 @@ class ServerPool(object):  # {{{
                             " but no --certsha1 option,"
                             " NO SSL VALIDATION WILL BE PERFORMED.")
             for i, ss in enumerate(settings["SERVER"]):
-                self.servers.append(Server(i, ss))
+                self.servers.append(Server(i, ss, timeout))
             return
 
         if len(settings["CERTSHA1"]) != len(settings["SERVER"]):
@@ -641,7 +652,7 @@ class ServerPool(object):  # {{{
             if scheme == "https":
                 cafile = os.path.join(settings["DLDIR"],
                                       "server.%s.pem" % certsha1)
-            self.servers.append(Server(i, ss, cafile, certsha1))
+            self.servers.append(Server(i, ss, timeout, cafile, certsha1))
 
             # Try downloading the certificate once. If connection is
             # refused, proceed to daemonizing - hopefully server will
@@ -757,7 +768,6 @@ class WorkunitProcessor(object):
         self.failedcommand = None
 
         self.stdio = {"stdout": [], "stderr": []}
-        self._answer = None
 
     def __str__(self):
         return "Processor for Workunit:\n%s" % super(WorkunitProcessor, self)
@@ -978,8 +988,9 @@ class WorkunitProcessor(object):
                 # The file won't exist if the program failed too early on.
                 logging.error("Could not remove file: %s", err)
 
-    def prepare_answer(self):
-        assert self._answer is None
+    def build_answer(self):
+        """Build the upload request body. A post reads the attached file
+        handles to the end, so every attempt needs a fresh body."""
         data = dict(WUid=self.workunit.get_id(),
                     clientid=self.settings["CLIENTID"])
         if self.errorcode:
@@ -1017,11 +1028,7 @@ class WorkunitProcessor(object):
                                               command=counter)
 
         data['fileinfo'] = json.dumps(fileinfo)
-        self._answer = dict(files=files, data=data)
-
-    def get_answer(self):
-        assert self._answer is not None
-        return self._answer
+        return dict(files=files, data=data)
 # }}}
 
 
@@ -1146,6 +1153,18 @@ class InputDownloader(object):
         self.server_pool = server_pool
         self.wu_filename = os.path.join(self.settings["DLDIR"],
                                         self.settings["WU_FILENAME"])
+        # Two workunits can exist at the same time: one that computes and
+        # one that the pipeline prefetches. Each fresh workunit downloads
+        # to a free one of two files. A slot file left by an earlier run
+        # would block its slot forever, so remove it; the server
+        # re-issues the workunit after its timeout. A file that a live
+        # client holds raises FileLockedException, which stays fatal.
+        for stale in self.wu_slot_filenames():
+            if os.path.exists(stale):
+                logging.info("Removing stale workunit file %s", stale)
+                fileobj = open_exclusive(stale)
+                os.remove(stale)
+                close_exclusive(fileobj)
         self.wu_backlog = []
         self.wu_backlog_alt = []
         self.exit_on_server_gone = self.settings["EXIT_ON_SERVER_GONE"]
@@ -1466,14 +1485,18 @@ class InputDownloader(object):
             # If we fail to download the file, we'll deal with it at the
             # level above
 
-            self.get_missing_file(urlpath, dlpath, checksum,
-                                  executable=fid.startswith('EXECFILE'),
-                                  mandatory_server=server)
-            # Try to lock the file once to be sure that download has finished
-            # if another cado-nfs-client is doing the downloading
-            with open(dlpath) as file_to_lock:
-                FileLock.lock(file_to_lock)
-                FileLock.unlock(file_to_lock)
+            # Clients that share a download directory take turns: the
+            # first one downloads, the others then find the file with
+            # the right checksum. Without the lock every client
+            # downloads its own copy and renames it over the shared
+            # file, and a sieve process that reads the replaced file
+            # on a network file system fails with "Stale file handle".
+            with open(dlpath + ".lock", "w") as lockfile:
+                FileLock.lock(lockfile, exclusive=True)
+                self.get_missing_file(urlpath, dlpath, checksum,
+                                      executable=fid.startswith('EXECFILE'),
+                                      mandatory_server=server)
+                FileLock.unlock(lockfile)
         return True
 
     # }}}
@@ -1488,6 +1511,7 @@ class InputDownloader(object):
         """
 
         while True:
+            wu_filename = self.free_wu_filename()
             # Download the WU file if none exists
             url = self.settings["GETWUPATH"]
             # we could maybe add more options, like architecture, qrange
@@ -1496,7 +1520,7 @@ class InputDownloader(object):
 
             # will not throw, or maybe NoMoreServers
             peer = self.get_missing_file(url,
-                                         self.wu_filename,
+                                         wu_filename,
                                          is_wu=True,
                                          options=options)
 
@@ -1508,7 +1532,7 @@ class InputDownloader(object):
             # workunit
             try:
                 real_peer = peer
-                workunit = WorkunitWrapper(self.wu_filename, real_peer)
+                workunit = WorkunitWrapper(wu_filename, real_peer)
             except FileLockedException:
                 # this one is fatal.
                 logging.error("File '%s' is already locked. This may "
@@ -1517,9 +1541,11 @@ class InputDownloader(object):
                               "running. Terminating.",
                               self.wu_filename, self.settings["CLIENTID"])
                 raise
-            # otherwise the WU constructor itself failed.
+            # otherwise the WU constructor itself failed. Remove the bad
+            # file so it does not block its slot.
             except Exception as err:
                 logging.error("Invalid workunit file: %s", err)
+                os.remove(wu_filename)
                 raise WorkunitParseError()
 
             # Don't do deadline checks on WUs we received from a server.
@@ -1583,7 +1609,7 @@ class InputDownloader(object):
             except WorkunitClientHalfDownload as ex:
                 logging.error(ex)
                 try:
-                    if workunit.get_filename() == self.wu_filename:
+                    if workunit.get_filename() in self.wu_slot_filenames():
                         workunit.move_to_server_private_file()
                     # Important: do not append right now, or we're in for
                     # an infinite loop
@@ -1595,6 +1621,15 @@ class InputDownloader(object):
         self.wu_backlog += self.wu_backlog_alt
         self.wu_backlog_alt = []
         return workunit
+
+    def wu_slot_filenames(self):
+        return ["%s.%d" % (self.wu_filename, s) for s in (0, 1)]
+
+    def free_wu_filename(self):
+        for filename in self.wu_slot_filenames():
+            if not os.path.exists(filename):
+                return filename
+        raise WorkunitClientToFinish("both workunit file slots are in use")
 # }}}
 
 
@@ -1676,8 +1711,8 @@ class ResultUploader(object):
                     try:
                         resp = p.workunit.get_peer().post(
                                 self.settings["POSTRESULTPATH"],
-                                **p.get_answer())
-                        if resp.status_code == 200:
+                                **p.build_answer())
+                        if resp.status_code in (200, 409):
                             break
                         e = f'status code {resp.status_code}, {resp.content}'
                         resp = None
@@ -1703,13 +1738,22 @@ class ResultUploader(object):
                         new_backlog.append(p)
                         wait = wait_min
                         break
-                if not resp:
+                if resp is None:
                     # we've appended p to the new backlog at this point.
                     continue
                 if p.workunit.is_stale():
                     # maybe it went stale since last time we checked.
                     logging.error("Workunit %s has expired, not uploading",
                                   p.workunit.get_id())
+                    p.cleanup()
+                    continue
+                if resp.status_code == 409:
+                    # The server holds a different result under the same
+                    # file name. It will never accept ours, so retrying
+                    # is pointless.
+                    logging.error("Server refused the result of %s and"
+                                  " will not accept it later, dropping it:"
+                                  " %s", p.workunit.get_id(), resp.content)
                     p.cleanup()
                     continue
                 if waiting_since > 0:
@@ -1720,7 +1764,8 @@ class ResultUploader(object):
                 wait = wait_min
                 logging.debug("Server response:\n%s", resp.content)
                 # did_progress = True
-                logging.info("Upload of %s succeeded.", p.workunit.get_id())
+                logging.info("Upload of %s succeeded: %s",
+                             p.workunit.get_id(), resp.text.strip())
                 p.cleanup()
             self.backlog_size -= len(old_backlog) - len(new_backlog)
             self.upload_backlog[index] = new_backlog
@@ -1728,6 +1773,66 @@ class ResultUploader(object):
         # We could return "did_progress", but alas, returning False will
         # cause the client to exit. We'd rather arrange to have our
         # backlog grow.
+# }}}
+
+
+# {{{ DownloadPipeline -- downloads the next workunit while the current
+# workunit computes.
+class DownloadPipeline(threading.Thread):
+    def __init__(self, downloader):
+        threading.Thread.__init__(self, daemon=True)
+        self.downloader = downloader
+        self.workunit = None
+        self.error = None
+
+    def run(self):
+        # An exception here crosses the thread boundary through
+        # self.error: the main thread re-raises it when it joins.
+        try:
+            self.workunit = self.downloader.get_wu_full()
+        except BaseException as e:
+            self.error = e
+# }}}
+
+
+# {{{ UploadPipeline -- uploads finished results from a queue. The upload
+# runs in its own thread, so a result reaches the server even while the
+# download thread waits for the server to open the next batch of work:
+# the server needs the result to open it.
+class UploadPipeline(threading.Thread):
+    def __init__(self, uploader):
+        threading.Thread.__init__(self, daemon=True)
+        self.uploader = uploader
+        self.queue = queue.Queue()
+        self.error = None
+
+    def run(self):
+        while True:
+            processor = self.queue.get()
+            # An exception here crosses the thread boundary through
+            # self.error: the main thread re-raises it on the next
+            # submit() or flush().
+            try:
+                self.uploader.schedule_upload(processor)
+                self.uploader.process_uploads()
+            except BaseException as e:
+                self.error = e
+            finally:
+                self.queue.task_done()
+
+    def check(self):
+        if self.error is not None:
+            error = self.error
+            self.error = None
+            raise error
+
+    def submit(self, processor):
+        self.queue.put(processor)
+        self.check()
+
+    def flush(self):
+        self.queue.join()
+        self.check()
 # }}}
 
 
@@ -1740,21 +1845,54 @@ class WorkunitClient(object):
         self.settings = settings
         self.workunit = None
         self.exit_on_server_gone = settings["EXIT_ON_SERVER_GONE"]
+        # With --single each workunit downloads, computes, and uploads in
+        # sequence. Otherwise two pipeline threads run: one downloads the
+        # next workunit and one uploads finished results, both while the
+        # current workunit computes, so the compute binary runs without a
+        # gap between workunits. The download pipeline holds at most one
+        # prefetched workunit, and that workunit waits at most one
+        # compute phase before its own compute starts, so its server-side
+        # deadline (tasks.wutimeout, counted from assignment) must cover
+        # about three compute phases.
+        self.prefetch = not settings["SINGLE"]
+        self.download_pipeline = None
+        self.upload_pipeline = None
+        if self.prefetch:
+            logging.info("Workunit pipeline active: the client downloads"
+                         " the next workunit and uploads results in the"
+                         " background")
+            self.upload_pipeline = UploadPipeline(uploader)
+            self.upload_pipeline.start()
 
     def have_terminate_request(self):
         return self.workunit.get("TERMINATE", None) is not None
 
+    def _take_next_workunit(self):
+        if self.download_pipeline is None:
+            return self.downloader.get_wu_full()
+        pipeline = self.download_pipeline
+        self.download_pipeline = None
+        pipeline.join()
+        if pipeline.error is not None:
+            self.upload_pipeline.flush()
+            raise pipeline.error
+        return pipeline.workunit
+
     def process(self):
-        self.workunit = downloader.get_wu_full()
+        self.workunit = self._take_next_workunit()
 
         if self.have_terminate_request():
             self.workunit.cleanup()
+            if self.upload_pipeline is not None:
+                self.upload_pipeline.flush()
             logging.info("Received TERMINATE, exiting")
             return False
 
+        if self.prefetch:
+            self.download_pipeline = DownloadPipeline(self.downloader)
+            self.download_pipeline.start()
+
         processor = WorkunitProcessor(self.workunit, self.settings)
-        # TODO: a select loop, maybe ? We could handle the pending
-        # uploads, maybe.
         processor.run_commands()
         # to check the return value of the above command, change the previous
         # line to ret = processor.run_commands(), and there is an error if
@@ -1766,14 +1904,16 @@ class WorkunitClient(object):
         #    sys.exit(1)
         # this is useful if a given error always happens on a given machine
 
-        processor.prepare_answer()
+        if self.prefetch:
+            # Transfer ownership of "processor" to the upload pipeline.
+            self.upload_pipeline.submit(processor)
+        else:
+            # Transfer ownership of "processor" to the schedule_upload
+            # control flow.
+            self.uploader.schedule_upload(processor)
 
-        # Transfer ownership of "processor" to the schedule_upload
-        # control flow.
-        self.uploader.schedule_upload(processor)
-
-        # And trigger the upload code now.
-        self.uploader.process_uploads()
+            # And trigger the upload code now.
+            self.uploader.process_uploads()
 
         self.workunit.cleanup()
         self.workunit = None
@@ -1827,6 +1967,9 @@ OPTIONAL_SETTINGS = {
     "MAX_CONNECTION_FAILURES":  ("999999",
                                  "Maximum number of successive"
                                  " connection failures to tolerate"),
+    "NETWORK_TIMEOUT": ("300",
+                        "Timeout in seconds for each HTTP request"
+                        " to the server"),
     "NICENESS":        ("0", "Run subprocesses under this niceness"),
     "LOGLEVEL":        ("INFO", "Verbosity of logging"),
     "LOGFILE":         (None,

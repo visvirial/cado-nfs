@@ -1,7 +1,7 @@
 #include "cado.h" // IWYU pragma: keep
 
 #include <cerrno>
-#include <climits>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -65,6 +65,12 @@ static int vec_read(arith_generic * A, void * z, bwc_file_base const & v, size_t
     return 0;
 }
 
+/* the path on disk; the derived classes format only the base name */
+static std::string fullname(bwc_file_base const & f)
+{
+    return std::string(f);
+}
+
 static size_t vec_items(arith_generic * A, bwc_file_base const & v)
 {
     struct stat sbuf[1];
@@ -104,19 +110,142 @@ static size_t common_size(arith_generic * Ac, std::vector<T> const & Cfiles, con
 
 using vseq_t = std::map<bwc_column_range, std::vector<bwc_V_file> >;
 
-static void check_V_files(arith_generic * Ac, vseq_t & Vsequences, std::vector<bwc_Cv_file> & Cfiles, int & nfailed)/*{{{*/
+struct projections {/*{{{*/
+    /* Every check consumes a V file only through the small matrix
+     * transpose(C)*V for a check file C: the V pair checks compare two
+     * such matrices, and the A file checks compare one with a sum over
+     * the A entries. The first time a V file is read, we project it
+     * against every check file, so that it is read only once per
+     * program run -- and only once over a whole bwc run when the
+     * projections persist in tiny files under projcache=<dir>. */
+    arith_generic * Ac;
+    std::string dir;                    /* empty: keep in memory only */
+    std::vector<std::string> cnames;    /* all Cv and Cd files */
+    size_t vsize;
+    std::map<std::pair<std::string, std::string>, std::vector<uint64_t>> table;
+
+    projections(arith_generic * Ac, std::string dir,
+            std::vector<std::string> cnames, size_t vsize)
+        : Ac(Ac), dir(std::move(dir))
+        , cnames(std::move(cnames)), vsize(vsize)
+    {
+        if (!this->dir.empty() && mkdir(this->dir.c_str(), 0777) < 0)
+            ASSERT_ALWAYS(errno == EEXIST);
+    }
+
+    static std::string basename(std::string const & s) {
+        auto const i = s.rfind('/');
+        return i == std::string::npos ? s : s.substr(i + 1);
+    }
+
+    std::string entry_name(std::string const & c, std::string const & v) const {
+        return fmt::format("{}/{}.{}.proj", dir, basename(v), basename(c));
+    }
+
+    /* the identity of the file contents a cached projection binds */
+    static bool id(std::string const & name, uint64_t f[3]) {
+        struct stat s[1];
+        if (stat(name.c_str(), s) < 0) return false;
+        f[0] = s->st_size;
+        f[1] = s->st_mtim.tv_sec;
+        f[2] = s->st_mtim.tv_nsec;
+        return true;
+    }
+
+    arith_generic::elt const * get(std::string const & cname,
+            bwc_V_file const & V, arith_generic * Av,
+            arith_cross_generic * AcxAv);
+};
+
+arith_generic::elt const * projections::get(std::string const & cname,
+        bwc_V_file const & V, arith_generic * Av,
+        arith_cross_generic * AcxAv)
+{
+    std::string const vname = fullname(V);
+    auto const key = std::make_pair(cname, vname);
+    if (auto const it = table.find(key); it != table.end())
+        return (arith_generic::elt const *) it->second.data();
+
+    size_t const nchecks = Ac->simd_groupsize();
+    size_t const stride = Av->vec_elt_stride(nchecks);
+
+    if (!dir.empty()) {
+        uint64_t h[6], c[3], v[3];
+        auto f = fopen_helper(entry_name(cname, vname), "rb", true);
+        if (f && id(cname, c) && id(vname, v)
+                && fread(h, sizeof(h), 1, f.get()) == 1
+                && memcmp(h, c, sizeof(c)) == 0
+                && memcmp(h + 3, v, sizeof(v)) == 0)
+        {
+            std::vector<uint64_t> data(stride / sizeof(uint64_t));
+            if (fread(data.data(), stride, 1, f.get()) == 1) {
+                auto & e = table[key] = std::move(data);
+                return (arith_generic::elt const *) e.data();
+            }
+        }
+    }
+
+    /* read the V file, once, and project it against every check file */
+    size_t const items = vec_items(Av, V);
+    if (items != vsize)
+        throw std::invalid_argument(fmt::format(
+                    "{} has {} coordinates, different from expected {}\n",
+                    V, items, vsize));
+    uint64_t v[3];
+    ASSERT_ALWAYS(id(vname, v));
+    arith_generic::elt * Vv;
+    vec_alloc(Av, Vv, vsize);
+    if (!vec_read(Av, Vv, V, vsize, " ")) {
+        vec_free(Av, Vv, vsize);
+        return nullptr;
+    }
+    size_t const chunk = std::min(vsize, size_t(1) << 22);
+    arith_generic::elt * Cc;
+    vec_alloc(Ac, Cc, chunk);
+    for(auto const & c : cnames) {
+        uint64_t cid[3];
+        std::vector<uint64_t> data(stride / sizeof(uint64_t));
+        auto * w = (arith_generic::elt *) data.data();
+        Av->vec_set_zero(w, nchecks);
+        auto f = fopen_helper(c, "rb", true);
+        bool ok = f && id(c, cid);
+        for(size_t i = 0 ; ok && i < vsize ; i += chunk) {
+            size_t const n = std::min(chunk, vsize - i);
+            ok = fread(Cc, Ac->elt_stride(), n, f.get()) == n;
+            if (ok)
+                AcxAv->add_dotprod(w, Cc, Av->vec_subvec(Vv, i), n);
+        }
+        if (!ok) {
+            fmt::print("  (no projection of {} against {})\n", vname, c);
+            continue;
+        }
+        if (!dir.empty()) {
+            uint64_t const h[6] = { cid[0], cid[1], cid[2], v[0], v[1], v[2] };
+            auto g = fopen_helper(entry_name(c, vname), "wb", true);
+            if (!g || fwrite(h, sizeof(h), 1, g.get()) != 1
+                    || fwrite(data.data(), stride, 1, g.get()) != 1)
+                fmt::print(stderr, "could not save {}\n",
+                        entry_name(c, vname));
+        }
+        table[{c, vname}] = std::move(data);
+    }
+    vec_free(Ac, Cc, chunk);
+    vec_free(Av, Vv, vsize);
+    auto const it = table.find(key);
+    if (it == table.end())
+        return nullptr;
+    return (arith_generic::elt const *) it->second.data();
+}/*}}}*/
+
+static void check_V_files(arith_generic * Ac, projections & P, vseq_t & Vsequences, std::vector<bwc_Cv_file> & Cfiles, int & nfailed)/*{{{*/
 {
     if (Cfiles.empty()) return;
 
     size_t const nchecks = Ac->simd_groupsize();
-    size_t vsize = common_size(Ac, Cfiles, "Cv");
+    size_t const vsize = P.vsize;
 
     for(unsigned int i0 = 0 ; i0 + 1 < Cfiles.size() ; i0++) {
         bwc_Cv_file const & C_i0(Cfiles[i0]);
-        arith_generic::elt * Cv_i0;
-        vec_alloc(Ac, Cv_i0, vsize);
-
-        int has_read_Cv_i0 = 0;
 
         for(unsigned int i1 = i0 + 1 ; i1 < Cfiles.size() ; i1++) {
             bwc_Cv_file const & C_i1(Cfiles[i1]);
@@ -124,11 +253,6 @@ static void check_V_files(arith_generic * Ac, vseq_t & Vsequences, std::vector<b
             fmt::print("Doing checks for distance {} using {} and {}\n",
                     C_i1.stretch - C_i0.stretch,
                     C_i0, C_i1);
-
-            arith_generic::elt * Cv_i1;
-            vec_alloc(Ac, Cv_i1, vsize);
-
-            int has_read_Cv_i1 = 0;
 
             /* {{{ check all V files together */
             for(auto const & it : Vsequences) {
@@ -154,14 +278,6 @@ static void check_V_files(arith_generic * Ac, vseq_t & Vsequences, std::vector<b
                 }
                 /* }}} */
 
-                arith_generic::elt * Vv;
-                vec_alloc(Av.get(), Vv, vsize);
-                unsigned int Vv_iter = UINT_MAX;
-
-                arith_generic::elt * dotprod_scratch[2];
-                vec_alloc(Av.get(), dotprod_scratch[0], nchecks);
-                vec_alloc(Av.get(), dotprod_scratch[1], nchecks);
-
                 unsigned int j = 0;
                 for(unsigned int i = 0 ; i < Vs.size() ; i++) {
                     for(j = i + 1 ; j < Vs.size() ; j++) {
@@ -169,18 +285,6 @@ static void check_V_files(arith_generic * Ac, vseq_t & Vsequences, std::vector<b
                             break;
                     }
                     if (j == Vs.size()) continue;
-
-                    if (!has_read_Cv_i0++)
-                        if (!vec_read(Ac, Cv_i0, C_i0, vsize, " "))
-                            continue;
-
-                    if (!has_read_Cv_i1++)
-                        if (!vec_read(Ac, Cv_i1, C_i1, vsize, " "))
-                            continue;
-
-                    // We might want to store how many checks we had for
-                    // each vector. This can be done in a global map.
-                    // Vs[j].checks++;
 
                     std::string vi { Vs[i] };
                     if (Vs[i].dirname() == C_i1.dirname())
@@ -191,34 +295,14 @@ static void check_V_files(arith_generic * Ac, vseq_t & Vsequences, std::vector<b
                         vj = Vs[j].basename();
 
                     fmt::print("  check {} against {}\n", vi, vj);
-                    if (Vs[i].n != Vv_iter) {
-                        if (!vec_read(Ac, Vv, Vs[i], vsize, "   "))
-                            continue;
-                        Vv_iter = Vs[i].n;
-                    }
 
-                    Av->vec_set_zero(dotprod_scratch[0], nchecks);
+                    auto const * d0 = P.get(fullname(C_i1), Vs[i],
+                            Av.get(), AcxAv.get());
+                    auto const * d1 = P.get(fullname(C_i0), Vs[j],
+                            Av.get(), AcxAv.get());
+                    if (!d0 || !d1) continue;
 
-                    /* compute the dot product */
-                    AcxAv->add_dotprod(
-                            dotprod_scratch[0],
-                            Cv_i1,
-                            Vv,
-                            vsize);
-
-                    if (!vec_read(Ac, Vv, Vs[j], vsize, "   "))
-                        continue;
-
-                    Vv_iter = Vs[j].n;
-
-                    Av->vec_set_zero(dotprod_scratch[1], nchecks);
-                    AcxAv->add_dotprod(
-                            dotprod_scratch[1],
-                            Cv_i0,
-                            Vv,
-                            vsize);
-
-                    int const cmp = Av->vec_cmp(dotprod_scratch[0], dotprod_scratch[1], nchecks);
+                    int const cmp = Av->vec_cmp(d0, d1, nchecks);
 
                     std::string diag = fmt::format(
                             "  check {} against {} -> {}\n",
@@ -231,33 +315,22 @@ static void check_V_files(arith_generic * Ac, vseq_t & Vsequences, std::vector<b
                         fmt::print(stderr, "{}", diag);
                     }
                 }
-                vec_free(Av.get(), dotprod_scratch[0], nchecks);
-                vec_free(Av.get(), dotprod_scratch[1], nchecks);
-                vec_free(Ac, Vv, vsize);
-
             }
             /* }}} */
-
-            vec_free(Ac, Cv_i1, vsize);
         }
-        vec_free(Ac, Cv_i0, vsize);
     }
 }/*}}}*/
 
-static void check_A_files(arith_generic * Ac, std::vector<bwc_V_file> const & Vfiles, std::vector<bwc_A_file> const & Afiles, std::vector<bwc_Cd_file> const & Dfiles, bwc_Cr_file & R, bwc_Ct_file & T, int & nfailed)
+static void check_A_files(arith_generic * Ac, projections & P, std::vector<bwc_V_file> const & Vfiles, std::vector<bwc_A_file> const & Afiles, std::vector<bwc_Cd_file> const & Dfiles, bwc_Cr_file & R, bwc_Ct_file & T, int & nfailed)
 {
     if (Dfiles.empty())
         return;
-    arith_generic::elt * Dv = nullptr;
-    size_t const vsize = common_size(Ac, Dfiles, "Cd");
     size_t const nchecks = Ac->simd_groupsize();
 
     size_t rsize = vec_items(Ac, R) / nchecks;
     fmt::print("Cr file has {} coordinates\n", rsize);
 
     ASSERT_ALWAYS(vec_items(Ac, T) ==  (size_t) bw->m);
-
-    vec_alloc(Ac, Dv, vsize);
 
     arith_generic::elt * Tdata = nullptr;
     Tdata = Ac->alloc(bw->m, ALIGNMENT_ON_ALL_BWC_VECTORS);
@@ -285,7 +358,6 @@ static void check_A_files(arith_generic * Ac, std::vector<bwc_V_file> const & Vf
         fmt::print("Doing A file checks for distance {} using {}\n"
                 "  (as well as {} and {})\n",
                 D.stretch, D, T, R);
-        int has_read_D = 0;
         /* first scan potential base files V, and the restrict to cases
          * where we have all the required A files to do a check...
          */
@@ -381,33 +453,12 @@ static void check_A_files(arith_generic * Ac, std::vector<bwc_V_file> const & Vf
                     break;
             }
 
-            int can_check = 1;
-
-            if (!has_read_D++)
-                if (!vec_read(Ac, Dv, D, vsize, "   "))
-                    can_check = 0;
+            auto const * rhs = P.get(fullname(D), V0,
+                    Av.get(), AcxAv.get());
+            int const can_check = rhs != nullptr;
 
             if (can_check) {
-                arith_generic::elt * Vv;
-
-                vec_alloc(Av.get(), Vv, vsize);
-                if (!vec_read(Av.get(), Vv, V0, vsize, "   "))
-                    can_check = 0;
-
-                if (can_check) {
-                    Av->vec_set_zero(dotprod_scratch[1], nchecks);
-                    AcxAv->add_dotprod(
-                            dotprod_scratch[1],
-                            Dv,
-                            Vv,
-                            vsize);
-                }
-
-                vec_free(Av.get(), Vv, vsize);
-            }
-
-            if (can_check) {
-                int const cmp = Av->vec_cmp(dotprod_scratch[0], dotprod_scratch[1], nchecks);
+                int const cmp = Av->vec_cmp(dotprod_scratch[0], rhs, nchecks);
 
                 std::string diag = fmt::format(
                         "  check {} against {} entries of{} -> {}\n",
@@ -431,14 +482,13 @@ static void check_A_files(arith_generic * Ac, std::vector<bwc_V_file> const & Vf
     }
     Ac->free(Rdata);
     Ac->free(Tdata);
-    vec_free(Ac, Dv, vsize);
 }
 
 /* This is *not* a parallel program, so we depart significantly from the
  * way programs such as krylov or mksol are written.
  *
  */
-static void * check_prog(cxx_param_list & pl MAYBE_UNUSED, int argc, char const * argv[])
+static void * check_prog(std::string const & projcache, int argc, char const * argv[])
 {
     int const withcoeffs = mpz_cmp_ui(bw->p, 2) > 0;
     int const nchecks = withcoeffs ? NCHECKS_CHECK_VECTOR_GFp : NCHECKS_CHECK_VECTOR_GF2;
@@ -521,14 +571,22 @@ static void * check_prog(cxx_param_list & pl MAYBE_UNUSED, int argc, char const 
 
     int nfailed = 0;
 
-    check_V_files(Ac.get(), Vsequences, Cfiles, nfailed);
+    size_t const vsize = common_size(Ac.get(), Cfiles, "Cv");
+    size_t const dsize = common_size(Ac.get(), Dfiles, "Cd");
+    ASSERT_ALWAYS(!vsize || !dsize || vsize == dsize);
+    std::vector<std::string> cnames;
+    for(auto const & C : Cfiles) cnames.push_back(fullname(C));
+    for(auto const & D : Dfiles) cnames.push_back(fullname(D));
+    projections P(Ac.get(), projcache, cnames, vsize ? vsize : dsize);
+
+    check_V_files(Ac.get(), P, Vsequences, Cfiles, nfailed);
 
     /* Check A files using V, D, T, and R */
     if ((Tfiles.empty() || Rfiles.empty()) && !Dfiles.empty()) {
         fmt::print(stderr, "{}", "It makes no sense to provide Cd files and no Cr and Ct file\n");
         exit(EXIT_FAILURE);
     } else if (!Tfiles.empty() && !Rfiles.empty() && !Dfiles.empty()) {
-        check_A_files(Ac.get(), Vfiles, Afiles, Dfiles, Rfiles.front(), Tfiles.front(), nfailed);
+        check_A_files(Ac.get(), P, Vfiles, Afiles, Dfiles, Rfiles.front(), Tfiles.front(), nfailed);
     }
 
     if (nfailed) {
@@ -663,11 +721,15 @@ int main(int argc, char const * argv[])
             "Options are as follows. Note that not all are relevant to this program specifically:\n");
 
     bw_common_decl_usage(pl);
-    /* declare local parameters and switches: none here (so far). */
+    pl.declare_usage("projcache", "directory where the projections of the"
+            " V files against the check files are cached, so that over a"
+            " run each V file is read only once");
 
     bw_common_parse_cmdline(bw, pl, &argc, &argv);
 
     bw_common_interpret_parameters(bw, pl);
+
+    std::string const projcache = pl.parse<std::string>("projcache");
 
     if (pl.warn_unused()) {
         int rank;
@@ -676,7 +738,7 @@ int main(int argc, char const * argv[])
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
 
-    check_prog(pl, argc, argv);
+    check_prog(projcache, argc, argv);
 
     bw_common_clear(bw);
 

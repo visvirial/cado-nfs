@@ -11,6 +11,7 @@
 #include <istream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,7 @@
 #include "cado_poly.hpp"
 #include "cxx_mpz.hpp"
 #include "macros.h"
+#include "mmappable_vector.hpp"
 #include "mpz_poly.h"
 #include "typedefs.h"
 
@@ -84,6 +86,39 @@ struct renumber_t {
      */
     static constexpr const int format_flat = 20220411;
 
+    /* The table is indexed by buckets of 2^flat_index_shift primes (see
+     * flat_data below). An entry holds the low flat_index_shift bits of
+     * p (the bucket holds the high ones) above vr, as a 48-bit
+     * little-endian integer, so that the entries of a bucket sort by
+     * (p, vr). vr <= vp < 2^vr_bits is checked against the large prime
+     * bounds by check_needed_bits().
+     */
+    static constexpr unsigned int flat_index_shift = 8;
+    struct flat_entry {
+        static constexpr unsigned int vr_bits = 40;
+        std::array<uint8_t, 6> bytes;
+        static_assert(vr_bits + flat_index_shift == 8 * sizeof(bytes));
+        static_assert(flat_index_shift == 8);
+        flat_entry() = default;
+        flat_entry(p_r_values_t p, p_r_values_t vr) {
+            ASSERT_ALWAYS((uint64_t(vr) >> vr_bits) == 0);
+            uint64_t u = (uint64_t(uint8_t(p)) << vr_bits) | uint64_t(vr);
+            for (auto & b : bytes) {
+                b = uint8_t(u);
+                u >>= 8;
+            }
+        }
+        uint64_t value() const {
+            uint64_t u = 0;
+            for (size_t k = bytes.size() ; k-- ; )
+                u = (u << 8) | bytes[k];
+            return u;
+        }
+        uint8_t p_low() const { return bytes.back(); }
+        p_r_values_t vr() const { return value() & ((uint64_t(1) << vr_bits) - 1); }
+        bool operator<(flat_entry const & o) const { return value() < o.value(); }
+    };
+
 private: /*{{{ internal data fields*/
 
     int format = format_flat;
@@ -95,8 +130,18 @@ private: /*{{{ internal data fields*/
 
     cxx_cado_poly cpoly;
 
-    /* Only for format_flat. */
-    std::vector<std::array<p_r_values_t, 2>> flat_data;
+    /* The (p, vr) entries, and a coarse index into them: bucket b holds
+     * the primes p with (p >> flat_index_shift) == b, and its entries are
+     * flat_data[flat_index[b]..flat_index[b+1]). The index grows with
+     * the table and is complete once flat_index_finish() has run.
+     *
+     * Both are either in memory (table built here, or read from a text
+     * file) or mapped read-only from an uncompressed renumber file that
+     * carries a binary table (see flat_table_trailer), in which case all
+     * processes that read the file share the same pages.
+     */
+    mmappable_vector<flat_entry> flat_data;
+    mmappable_vector<index_t> flat_index;
 
     std::vector<unsigned int> lpb;
     std::vector<index_t> index_from_p_cache;
@@ -263,7 +308,7 @@ public:
 
     struct cooked {
         std::vector<int> nroots;
-        std::vector<std::array<p_r_values_t, 2>> flat;
+        std::vector<flat_entry> flat;
         std::string text;
         bool empty() const { return flat.empty(); }
     };
@@ -293,6 +338,39 @@ private:/*{{{ more implementation-level stuff. */
     /* there's no write_table, because writing the table is done by
      * the build() function (called from freerel) */
     void read_table(std::istream& is);
+
+    /* An uncompressed renumber file may hold the table in binary form
+     * after the text header: flat_data, then flat_index (padded to
+     * its alignment), then this trailer as the last bytes of the file.
+     * Version 1 files hold (p, vr) as two p_r_values_t words per entry;
+     * they are read (not mapped) and packed into flat_data.
+     */
+    struct flat_table_trailer {
+        static constexpr std::array<char, 8> magic_v1 {{ 'R', 'N', 'B', 'F', 'L', 'A', 'T', '1' }};
+        static constexpr std::array<char, 8> magic_value {{ 'R', 'N', 'B', 'F', 'L', 'A', 'T', '2' }};
+        std::array<char, 8> magic = magic_value;
+        uint32_t sizeof_p_r_values = sizeof(p_r_values_t);
+        uint32_t sizeof_index = sizeof(index_t);
+        uint64_t offset;        /* of flat_data in the file */
+        uint64_t nflat;
+        uint64_t nindex;
+        uint64_t flat_index_offset() const {
+            uint64_t const end = offset + nflat * sizeof(flat_entry);
+            return end + (-end) % alignof(index_t);
+        }
+    };
+    static std::optional<flat_table_trailer> read_flat_table_trailer(std::string const & filename);
+    void read_table_v1(std::string const & filename, flat_table_trailer const & T);
+    void mmap_table(std::string const & filename, flat_table_trailer const & T);
+
+    size_t flat_index_nbuckets() const {
+        ASSERT_ALWAYS(get_max_lpb() >= flat_index_shift);
+        return size_t(1) << (get_max_lpb() - flat_index_shift);
+    }
+    /* entry i of flat_data is the first one with prime p */
+    void flat_index_push(index_t i, p_r_values_t p);
+    void flat_index_finish(index_t nflat);
+    void build_index_from_p_cache();
     void compute_bad_ideals();
     void compute_bad_ideals_from_dot_badideals_hint(std::istream&, unsigned int = UINT_MAX);
     void compute_ramified_primes();
@@ -305,10 +383,11 @@ private:/*{{{ more implementation-level stuff. */
     void set_format(int);
 
     unsigned int needed_bits() const;
-    /* this returns an index i such that data[i - above_bad] points to
-     * the beginning of data for p.
-     */
-    const_iterator get_first_iterator_from_p(p_r_values_t p) const;
+    /* the index in flat_data of the first entry for p (or above p, if p
+     * is not prime) */
+    index_t first_entry_from_p(p_r_values_t p) const;
+    /* the prime of entry i of flat_data */
+    p_r_values_t flat_p(index_t i) const;
 
     p_r_values_t compute_vr_from_p_r_side (p_r_side x) const;
     p_r_side compute_p_r_side_from_p_vr (p_r_values_t p, p_r_values_t vr) const;

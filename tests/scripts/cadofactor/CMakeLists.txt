@@ -24,6 +24,16 @@ foreach (doctest_source ${PYTHON_DOCTEST_SOURCES})
   set_tests_properties(test_python_${basename} PROPERTIES RUN_SERIAL 1)
 endforeach (doctest_source)
 
+foreach (unittest_name test_python_api_upload test_python_client_upload
+                        test_python_polysel1_heap test_python_timeout_own_task)
+  cado_define_test(TEST_NAME ${unittest_name}
+      ENVIRONMENT PYTHONPATH=${CADO_NFS_SOURCE_DIR}/scripts
+      PRECOMMAND ${CADO_NFS_SOURCE_DIR}/tests/provide-wdir.sh --env TMPDIR
+      PROGRAM
+      python3 ${CMAKE_CURRENT_SOURCE_DIR}/${unittest_name}.py
+      )
+endforeach (unittest_name)
+
 cado_define_test(test_python_wudb_cmdline
     PROVIDE_TEMPORARY_WDIR
     ENVIRONMENT PYTHONPATH=${CADO_NFS_SOURCE_DIR}/scripts

@@ -60,16 +60,24 @@ done
 RENUMBER="${wdir}/renumber.gz"
 WORK_RELS="${wdir}/rels.gz"
 
-cp "$RELS" "$WORK_RELS"
+# A compressed renumber file is a text table, an uncompressed one
+# carries the table in binary form and is mmap'ed by dup2. Both must
+# give the same output.
+run_dup2() {
+    local renumber="$1"
+    local rels="$2"
+    cp "$RELS" "$rels"
+    local common=(-poly "$POLY" -renumber "$renumber")
+    "${CADO_NFS_BINARY_DIR}/sieve/freerel" "${common[@]}" -lpbs "$LPBS"
+    # bail out early if debug_renumber sees an inconsistency.
+    "${CADO_NFS_BINARY_DIR}/misc/debug_renumber" "${common[@]}" -check -quiet
+    "${CADO_NFS_BINARY_DIR}/filter/dup2" "${common[@]}" \
+        -nrels $(gzip -dc "$rels" | wc -l) "${DL[@]}" ${LARGE_AB} "$rels"
+}
 
-common=(-poly "$POLY" -renumber "${RENUMBER}")
-
-"${CADO_NFS_BINARY_DIR}/sieve/freerel" "${common[@]}" \
-                           -lpbs "$LPBS"
-# bail out early if debug_renumber sees an inconsistency.
-"${CADO_NFS_BINARY_DIR}/misc/debug_renumber" "${common[@]}" -check -quiet
-"${CADO_NFS_BINARY_DIR}/filter/dup2" "${common[@]}"       \
-                    -nrels $(gzip -dc "$WORK_RELS" | wc -l) "${DL[@]}" ${LARGE_AB} "${WORK_RELS}"
+run_dup2 "${wdir}/renumber" "${wdir}/rels.binary-table.gz"
+run_dup2 "$RENUMBER" "$WORK_RELS"
+cmp <(gzip -dc "${wdir}/rels.binary-table.gz") <(gzip -dc "$WORK_RELS")
 
 if [ "$REFERENCE_SHA1" ] ; then
     SHA1BIN=sha1sum

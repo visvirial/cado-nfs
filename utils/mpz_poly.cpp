@@ -88,7 +88,16 @@
  *      compile-time constant
  * }
  *
+ * The parallel loops take teams of at most as many threads as they have
+ * iterations, so that the threads that the program has left over can go
+ * to the big products inside the iterations (see sqrt/par_mul.cpp).
  */
+#include "omp_proxy.h"
+
+MAYBE_UNUSED static int team(int iterations)
+{
+    return std::max(1, std::min(omp_get_max_threads(), iterations));
+}
 
 // compute timings for Q^a mod(f,p): square, multiplication, reduction mod f
 // PZ piece of code:
@@ -215,6 +224,7 @@ static long const tc_points[MAX_TC_DEGREE] = {0,  1, -1, 2, -2, 3, -3, 4, -4, 5,
    In the square root, with an algebraic polynomial of degree d,
    we have to multiply polynomials of degree d-1, thus we have t=2(d-1).
 */
+template <typename inf>
 static void mpz_poly_mul_tc_interpolate(mpz_t * f, int t)
 {
     /* The alignment constraint below is bogus. We've seen this be
@@ -225,6 +235,11 @@ static void mpz_poly_mul_tc_interpolate(mpz_t * f, int t)
      * looks like a compiler bug.
      */
     int64_t M[MAX_TC_DEGREE + 1][MAX_TC_DEGREE + 1] ATTR_ALIGNED(32), g, h;
+    /* row operation f[i] <- Gm[i][j]*f[i] - Hm[i][j]*f[j] of the forward
+     * Gauss, decided on M alone, then applied pivot by pivot so that the
+     * rows of one pivot run in parallel */
+    int64_t Gm[MAX_TC_DEGREE + 1][MAX_TC_DEGREE + 1];
+    int64_t Hm[MAX_TC_DEGREE + 1][MAX_TC_DEGREE + 1];
     int i, j, k, l;
     /* G[] is the list of gcd's that appear in the forward Gauss loop, in the
        order they appear (they don't depend on t, since we start with the low
@@ -271,23 +286,43 @@ static void mpz_poly_mul_tc_interpolate(mpz_t * f, int t)
             g = G[l++]; /* same as gcd_int64 (M[i][j], M[j][j]) */
             h = M[i][j] / g;
             g = M[j][j] / g;
-            /* f[i] <- g*f[i] - h*f[j] */
             ASSERT(g > 0);
-            if (g != 1)
-                mpz_mul_uint64(f[i], f[i], g);
-            mpz_submul_int64(f[i], f[j], h);
+            Gm[i][j] = g;
+            Hm[i][j] = h;
             for (k = j; k <= t; k++)
                 M[i][k] = g * M[i][k] - h * M[j][k];
         }
     }
 
-    /* now zero upper-diagonal coefficients while going up */
-    for (i = t - 1; i >= 0; i--) {
-        for (j = i + 1; j <= t; j++)
+    for (j = 0; j < t - 1; j++) {
+#ifdef HAVE_OPENMP
+#pragma omp                                                                    \
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(t - 1 - j))
+#endif
+        for (int i = j + 1; i < t; i++) {
+            /* f[i] <- g*f[i] - h*f[j] */
+            if (Gm[i][j] != 1)
+                mpz_mul_uint64(f[i], f[i], Gm[i][j]);
+            mpz_submul_int64(f[i], f[j], Hm[i][j]);
+        }
+    }
+
+    /* now zero upper-diagonal coefficients while going up: once f[j] is
+     * final, subtract its multiples from all rows above it */
+    for (j = t; j >= 0; j--) {
+        if (M[j][j] != 1) {
+            ASSERT(mpz_divisible_uint64_p(f[j], M[j][j]));
+            mpz_divexact_uint64(f[j], f[j], M[j][j]);
+        }
+#ifdef HAVE_OPENMP
+#pragma omp                                                                    \
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(j))
+#endif
+        for (int i = 0; i < j; i++)
             /* f[i] = f[i] - M[i][j] * f[j] */
             mpz_submul_int64(f[i], f[j], M[i][j]);
-        ASSERT(mpz_divisible_uint64_p(f[i], M[i][i]));
-        mpz_divexact_uint64(f[i], f[i], M[i][i]);
     }
 }
 #if GNUC_VERSION_ATLEAST(7, 0, 0)
@@ -433,7 +468,8 @@ static int mpz_poly_mul_tc(inf & inf_arg, mpz_t * f, mpz_t * g, int r,
 
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(t + 1))
 #endif
     for (int i = 0; i <= t; i++) {
         if (i == 0) /* evaluate at 0 */
@@ -454,7 +490,7 @@ static int mpz_poly_mul_tc(inf & inf_arg, mpz_t * f, mpz_t * g, int r,
         }
     }
 
-    mpz_poly_mul_tc_interpolate(f, t);
+    mpz_poly_mul_tc_interpolate<inf>(f, t);
 
     return t;
 }
@@ -628,7 +664,8 @@ static int mpz_poly_sqr_tc(inf & /* unused */, mpz_t * f, mpz_t * g, int r)
 
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(t + 1))
 #endif
     for (int i = 0; i <= t; i++) {
         if (i == 0) /* evaluate at 0 */
@@ -643,7 +680,7 @@ static int mpz_poly_sqr_tc(inf & /* unused */, mpz_t * f, mpz_t * g, int r)
         }
     }
 
-    mpz_poly_mul_tc_interpolate(f, t);
+    mpz_poly_mul_tc_interpolate<inf>(f, t);
 
     return t;
 }
@@ -1357,7 +1394,8 @@ void mpz_poly_parallel_interface<inf>::mpz_poly_sub(mpz_poly_ptr f,
     mpz_poly_realloc(f, maxdeg + 1);
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(maxdeg + 1))
 #endif
     for (int i = 0; i <= maxdeg; i++) {
         if (i <= g->deg && i <= h->deg)
@@ -2048,7 +2086,8 @@ void mpz_poly_parallel_interface<inf>::mpz_poly_div_2_mod_mpz(
 
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(g->deg + 1))
 #endif
     for (int i = g->deg; i >= 0; --i) {
         if (mpz_scan1(g->_coeff[i], 0) == 0) /* g[i] is odd */
@@ -2353,7 +2392,8 @@ int mpz_poly_parallel_interface<inf>::mpz_poly_mod_mpz(mpz_poly_ptr R,
     mpz_poly_realloc(R, A->deg + 1);
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(A->deg + 1))
 #endif
     for (int i = 0; i <= A->deg; ++i)
         if (invm == nullptr)
@@ -2456,7 +2496,8 @@ int mpz_poly_parallel_interface<inf>::mpz_poly_mod_f_mod_mpz(
             mpz_mod(c, c, m);
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(f->deg))
 #endif
         for (int i = R->deg - 1; i >= R->deg - f->deg; --i)
             mpz_submul(R->_coeff[i], c, f->_coeff[f->deg - R->deg + i]);
@@ -2928,7 +2969,8 @@ mpz_poly * mpz_poly_parallel_interface<inf>::mpz_poly_base_modp_init(
     FATAL_ERROR_CHECK(P == nullptr, "not enough memory");
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(l + 2))
 #endif
     for (int i = 0; i < l + 2; i++)
         mpz_poly_init(P[i], P0->deg);
@@ -2936,7 +2978,8 @@ mpz_poly * mpz_poly_parallel_interface<inf>::mpz_poly_base_modp_init(
 
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(P0->deg + 1))
 #endif
     for (int i = 0; i <= P0->deg; i++)
         mpz_tdiv_qr(P[l]->_coeff[i], P[l - 1]->_coeff[i], P0->_coeff[i],
@@ -2948,7 +2991,8 @@ mpz_poly * mpz_poly_parallel_interface<inf>::mpz_poly_base_modp_init(
         /* reduce P[j] into P[j] and P[j-1] */
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(P0->deg + 1))
 #endif
         for (int i = 0; i <= P0->deg; i++)
             mpz_tdiv_qr(P[j]->_coeff[i], P[j - 1]->_coeff[i], P[j]->_coeff[i],
@@ -2959,7 +3003,8 @@ mpz_poly * mpz_poly_parallel_interface<inf>::mpz_poly_base_modp_init(
 
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(l))
 #endif
     for (int i = 0; i < l; i++)
         mpz_clear(pk[i]);
@@ -2986,14 +3031,16 @@ void mpz_poly_parallel_interface<inf>::mpz_poly_base_modp_lift(
     int const imax = (P[k]->deg < a->deg) ? P[k]->deg : a->deg;
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(imax + 1))
 #endif
     for (int i = 0; i <= imax; i++)
         mpz_addmul(a->_coeff[i], P[k]->_coeff[i], pk);
 
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(P[k]->deg - imax))
 #endif
     for (int i = imax + 1; i <= P[k]->deg; i++)
         mpz_mul(a->_coeff[i], P[k]->_coeff[i], pk);
@@ -5192,7 +5239,8 @@ void mpz_poly_parallel_interface<inf>::mpz_poly_reducemodF(
             v++; /* we consider p/F[d]^v */
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(k))
 #endif
             for (i = 0; i < k; ++i)
                 mpz_mul(P->p->_coeff[i], P->p->_coeff[i], F->_coeff[d]);
@@ -5200,7 +5248,8 @@ void mpz_poly_parallel_interface<inf>::mpz_poly_reducemodF(
 
 #ifdef HAVE_OPENMP
 #pragma omp                                                                    \
-    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value)
+    parallel for if (!std::is_same<inf, mpz_poly_notparallel_info>::value) \
+        num_threads(team(d))
 #endif
         for (i = 0; i < d; ++i)
             mpz_submul(P->p->_coeff[k - d + i], P->p->_coeff[k], F->_coeff[i]);

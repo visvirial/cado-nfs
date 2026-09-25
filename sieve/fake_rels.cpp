@@ -7,6 +7,8 @@
 #include <cstdint>
 
 #include <algorithm>
+#include <fstream>
+#include <functional>
 #include <iosfwd>
 #include <iostream>
 #include <iterator>
@@ -21,6 +23,7 @@
 
 #include <gmp.h>
 #include "fmt/base.h"
+#include "fmt/format.h"
 
 #include "cado_poly.hpp"
 #include "cxx_mpz.hpp"
@@ -309,9 +312,10 @@ static unsigned long print_fake_rel_manyq(
         int dl, double shrink_factor,
         gmp_randstate_t buf)
 {
-    /* There's a question of whether we print at each special-q, or only
-     * once at the end. The former has the advantage of avoiding user
-     * boredom.
+    /* Buffer many special-q and print under the lock only when the
+     * buffer exceeds 16MB. A flush at each special-q makes every
+     * thread take the global io_mutex millions of times per chunk,
+     * and the contention serializes the generation.
      */
     unsigned long nrels_thread = 0;
 
@@ -319,8 +323,8 @@ static unsigned long print_fake_rel_manyq(
 
     ASSERT_ALWAYS((qend - qbegin) % nq == 0);
 
+    std::ostringstream oss;
     for (auto it = qbegin ; it != qend ; ) {
-        std::ostringstream oss;
         /* This is the part that will go in _all_ relations */
         std::vector<index_t> qpart;
         for(int n = nq ; n-- ; )
@@ -360,6 +364,13 @@ static unsigned long print_fake_rel_manyq(
 
             if (shrink_factor > 1)
                 rel.shrink(shrink_factor);
+            /* The renumber table interleaves the sides of one prime, so
+             * shrink can map an index of each side to the same column.
+             * compress() works per side: fold the sides first, so that
+             * every column appears at most once in the output (merge
+             * requires it). */
+            std::ranges::move(rel.sides[0], std::back_inserter(rel.sides[1]));
+            rel.sides[0].clear();
             rel.sort();
             rel.compress(dl);
 
@@ -367,9 +378,15 @@ static unsigned long print_fake_rel_manyq(
             nrels_thread++;
             // rels_printed++;
         }
-        std::lock_guard<std::mutex> const dummy(io_mutex);
-        os << oss.str();
+
+        if (oss.tellp() > (1 << 24)) {
+            std::lock_guard<std::mutex> const dummy(io_mutex);
+            os << oss.str();
+            oss.str("");
+        }
     }
+    std::lock_guard<std::mutex> const dummy(io_mutex);
+    os << oss.str();
     return nrels_thread;
 }
 
@@ -444,7 +461,7 @@ std::vector<std::vector<index_t>> indexrange::all_composites(uint64_t q0, uint64
     return list;
 }
 
-static void worker(int tnum, int nt,
+static void worker(std::ostream & os, int tnum, int nt,
         std::vector<indexrange> const & Ind,
         // std::vector<std::pair<special_q, std::vector<model_relation>>> const & sample,
         std::pair<std::vector<size_t>, std::vector<model_relation>> const & sample,
@@ -460,7 +477,7 @@ static void worker(int tnum, int nt,
         auto it0 = qs[n].begin() + n * ((tnum * qs[n].size() / n) / nt);
         auto it1 = qs[n].begin() + n * (((tnum + 1) * qs[n].size() / n) / nt);
         ret += print_fake_rel_manyq(
-                std::cout,
+                os,
                 it0, it1,
                 n,
                 sample,
@@ -482,6 +499,10 @@ static void declare_usage(cxx_param_list & pl)
     pl.declare_usage("q1", "upper bound of the qrange");
     pl.declare_usage("sqside", "side of the special-q");
     pl.declare_usage("sample", "file where to find a sample of relations");
+    pl.declare_usage("chunk-list", "file of \"q0 q1 sample output [seed]\" lines;"
+            " expand every chunk with one load of the renumber table"
+            " (replaces -q0/-q1/-sample); seed defaults to -seed, and"
+            " the seeds of two lines must differ by at least -t");
     pl.declare_usage("renumber", "renumber table");
     pl.declare_usage("shrink-factor", "simulate with a matrix that number (integer >= 1) times smaller");
     pl.declare_usage("dl", "dl mode");
@@ -492,6 +513,66 @@ static void declare_usage(cxx_param_list & pl)
     pl.declare_usage("t", "number of threads to use");
     pl.declare_usage("v", "verbose mode");
     verbose_decl_usage(pl);
+}
+
+/* Chunk-list mode: the renumber table and the index ranges load
+ * once, and every listed chunk expands from them in turn. Each chunk
+ * writes to its own output file. A chunk seeds its workers with the
+ * seed of its line, or with -seed when the line has none, so the
+ * relations are the same ones a per-chunk invocation with that seed
+ * produces. Worker tnum of a chunk draws from seed+tnum, so two chunks
+ * of the same sample whose seeds are less than -t apart share a random
+ * sequence and output twin relations that differ only in the
+ * special-q; such lists are refused. Chunks of different samples may
+ * share a seed: their model relations differ, so their output does.
+ */
+struct chunk {
+    uint64_t q0, q1;
+    std::string sample, output;
+    unsigned long seed;
+};
+
+static std::vector<chunk> read_chunk_list(const char * chunklistfile,
+        unsigned long seed, int mt)
+{
+    std::vector<chunk> chunks;
+    std::ifstream chunklist(chunklistfile);
+    if (!chunklist) {
+        fmt::print(stderr, "Error: cannot read chunk list {}\n", chunklistfile);
+        exit(EXIT_FAILURE);
+    }
+    for(std::string line ; std::getline(chunklist, line) ; ) {
+        if (line.empty() || line[0] == '#')
+            continue;
+        chunk c { 0, 0, "", "", seed };
+        std::string seedfield;
+        std::istringstream is(line);
+        is >> c.q0 >> c.q1 >> c.sample >> c.output >> seedfield;
+        bool const has_seed = !seedfield.empty();
+        if (c.output.empty() || (has_seed && !(std::istringstream(seedfield) >> c.seed))) {
+            fmt::print(stderr, "Error: bad chunk list line: {}\n", line);
+            exit(EXIT_FAILURE);
+        }
+        chunks.push_back(c);
+    }
+
+    std::map<std::string, std::vector<unsigned long>> seeds_of_sample;
+    for(chunk const & c : chunks)
+        seeds_of_sample[c.sample].push_back(c.seed);
+    for(auto & [sample, seeds] : seeds_of_sample) {
+        std::sort(seeds.begin(), seeds.end());
+        for(size_t i = 1 ; i < seeds.size() ; i++) {
+            if (seeds[i] - seeds[i-1] >= (unsigned long) mt)
+                continue;
+            fmt::print(stderr, "Error: chunks of sample {} have seeds {}"
+                    " and {}, less than -t {} apart; chunks of one sample"
+                    " need seeds at least the thread count apart, or they"
+                    " output the same relations\n",
+                    sample, seeds[i-1], seeds[i], mt);
+            exit(EXIT_FAILURE);
+        }
+    }
+    return chunks;
 }
 
 // coverity[root_function]
@@ -544,8 +625,12 @@ int main(int argc, char const * argv[])
 
     pl.parse_mandatory("lpb0", lpb[0]);
     pl.parse_mandatory("lpb1", lpb[1]);
-    pl.parse_mandatory("q0", q0);
-    pl.parse_mandatory("q1", q1);
+
+    const char * chunklistfile = pl.lookup_old("chunk-list");
+    if (!chunklistfile) {
+        pl.parse_mandatory("q0", q0);
+        pl.parse_mandatory("q1", q1);
+    }
 
     pl.parse("shrink-factor", shrink_factor);
     if (shrink_factor < 1) {
@@ -560,6 +645,11 @@ int main(int argc, char const * argv[])
 
     unsigned long seed = 171717;
     pl.parse("seed", seed);
+
+    /* the list is checked before the long renumber table read */
+    std::vector<chunk> chunks;
+    if (chunklistfile)
+        chunks = read_chunk_list(chunklistfile, seed, mt);
 
     if (!cpoly.read(filename))
     {
@@ -596,96 +686,122 @@ int main(int argc, char const * argv[])
 
     // read sample file
     const char * samplefile = pl.lookup_old("sample");
-    if (!samplefile) {
+    if (!samplefile && !chunklistfile) {
         fmt::print(stderr, "Error: parameter -sample is mandatory\n");
         pl.print_usage(stderr);
         exit(EXIT_FAILURE);
     }
-
-    fmt::print ("# Start reading sample file\n");
-    fflush (stdout);
-
-    std::pair<std::vector<size_t>, std::vector<model_relation>> const sample = read_sample_file(sqside, samplefile, ren_table);
-
-    /*
-       std::vector<std::pair<special_q, std::vector<model_relation>>>
-       sample;
-       for(auto& x : read_sample_file(sqside, samplefile, ren_table))
-       sample.emplace_back(std::move(x));
-       if (verbose) {
-       for(auto const & x : sample) {
-       std::cout << "# " << x.first << ": " << x.second.size() << " relations\n";
-       }
-       }
-       */
-
-    fmt::print ("# Done reading sample file\n");
-    fflush (stdout);
 
     pl.warn_unused();
 
     // Two index ranges, one for each side
     fmt::print ("# Start preparing index ranges\n");
     fflush (stdout);
-    std::vector<indexrange> Ind = prepare_indexrange(ren_table, sqside, compsq);
+    std::vector<indexrange> const Ind = prepare_indexrange(ren_table, sqside, compsq);
     fmt::print ("# Done preparing index ranges\n");
     fflush (stdout);
 
-    std::vector<std::vector<index_t>> qs;
-
     /* the indexranges contain the prime-to-index conversion functionality
      * only if compsq holds. In the non-composite case, we fill qs[1]
-     * differently, because we don't want to 
+     * differently, because we don't want to
      */
-    if (!compsq) {
-        qs.emplace_back(); /* 0 -- placeholder */
-        qs.emplace_back(); /* 1 */
+    auto build_qs = [&](uint64_t cq0, uint64_t cq1) {
+        std::vector<std::vector<index_t>> qs;
+        if (!compsq) {
+            qs.emplace_back(); /* 0 -- placeholder */
+            qs.emplace_back(); /* 1 */
 
-        /* jump-start in the renumber table, and enumerate the large primes
-         * from there.
-         */
-        index_t i = ren_table.index_from_p(q0, sqside);
-        renumber_t::const_iterator it(ren_table, i);
-        for( ; it != ren_table.end() && (*it).p < q1 ; ++it, ++i) {
-            if ((*it).side == sqside)
-                qs[1].push_back(i);
+            /* jump-start in the renumber table, and enumerate the large
+             * primes from there.
+             */
+            index_t i = ren_table.index_from_p(cq0, sqside);
+            renumber_t::const_iterator it(ren_table, i);
+            for( ; it != ren_table.end() && (*it).p < cq1 ; ++it, ++i) {
+                if ((*it).side == sqside)
+                    qs[1].push_back(i);
+            }
+        } else {
+            /* In theory, this is overkill. We don't _really_ need the
+             * prime[] cache in the indexrange type. Except that the
+             * renumber "traditional" format has expensive *_from_index
+             * lookups, and that would get in the way if we want to do away
+             * with indexrange::prime[]. Also, we don't have bidirectional
+             * iterators on the renumber table, so it's not really
+             * practical to use only the renumber table.
+             */
+            qs = Ind[sqside].all_composites(cq0, cq1, qfac_min, qfac_max);
         }
-    } else {
-        /* In theory, this is overkill. We don't _really_ need the prime[]
-         * cache in the indexrange type. Except that the renumber
-         * "traditional" format has expensive *_from_index lookups, and
-         * that would get in the way if we want to do away with
-         * indexrange::prime[]. Also, we don't have bidirectional iterators
-         * on the renumber table, so it's not really practical to use only
-         * the renumber table.
+        return qs;
+    };
+
+    /* Expand one chunk: run the workers on its qs and sample, then
+     * append the statistics lines. A complete output ends with the two
+     * "# Output" lines, which resume checks look for.
+     */
+    auto expand = [&](std::ostream & os,
+            std::pair<std::vector<size_t>, std::vector<model_relation>> const & sample,
+            std::vector<std::vector<index_t>> const & qs,
+            unsigned long seed) {
+        rels_printed = 0;
+
+        std::vector<std::thread> threads;
+
+        double t0 = seconds ();
+        double wct_t0 = wct_seconds ();
+
+        /* std::thread copies its arguments. A by-value pass gives each
+         * worker a private copy of the tables (tens of GB for a large
+         * renumber table), and the main thread makes the copies one after
+         * the other, which serializes the workers. The workers only read
+         * the tables, so they share them by reference.
          */
-        qs = Ind[sqside].all_composites(q0, q1, qfac_min, qfac_max);
+        threads.reserve(mt);
+        for(int i = 0 ; i < mt ; i++)
+            threads.emplace_back(worker, std::ref(os), i, mt,
+                    std::cref(Ind), std::cref(sample), std::cref(qs),
+                    shrink_factor, dl, seed);
+        for(auto & t : threads)
+            t.join();
+
+        t0 = seconds () - t0;
+        wct_t0 = wct_seconds () - wct_t0;
+
+        /* print statistics */
+
+        os << fmt::format("# Output {} relations in {:.2f}s cpu ({:.0f} rels/s)\n",
+                rels_printed, t0, double_ratio(rels_printed, t0));
+        os << fmt::format("# Output {} relations in {:.2f}s wct ({:.0f} rels/s)\n",
+                rels_printed, wct_t0, double_ratio(rels_printed, wct_t0));
+        os.flush();
+    };
+
+    if (!chunklistfile) {
+        fmt::print ("# Start reading sample file\n");
+        fflush (stdout);
+        std::pair<std::vector<size_t>, std::vector<model_relation>> const
+            sample = read_sample_file(sqside, samplefile, ren_table);
+        fmt::print ("# Done reading sample file\n");
+        fflush (stdout);
+        expand(std::cout, sample, build_qs(q0, q1), seed);
+        return 0;
     }
 
-
-    std::vector<std::thread> threads;
-
-    double t0 = seconds ();
-    double wct_t0 = wct_seconds ();
-
-    threads.reserve(mt);
-    for(int i = 0 ; i < mt ; i++)
-        threads.emplace_back(worker, i, mt, 
-                Ind, sample, qs,
-                shrink_factor, dl, seed);
-    for(auto & t : threads)
-        t.join();
-
-
-    t0 = seconds () - t0;
-    wct_t0 = wct_seconds () - wct_t0;
-
-    /* print statistics */
-
-    fmt::print ("# Output {} relations in {:.2f}s cpu ({:.0f} rels/s)\n",
-            rels_printed, t0, double_ratio(rels_printed, t0));
-    fmt::print ("# Output {} relations in {:.2f}s wct ({:.0f} rels/s)\n",
-            rels_printed, wct_t0, double_ratio(rels_printed, wct_t0));
+    for(chunk const & c : chunks) {
+        fmt::print ("# Chunk {}-{}: {} -> {} (seed {})\n", c.q0, c.q1,
+                c.sample, c.output, c.seed);
+        fflush (stdout);
+        std::pair<std::vector<size_t>, std::vector<model_relation>> const
+            sample = read_sample_file(sqside, c.sample.c_str(), ren_table);
+        ofstream_maybe_compressed os(c.output);
+        expand(os, sample, build_qs(c.q0, c.q1), c.seed);
+        /* expand ends with a flush, so a failed write has set the
+         * stream state by now. The state at construction is good even
+         * when the file cannot be created. */
+        if (!os) {
+            fmt::print(stderr, "Error: cannot write {}\n", c.output);
+            exit(EXIT_FAILURE);
+        }
+    }
 
     return 0;
 }

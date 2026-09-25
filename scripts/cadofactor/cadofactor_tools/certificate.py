@@ -1,4 +1,6 @@
+import ipaddress
 import logging
+import re
 import sys
 import socket
 import os
@@ -56,7 +58,12 @@ def create_certificate(cafile, name, SAN, bits=2048):
 
     if os.path.isfile(cafile) and os.access(cafile, os.R_OK) and \
        os.path.isfile(keyfile) and os.access(keyfile, os.R_OK):
-        return (cafile, keyfile)
+        requested = {canonical_name(line.split('=', 1)[1].strip())
+                     for line in SAN.splitlines()}
+        if requested <= certificate_names(cafile):
+            return (cafile, keyfile)
+        logger.info("%s does not have all the requested alternate names, "
+                    "generating a new certificate", cafile)
 
     config_filename = cafile + '.config'
     print(openssl_config_template.format(bits=2048, SAN=SAN),
@@ -86,11 +93,15 @@ def create_certificate(cafile, name, SAN, bits=2048):
     return (cafile, keyfile)
 
 
-def get_server_alternate_names(address):
+def get_server_alternate_names(address, extra_names=()):
     """
     given a server that will listen on the given address (maybe it's an
     ipv4 address, maybe an fqdn, etc), try to determine possible server
     alt names that it would make sense to include in the certificate
+
+    extra_names are added to the ones found from the address. Use them
+    for the names that clients dial but the server cannot see, such as
+    the public name of a reverse proxy or of a tunnel.
     """
 
     # We need to find out which addresses to put as SubjectAltNames (SAN)
@@ -139,7 +150,48 @@ def get_server_alternate_names(address):
             dns_counter += 1
             SAN += "IP.2 = 127.0.0.1\n"
 
+    # The names go into an openssl config file, so restrict them to
+    # host name characters, plus "*" for wildcard names and "_" for
+    # internal DNS labels.
+    for extra in extra_names:
+        try:
+            ipaddress.ip_address(extra)
+            kind = "IP"
+        except ValueError:
+            if not re.fullmatch(r"[A-Za-z0-9.*_-]+", extra):
+                raise ValueError("invalid alternate name: %r"
+                                 % extra) from None
+            kind = "DNS"
+        SAN += "%s.%d = %s\n" % (kind, SAN.count(kind + ".") + 1, extra)
+
     return SAN
+
+
+def canonical_name(name):
+    """returns the canonical text form of an IP address, and any other
+    name unchanged"""
+    try:
+        return str(ipaddress.ip_address(name))
+    except ValueError:
+        return name
+
+
+def certificate_names(certfile):
+    """returns the set of subject alternative names in the certificate,
+    or the empty set if the certificate cannot be read"""
+    command = ['openssl', 'x509', '-in', certfile, '-noout', '-text']
+    try:
+        output = check_output(command, stderr=STDOUT).decode('ascii')
+    except (OSError, CalledProcessError) as e:
+        logger.warning("openssl failed: %s", e)
+        return set()
+    lines = output.splitlines()
+    for i, line in enumerate(lines[:-1]):
+        if 'X509v3 Subject Alternative Name' in line:
+            entries = lines[i + 1].split(',')
+            return {canonical_name(e.split(':', 1)[1].strip())
+                    for e in entries}
+    return set()
 
 
 def get_certificate_hash(certfile):

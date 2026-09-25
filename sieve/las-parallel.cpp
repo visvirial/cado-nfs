@@ -148,7 +148,7 @@ struct las_parallel_desc::helper {
 #endif
             hwloc_topology_set_flags(topology, flags);
 
-            hwloc_topology_load(topology);
+            hwloc_aux_topology_load(topology);
 
         }/*}}}*/
         depth = hwloc_topology_get_depth(topology);

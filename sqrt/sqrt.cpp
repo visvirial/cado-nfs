@@ -56,9 +56,11 @@
 #include "mpz_polymodF.h"
 #include "mpz_poly_parallel.hpp"
 #include "omp_proxy.h"
+#include "par_mul.hpp"
 #include "purgedfile.h"
 #include "portability.h"
 #include "macros.h"
+#include "misc.h"
 #include "params.hpp"
 #include "timing.h"
 #include "runtime_numeric_cast.hpp"
@@ -72,9 +74,6 @@
 
 /* frequency of messages "read xxx (a,b) pairs" */
 #define REPORT 10000000
-
-/* maximal number of threads when reading dependency files */
-#define MAX_IO_THREADS 16
 
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 static int verbose = 0;
@@ -263,6 +262,10 @@ static void accumulate_level00(std::vector<typename M::T> & v, M const & m, std:
     unsigned int n = 1;
     for( ; (1UL << n) < min_pieces_per_thread * nthr ; n++) ;
 
+    /* already a floor level (see the other accumulate_level00) */
+    if (!(N & (N - 1)) && N <= (1UL << n))
+        return;
+
     if ((N >> n) < 16) {
         /* Don't bother with very small vectors. Here we have a vector of
          * size less than 16*min_pieces_per_thread*thr/2, so don't bother. */
@@ -382,7 +385,9 @@ static typename M::T accumulate(std::vector<typename M::T> & v, M const & m, std
 	  omp_set_nested (1);
 	  local_nthreads = nthr / nloops;
 	}
-#pragma omp parallel for
+      /* a team of the size of the work: idle team members would count
+       * against the threads of the products (see sqrt/par_mul.cpp) */
+#pragma omp parallel for num_threads(nloops < nthr ? nloops : nthr)
       for(size_t j = 0 ; j < N ; j += 2) {
 	  omp_set_num_threads (local_nthreads);
 	  m(v[j], v[j], v[j+1]);
@@ -409,7 +414,11 @@ static typename M::T accumulate(std::vector<typename M::T> & v, M const & m, std
 /* }}} */
 
 /*************************************************************************/
-/* {{{ Parallel I/O for reading the dep file */
+/* {{{ Reading the dep file */
+
+/* The (a,b) pairs of a dependency file, as leaves of the product tree.
+ * This is the single-thread fallback for files that cannot be seeked.
+ */
 template<typename M>
 static std::vector<typename M::T>
 read_ab_pairs_from_depfile(std::string const & depname, M const & m, std::string const & message, unsigned long & nab, unsigned long & nfree)
@@ -419,113 +428,131 @@ requires requires { m.from_ab(cxx_mpz(), cxx_mpz()); }
     FILE * depfile = fopen_maybe_compressed_lock (depname.c_str(), "rb");
     ASSERT_ALWAYS(depfile);
     std::vector<typename M::T> prd;
-
-    if (fseek(depfile, 0, SEEK_END) < 0) {
-        fmt::print(stderr, "{}: cannot seek in dependency file, using single-thread I/O\n", message);
-        cxx_mpz a, b;
-        /* Cannot seek: we have to use serial i/o */
-        while (gmp_fscanf(depfile, "%Zd %Zd", (mpz_ptr) a, (mpz_ptr) b) != EOF)
-        {
-            if(!(nab % REPORT)) {
-                fmt::print(stderr, "{}: read {} (a,b) pairs in {:.2f}s (wct {:.2f}s, peak {}M)\n",
-                        message, nab, seconds (), wct_seconds () - wct0,
-                        PeakMemusage () >> 10U);
-                fflush (stderr);
-            }
-            if (mpz_cmp_ui (a, 0) == 0 && mpz_cmp_ui (b, 0) == 0)
-                break;
-            prd.emplace_back(m.from_ab(a, b));
-            nab++;
-            if (mpz_cmp_ui (b, 0) == 0)
-                nfree++;
-        }
-    } else {
-        /* We _can_ seek. Good news ! */
-        const long endpos = ftell(depfile);
-        /* Find accurate starting positions for everyone */
-        unsigned int nthreads = omp_get_max_threads();
-        /* cap the number of I/O threads */
-        if (nthreads > MAX_IO_THREADS)
-            nthreads = MAX_IO_THREADS;
-        fmt::print(stderr, "{}: Doing I/O with {} threads\n", message, nthreads);
-        std::vector<long> spos_tab;
-        spos_tab.reserve(nthreads);
-        for(unsigned int i = 0 ; i < nthreads ; i++)
-            spos_tab.push_back((endpos * i) / nthreads);
-        spos_tab.push_back(endpos);
-        /* All threads get their private reading head. */
-#pragma omp parallel num_threads(nthreads)
-        {
-            const int i = omp_get_thread_num();
-            FILE * fi = fopen_maybe_compressed_lock (depname.c_str(), "rb");
-            const int rc = fseek(fi, spos_tab[i], SEEK_SET);
-            ASSERT_ALWAYS(rc == 0);
-            if (i > 0) {
-                /* Except when we're at the end of the stream, read until
-                 * we get a newline */
-                for( ; fgetc(fi) != '\n' ; ) ;
-            }
-            spos_tab[i] = ftell(fi);
-#pragma omp barrier
-            std::vector<typename M::T> loc_prd;
-            unsigned long loc_nab = 0;
-            unsigned long loc_nfree = 0;
-            cxx_mpz a, b;
-            for(long pos = ftell(fi) ; pos < spos_tab[i+1] ; ) {
-                const int rc = gmp_fscanf(fi, "%Zd %Zd", (mpz_ptr) a, (mpz_ptr) b);
-                pos = ftell(fi);
-                /* We may be tricked by initial white space, since our
-                 * line parsing does not gobble whitespace at end of
-                 * line.
-                 * Therefore we must check the position _after_ the
-                 * parse.
-                 */
-                if ((rc != 2 && feof(fi)) || pos >= spos_tab[i+1])
-                    break;
-                ASSERT_ALWAYS(rc == 2);
-                if (mpz_cmp_ui (a, 0) == 0 && mpz_cmp_ui (b, 0) == 0)
-                    ASSERT_ALWAYS(0);
-                loc_prd.emplace_back(m.from_ab(a, b));
-                loc_nab++;
-                loc_nfree += (mpz_cmp_ui (b, 0) == 0);
-
-                if(!(loc_nab % 100000))
-#pragma omp critical
-                {
-                    nab += loc_nab;
-                    nfree += loc_nfree;
-                    loc_nab = 0;
-                    loc_nfree = 0;
-                    /* in truth, a splice() would be best. */
-                    for(auto & x: loc_prd)
-                        prd.emplace_back(std::move(x));
-                    loc_prd.clear();
-                    if(!(nab % REPORT)) {
-                        fmt::print(stderr, "{}: read {} (a,b) pairs in {:.2f}s (wct {:.2f}s, peak {}M)\n",
-                                message, nab, seconds (), wct_seconds () - wct0,
-                                PeakMemusage () >> 10U);
-                        fflush (stderr);
-                    }
-                }
-            }
-#pragma omp critical
-            {
-                nab += loc_nab;
-                nfree += loc_nfree;
-                for(auto & x: loc_prd)
-                    prd.emplace_back(std::move(x));
-                loc_prd.clear();
-            }
-            fclose_maybe_compressed_lock (fi, depname.c_str());
-        }
-        {
-            fmt::print (stderr, "{} read {} (a,b) pairs, including {} free, in {:1.2f}s (wct {:1.2f}s)\n",
-                    message, nab, nfree, seconds (), wct_seconds () - wct0);
+    cxx_mpz a, b;
+    while (gmp_fscanf(depfile, "%Zd %Zd", (mpz_ptr) a, (mpz_ptr) b) != EOF)
+    {
+        if(!(nab % REPORT)) {
+            fmt::print(stderr, "{}: read {} (a,b) pairs in {:.2f}s (wct {:.2f}s, peak {}M)\n",
+                    message, nab, seconds (), wct_seconds () - wct0,
+                    PeakMemusage () >> 10U);
             fflush (stderr);
         }
+        if (mpz_cmp_ui (a, 0) == 0 && mpz_cmp_ui (b, 0) == 0)
+            break;
+        prd.emplace_back(m.from_ab(a, b));
+        nab++;
+        if (mpz_cmp_ui (b, 0) == 0)
+            nfree++;
     }
     fclose_maybe_compressed_lock (depfile, depname.c_str());
     return prd;
+}
+
+using ab_pair = std::pair<int64_t, uint64_t>;
+
+/* The product of the leaves of one range of (a,b) pairs, for the M that
+ * have no range product of their own */
+template<typename M>
+static typename M::T product_of_leaves(std::vector<ab_pair> const & ab, M const & m)
+{
+    std::vector<typename M::T> leaves;
+    cxx_mpz a, b;
+    for (auto const & [av, bv] : ab) {
+        mpz_set_si(a, av);
+        mpz_set_ui(b, bv);
+        leaves.emplace_back(m.from_ab(a, b));
+    }
+    std::vector<typename M::T> A;
+    accumulate(A, leaves.begin(), leaves.end(), m);
+    return std::move(leaves.front());
+}
+
+/* The floor level of the product tree, read from the dependency file:
+ * the file is cut in 2^n byte ranges, and the thread that takes a range
+ * parses its (a,b) pairs and multiplies them, so that every leaf is
+ * allocated, used and freed by one thread. Returns the 2^n range
+ * products, or the leaves themselves when the file cannot be seeked.
+ */
+template<typename M>
+static std::vector<typename M::T>
+accumulate_level00(std::string const & depname, M const & m, std::string const & message, unsigned long & nab, unsigned long & nfree)
+requires requires { m.from_ab(cxx_mpz(), cxx_mpz()); }
+{
+    FILE * depfile = fopen_maybe_compressed_lock (depname.c_str(), "rb");
+    ASSERT_ALWAYS(depfile);
+    const bool seekable = fseek(depfile, 0, SEEK_END) == 0;
+    const long endpos = ftell(depfile);
+    fclose_maybe_compressed_lock (depfile, depname.c_str());
+    if (!seekable) {
+        fmt::print(stderr, "{}: cannot seek in dependency file, using single-thread I/O\n", message);
+        return read_ab_pairs_from_depfile(depname, m, message, nab, nfree);
+    }
+
+    /* 8 ranges per thread or more, for the balance of the work */
+    const unsigned int nthr = omp_get_max_threads();
+    unsigned int n = 1;
+    for( ; (1UL << n) < 8 * nthr ; n++) ;
+    const size_t npieces = 1UL << n;
+    fmt::print (stderr, "{}: starting level 00 at wct={:1.2f}s, {} bytes in 2^{} ranges\n",
+            message, wct_seconds () - wct0, endpos, n);
+    fflush (stderr);
+
+    /* range i starts at the line after the byte endpos*i/npieces */
+    std::vector<long> start(npieces + 1, endpos);
+    start[0] = 0;
+#pragma omp parallel for
+    for (size_t i = 1; i < npieces; i++) {
+        FILE * fi = fopen_maybe_compressed_lock (depname.c_str(), "rb");
+        ASSERT_ALWAYS(fseek(fi, (endpos * (long) i) / (long) npieces, SEEK_SET) == 0);
+        for (int c = fgetc(fi); c != '\n' && c != EOF; c = fgetc(fi)) ;
+        start[i] = ftell(fi);
+        fclose_maybe_compressed_lock (fi, depname.c_str());
+    }
+
+    std::vector<typename M::T> v(npieces);
+    unsigned long ab = 0, fr = 0;
+#pragma omp parallel
+    {
+        FILE * fi = fopen_maybe_compressed_lock (depname.c_str(), "rb");
+        std::string text;
+        std::vector<ab_pair> ab_range;
+#pragma omp for schedule(dynamic) reduction(+:ab,fr)
+        for (size_t i = 0; i < npieces; i++) {
+            /* the whole range in memory: the lines "a b" of the range, a
+             * signed and b unsigned 64-bit, are parsed with strtoll */
+            text.resize(start[i+1] - start[i]);
+            ASSERT_ALWAYS(fseek(fi, start[i], SEEK_SET) == 0);
+            ASSERT_ALWAYS(fread(text.data(), 1, text.size(), fi) == text.size());
+            ab_range.clear();
+            for (char * p = text.data(), * end = p + text.size(); p < end; ) {
+                errno = 0;
+                char * q;
+                const long long av = strtoll(p, &q, 10);
+                ASSERT_ALWAYS(q > p && *q == ' ');
+                const unsigned long long bv = strtoull(q, &p, 10);
+                ASSERT_ALWAYS(p > q && (*p == '\n' || p == end) && errno == 0);
+                p++;
+                ab_range.emplace_back(av, bv);
+                fr += bv == 0;
+            }
+            ab += ab_range.size();
+            m.set1(v[i]);
+            if (!ab_range.empty())
+                v[i] = m.range_product(ab_range);
+            const std::scoped_lock<std::mutex> dummy(stdio_guard);
+            fmt::print (stderr, "{}: fragment {}/{} of level 00 ({} pairs) done by thread {} at wct={:1.2f}s\n",
+                    message, i, npieces, ab_range.size(), omp_get_thread_num(),
+                    wct_seconds () - wct0);
+            fflush (stderr);
+        }
+        fclose_maybe_compressed_lock (fi, depname.c_str());
+    }
+    nab = ab;
+    nfree = fr;
+    fmt::print (stderr, "{} read {} (a,b) pairs, including {} free, in {:1.2f}s (wct {:1.2f}s)\n",
+            message, nab, nfree, seconds (), wct_seconds () - wct0);
+    fflush (stderr);
+    return v;
 } /* }}} */
 
 /********** RATSQRT **********/
@@ -550,6 +577,59 @@ struct cxx_mpz_functions { /* {{{ */
         mpz_mul (v, mpz_poly_coeff_const(P, 1), a);
         mpz_addmul (v, mpz_poly_coeff_const(P, 0), b);
         return v;
+    }
+    /* The product of the leaves g1*a+g0*b of a range, as limbs: the
+     * leaves go into one buffer, and each level of the tree is written
+     * into the buffer that the level below does not use, so that the
+     * range allocates nothing but the two buffers (with an mpz per leaf
+     * and per product, the threads serialize on the allocator lock).
+     */
+    ATTRIBUTE_NODISCARD
+    T range_product(std::vector<ab_pair> const & ab) const
+    {
+        struct span { mp_limb_t * p; mp_size_t n; };
+        mpz_srcptr g1 = mpz_poly_coeff_const(P, 1);
+        mpz_srcptr g0 = mpz_poly_coeff_const(P, 0);
+        /* a and b are one limb each */
+        const mp_size_t L = std::max(mpz_size(g1), mpz_size(g0)) + 2;
+        std::vector<mp_limb_t> buf[2] = {
+            std::vector<mp_limb_t>(ab.size() * L),
+            std::vector<mp_limb_t>(ab.size() * L) };
+        std::vector<span> cur, next;
+        bool negative = false;
+        cxx_mpz v;
+        mpz_realloc2(v, L * GMP_NUMB_BITS);
+        mp_limb_t * w = buf[0].data();
+        for (auto const & [av, bv] : ab) {
+            mpz_mul_si(v, g1, av);
+            mpz_addmul_ui(v, g0, bv);
+            const mp_size_t n = mpz_size(v);
+            ASSERT_ALWAYS(n > 0);
+            negative ^= mpz_sgn(v) < 0;
+            mpn_copyi(w, mpz_limbs_read(v), n);
+            cur.push_back({w, n});
+            w += n;
+        }
+        for (int k = 1; cur.size() > 1; k ^= 1) {
+            w = buf[k].data();
+            next.clear();
+            for (size_t j = 0; j + 1 < cur.size(); j += 2) {
+                span x = cur[j], y = cur[j+1];
+                if (x.n < y.n) std::swap(x, y);
+                const mp_limb_t high = mpn_mul(w, x.p, x.n, y.p, y.n);
+                next.push_back({w, x.n + y.n - (high == 0)});
+                w += next.back().n;
+            }
+            if (cur.size() & 1) {
+                mpn_copyi(w, cur.back().p, cur.back().n);
+                next.push_back({w, cur.back().n});
+                w += cur.back().n;
+            }
+            ASSERT_ALWAYS(w <= buf[k].data() + buf[k].size());
+            std::swap(cur, next);
+        }
+        mpz_t r;
+        return cxx_mpz(mpz_roinit_n(r, cur[0].p, negative ? -cur[0].n : cur[0].n));
     }
     explicit cxx_mpz_functions(cxx_mpz_poly const & P) : P(P) {}
 }; /* }}} */
@@ -583,35 +663,62 @@ calculateSqrtRat (std::string const & prefix, unsigned int numdep, cxx_cado_poly
   cxx_mpz_poly F(cpoly[side]);
   cxx_mpz prod;
 
+  /* The full product can exceed what an mpz_t holds (its limb count is
+   * an int, so at most 2^31-1 limbs; a large factorization with 1e9
+   * relations of 155 bits each needs more). The two halves of the product fit, so
+   * accumulate them separately, and form the full product and its
+   * square root with mpn calls, whose counts are mp_size_t.
+   */
+  cxx_mpz half0, half1;
   {
       const cxx_mpz_functions M(F);
       const std::string message = fmt::format("Rat({})", numdep);
 
-      std::vector<cxx_mpz> prd = read_ab_pairs_from_depfile(
+      std::vector<cxx_mpz> prd = accumulate_level00(
               get_depname (prefix, "", numdep),
               M, message, nab, nfree);
 
-      prod = accumulate(prd, M, message);
+      std::vector<cxx_mpz> prd1(
+              std::make_move_iterator(prd.begin() + prd.size() / 2),
+              std::make_move_iterator(prd.end()));
+      prd.erase(prd.begin() + prd.size() / 2, prd.end());
+      half0 = prd.empty() ? cxx_mpz(1) : accumulate(prd, M, message + " half 0");
+      half1 = prd1.empty() ? cxx_mpz(1) : accumulate(prd1, M, message + " half 1");
   }
 
   /* we must divide by g1^nab: if the number of (a,b) pairs is odd, we
      multiply by g1, and divide by g1^(nab+1) */
   if (nab & 1U)
-    mpz_mul (prod, prod, mpz_poly_coeff_const(F, 1));
+    mpz_mul (half0, half0, mpz_poly_coeff_const(F, 1));
 
-#pragma omp critical
-  {
-    fmt::print (stderr, "Rat({}): size of product = {} bits (peak {}M)\n",
-	     numdep, mpz_sizeinbase (prod, 2),
-	     PeakMemusage () >> 10U);
-    fflush (stderr);
-  }
-
-  if (mpz_sgn (prod) < 0)
+  if (mpz_sgn (half0) * mpz_sgn (half1) < 0)
     {
       fmt::print (stderr, "Error, product is negative: try another dependency\n");
       exit(EXIT_FAILURE);
     }
+
+  const mp_size_t n0 = mpz_size(half0);
+  const mp_size_t n1 = mpz_size(half1);
+  ASSERT_ALWAYS(n0 > 0 && n1 > 0);
+  mp_size_t np = n0 + n1;
+  std::unique_ptr<mp_limb_t[]> P(new mp_limb_t[np]);
+  if (n0 >= n1)
+      par_mul(P.get(), mpz_limbs_read(half0), n0, mpz_limbs_read(half1), n1);
+  else
+      par_mul(P.get(), mpz_limbs_read(half1), n1, mpz_limbs_read(half0), n0);
+  mpz_realloc2 (half0, 1);
+  mpz_realloc2 (half1, 1);
+  while (np > 0 && P[np - 1] == 0)
+      np--;
+  ASSERT_ALWAYS(np > 0);
+
+#pragma omp critical
+  {
+    fmt::print (stderr, "Rat({}): size of product = {} bits (peak {}M)\n",
+	     numdep, (size_t) np * GMP_NUMB_BITS - cado_clzl(P[np - 1]),
+	     PeakMemusage () >> 10U);
+    fflush (stderr);
+  }
 
 #pragma omp critical
   {
@@ -620,9 +727,9 @@ calculateSqrtRat (std::string const & prefix, unsigned int numdep, cxx_cado_poly
     fflush (stderr);
   }
 
-  cxx_mpz v;
   /* since we know we have a square, take the square root */
-  mpz_sqrtrem (prod, v, prod);
+  const cxx_mpz rem = par_sqrtrem(prod, P.get(), np);
+  P.reset();
 
 #pragma omp critical
   {
@@ -631,41 +738,15 @@ calculateSqrtRat (std::string const & prefix, unsigned int numdep, cxx_cado_poly
     fflush (stderr);
   }
 
-  if (mpz_cmp_ui (v, 0) != 0)
+  if (mpz_sgn(rem) != 0)
     {
-      unsigned long p = 2, e, errors = 0;
-      cxx_mpz pp;
-
       fmt::print (stderr, "Error, rational square root remainder is not zero\n");
-      /* reconstruct the initial value of prod to debug */
-      mpz_mul (prod, prod, prod);
-      mpz_add (prod, prod, v);
-      prime_info pi;
-      prime_info_init (pi);
-      while (mpz_cmp_ui (prod, 1) > 0)
-        {
-          e = 0;
-          if (verbose)
-            fmt::print ("Removing p={}:", p);
-          mpz_set_ui (pp, p);
-          e = mpz_remove (prod, prod, pp);
-          if (verbose)
-            fmt::print (" exponent={}, remaining {} bits\n", e,
-                    mpz_sizeinbase (prod, 2));
-          if ((e % 2) != 0)
-            {
-              errors ++;
-              fmt::print (stderr, "Prime {} appears to odd power {}\n", p, e);
-              if (verbose || errors >= 10)
-                break;
-            }
-          p = getprime_mt (pi);
-        }
-      prime_info_clear (pi);
       exit(EXIT_FAILURE);
     }
 
   mpz_mod (prod, prod, Np);
+
+  cxx_mpz v;
 
 #pragma omp critical
   {
@@ -724,6 +805,10 @@ struct cxx_mpz_polymodF_functions { /* {{{ */
         cxx_mpz_polymodF ret;
         mpz_polymodF_set_from_ab(ret, a, b);
         return ret;
+    }
+    ATTRIBUTE_NODISCARD
+    T range_product(std::vector<ab_pair> const & ab) const {
+        return product_of_leaves(ab, *this);
     }
     static bool is1(T & res) {
         return res->p->deg == 0 && res->v == 0 && mpz_cmp_ui(mpz_poly_coeff_const(res->p, 0), 1) == 0;
@@ -1156,7 +1241,7 @@ calculateSqrtAlg (std::string const & prefix, unsigned int numdep,
       const cxx_mpz_polymodF_functions M(F, pinf);
 
       const std::string message = fmt::format("Alg({})", numdep);
-      std::vector<cxx_mpz_polymodF> prd = read_ab_pairs_from_depfile(
+      std::vector<cxx_mpz_polymodF> prd = accumulate_level00(
               get_depname (prefix, "", numdep),
               M, message, nab, nfree);
 
@@ -1165,12 +1250,14 @@ calculateSqrtAlg (std::string const & prefix, unsigned int numdep,
           mpz_poly_set_xi(alpha_hat, 1);
           mpz_poly_mul_mpz(alpha_hat, alpha_hat, mpz_poly_lc(F));
           mpz_poly_eval_diff_poly(scale, F_hat, alpha_hat);
-          /* Add these two to the subproduct tree. ok, they're slightly
-           * larger than the other elements, but it won't make a big
-           * difference in the long run, and is certainly not worse than
-           * doing the full unbalanced mul after the accumulation */
-          prd.emplace_back(scale,0);
-          prd.emplace_back(scale,0);
+          /* Multiply these two into the subproduct tree. ok, they're
+           * slightly larger than the other elements, but it won't make
+           * a big difference in the long run, and is certainly not worse
+           * than doing the full unbalanced mul after the accumulation */
+          const cxx_mpz_polymodF s(scale, 0);
+          ASSERT_ALWAYS(prd.size() >= 2);
+          M(prd[0], prd[0], s);
+          M(prd[1], prd[1], s);
       }
 
       ASSERT_ALWAYS ((nab & 1U) == 0);
@@ -1327,6 +1414,10 @@ struct cxx_mpz_qs_functions { /* {{{ */
         mpz_poly_eval(v, P, a);
         return { v, a };
     }
+    ATTRIBUTE_NODISCARD
+    T range_product(std::vector<ab_pair> const & ab) const {
+        return product_of_leaves(ab, *this);
+    }
 }; /* }}} */
 
 static int calculateSqrtQS( /* {{{ */
@@ -1347,7 +1438,7 @@ static int calculateSqrtQS( /* {{{ */
         const cxx_mpz_qs_functions M(F, Np);
         const std::string message = fmt::format("QS({})", numdep);
 
-        auto prd = read_ab_pairs_from_depfile(
+        auto prd = accumulate_level00(
             get_depname (prefix, "", numdep),
             M, message, nab, nfree);
 
@@ -1932,7 +2023,11 @@ struct task_generic_context {
     template<typename F>
     void dispatch(F const & f) const
     {
-        omp_set_num_threads(iceildiv(omp_get_max_threads(), nthreads));
+        /* Each dependency gets its share of the cores. A new thread takes
+         * its OpenMP thread count from the environment, not from this
+         * thread, so each dependency thread sets its own share. */
+        int const share = iceildiv(omp_get_max_threads(), nthreads);
+        auto g = [&f, share](int j) { omp_set_num_threads(share); f(j); };
         std::vector<std::thread> threads;
         threads.reserve(nthreads);
         for(int j = 0 ; j < nthreads ; j++) {
@@ -1944,9 +2039,9 @@ struct task_generic_context {
              * libc (used by alpine linux). Note that HAVE_MUSL is a
              * custom flag that we define ourselves.
              */
-            f(j);
+            g(j);
 #else
-            threads.emplace_back(f, j);
+            threads.emplace_back(g, j);
 #endif
         }
         for(auto & t : threads)

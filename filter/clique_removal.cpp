@@ -8,15 +8,19 @@
 
 #include <algorithm>
 #include <functional>
+#include <numeric>
 #include <set>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "fmt/base.h"
+#include "fmt/format.h"
 
 #include "macros.h"
+#include "misc.h"
 #include "purge_matrix.hpp"
+#include "subdivision.hpp"
 #include "timing.h"
 #include "typedefs.h"
 
@@ -89,11 +93,18 @@ void purge_matrix::print_clique_removal_weight_function()
  * a 0-row component. It indicates that the same component was found
  * earlier.
  *
+ * The column weights are read with relaxed atomic loads, because
+ * delete_connected_component calls this function while other threads
+ * delete other components. The result does not depend on these
+ * deletions: a column of weight_two has its two rows in the
+ * component of i0, so its weight and its row_xors entry stay until
+ * this component is deleted, and the deletion does not use the weight w.
+ *
  * An important property is that the connected components are (of course)
  * disjoint. The deletion of a connected component uses (and "consumes",
- * in a way) the sum2[] array entries for column indices that are in this
- * connected component, but those entries _cannot_ relate to entries in
- * another component, by definition.
+ * in a way) the row_xors[] array entries for column indices that are in
+ * this connected component, but those entries _cannot_ relate to entries
+ * in another component, by definition.
  *
  * XXX
  * there's a design decision regarding the underlying type for the
@@ -112,7 +123,7 @@ void purge_matrix::print_clique_removal_weight_function()
 
 template <weight_function F>
 auto purge_matrix::compute_connected_component_with_set(size_t i0,
-        std::vector<size_t> const & sum2,
+        column_bitset const & weight_two,
         std::vector<size_t> & buf,
         F const & f) const
     -> std::pair<size_t, connected_component>
@@ -134,24 +145,20 @@ auto purge_matrix::compute_connected_component_with_set(size_t i0,
     /* Loop on all connected rows */
     for (size_t k = 0; k < buf.size(); k++) {
         auto const i = buf[k];
-        auto const * p = rows[i];
 
         /* Loop on all columns of the current row */
-        for (auto const * q = p; *q != END_OF_ROW; q++) {
-            index_t const h = *q;
-            weight_t const wh = column_weights[h];
+        for (auto h: columns(i)) {
+            weight_t const wh = std::atomic_ref(column_weights[h])
+                .load(std::memory_order_relaxed);
             w += f(wh);
-            /* See the next function for comments about this test and the
-             * following ASSERT.
-             */
-            if (UNLIKELY(wh == 2 && sum2[h])) {
-                ASSERT_ALWAYS(i <= sum2[h]);
-                size_t const i1 = sum2[h] - i;
+            /* See the next function for comments about this test. */
+            if (UNLIKELY(wh == 2 && test_bit(weight_two, h))) {
+                size_t const i1 = other_row(h, i);
                 /* See if the connected component was found earlier.  */
                 if (i1 < i0)
                     return {0, {}};
 
-                if (std::ranges::find(H, i1) == H.end()) {
+                if (!H.contains(i1)) {
                     H.insert(i1);
                     buf.push_back(i1);
                 }
@@ -164,7 +171,7 @@ auto purge_matrix::compute_connected_component_with_set(size_t i0,
 
 template <weight_function F>
 auto purge_matrix::compute_connected_component(size_t i0,
-        std::vector<size_t> const & sum2,
+        column_bitset const & weight_two,
         std::vector<size_t> & buf, F const & f) const
     -> std::pair<size_t, connected_component>
 {
@@ -176,12 +183,11 @@ auto purge_matrix::compute_connected_component(size_t i0,
     /* Loop on all connected rows */
     for (size_t k = 0; k < buf.size(); k++) {
         auto const i = buf[k];
-        auto const * p = rows[i];
 
         /* Loop on all columns of the current row */
-        for (auto const * q = p; *q != END_OF_ROW; q++) {
-            index_t const h = *q;
-            weight_t const wh = column_weights[h];
+        for (auto h: columns(i)) {
+            weight_t const wh = std::atomic_ref(column_weights[h])
+                .load(std::memory_order_relaxed);
             w += f(wh);
             /* Note that this function, compute_connected_components, is
              * used both for what its name says, namely computing the
@@ -189,21 +195,15 @@ auto purge_matrix::compute_connected_component(size_t i0,
              * the components), but also to compute them once again but
              * just with the goal of deleting the component right away.
              *
-             * In the former situation, the check sum2[h] != 0 is
+             * In the former situation, the check of weight_two is
              * redundant, since it's in fact guaranteed (this first
              * "compute components" pass in readonly). Such isn't the
              * case in the latter case, since wh==2 can appear for
-             * columns that used to be heavier before. We don't have sum2
-             * data for them.
+             * columns that used to be heavier before. Following them
+             * would pull rows of other components into this one.
              */
-            if (UNLIKELY(wh == 2 && sum2[h])) {
-                /* TODO: this assert is actually not useful. By
-                 * construction we always have sums of two things
-                 * in this table. We could even make sum2 be a
-                 * table of XORs, if we want.
-                 */
-                ASSERT_ALWAYS(i <= sum2[h]);
-                size_t const i1 = sum2[h] - i;
+            if (UNLIKELY(wh == 2 && test_bit(weight_two, h))) {
+                size_t const i1 = other_row(h, i);
                 /* See if the connected component was found earlier.  */
                 if (i1 < i0)
                     return {0, {}};
@@ -220,7 +220,7 @@ auto purge_matrix::compute_connected_component(size_t i0,
                  * ever detect that some long components exist.
                  */
                 if (buf.size() >= ccc_quadratic_abort) {
-                    return compute_connected_component_with_set(i0, sum2, buf, f);
+                    return compute_connected_component_with_set(i0, weight_two, buf, f);
                 }
 
                 if (std::ranges::find(buf, i1) == buf.end())
@@ -236,19 +236,17 @@ auto purge_matrix::compute_connected_component(size_t i0,
 /* Delete the connected component containing the row "current_row" */
 void
 purge_matrix::delete_connected_component(size_t i0,
-                                std::vector<size_t> const & sum2,
-                                std::vector<size_t> & buf)
+                                column_bitset const & weight_two,
+                                std::vector<size_t> & buf,
+                                std::vector<index_t> & weight_one)
 {
     /* reuse the code of compute_connected_component, but with a
      * trivial weight function.  */
     const auto f = [](auto) { return float(); };
-    compute_connected_component(i0, sum2, buf, f);
+    compute_connected_component(i0, weight_two, buf, f);
 
-    /* This updates the different data fields atomically *BUT* it doesn't
-     * update sum2! New columns with weight 2 can appear, and we won't
-     * have their sum2 data right away. */
     for (auto const i : buf)
-        delete_row(i);
+        ASSERT_ALWAYS(delete_row(i, weight_one));
 }
 
 
@@ -258,7 +256,7 @@ purge_matrix::delete_connected_component(size_t i0,
  * are expensive to compute, so these functions should not be called by default.
  */
 void purge_matrix::print_stats_on_cliques (FILE *out,
-        std::vector<size_t> const & sum2,
+        column_bitset const & weight_two,
         int verbose) const
 {
     std::vector<size_t> component_sizes;
@@ -270,7 +268,7 @@ void purge_matrix::print_stats_on_cliques (FILE *out,
     for (size_t i = 0; i < rows.size(); i++) {
         if (is_active(i)) {
             const auto f = [](auto) { return float(); };
-            auto [ size, C ] = compute_connected_component(i, sum2, buf, f);
+            auto [ size, C ] = compute_connected_component(i, weight_two, buf, f);
             component_sizes.push_back(size);
         }
     }
@@ -295,11 +293,13 @@ void purge_matrix::print_stats_on_cliques (FILE *out,
  * discovering a lower-indexed row in the component is of course larger).
  */
 size_t purge_matrix::clique_removal_core (
-        sum2_type const & sum2,
+        column_bitset const & weight_two,
         int64_t target_excess, size_t max_nb_comp,
         size_t nthreads,
         int verbose)
 {
+    double const wct_search0 = wct_seconds();
+
     /* We want the max_nb_comp components with the largest computed
      * score. The first step towards this is a min heap.
      *
@@ -319,7 +319,7 @@ size_t purge_matrix::clique_removal_core (
             i1 = std::min(i1, rows.size());
             for (size_t i = i0 ; i < i1 ; i++) {
                 if (is_active(i)) {
-                    auto [ size, C ] = compute_connected_component(i, sum2, buf, f);
+                    auto [ size, C ] = compute_connected_component(i, weight_two, buf, f);
                     if (!size)
                         continue;
 
@@ -373,47 +373,160 @@ size_t purge_matrix::clique_removal_core (
      * it globally, which has the advantage of yielding more
      * deterministic results.
      *
-     * To do so, the easiest approach is to sort the concatenation of all
-     * Q and proceed from the top. Normal comparison works, here, since
-     * the weights are stored with the components.
+     * To do so, we proceed through all Q from the top. Normal
+     * comparison works, here, since the weights are stored with the
+     * components.
+     *
+     * The deletion of one component reduces the excess by at most one,
+     * so the loop below deletes about max_nb_comp components, while the
+     * Q[k] hold up to nthreads times more. Each thread sorts its own
+     * Q[k], and take_heaviest(n) moves the n heaviest components of all
+     * Q[k] into `heaviest`, sorted, heaviest last. The n-th heaviest
+     * component is found by a bisection on the weight, and the
+     * components at or above it form a suffix of each sorted Q[k].
      */
-    std::vector<connected_component> all_Q;
-    for(auto const & q : Q)
-        all_Q.insert(all_Q.end(), q.begin(), q.end());
-    std::ranges::sort(all_Q);
+    double const wct_sort0 = wct_seconds();
+    {
+        std::vector<std::thread> T;
+        T.reserve(nthreads);
+        for (auto & q : Q)
+            T.emplace_back([&q]() { std::ranges::sort(q); });
+        for (auto & t: T)
+            t.join();
+    }
+    size_t n_candidates = 0;
+    size_t candidate_bytes = 0;
+    for (auto const & q : Q) {
+        n_candidates += q.size();
+        candidate_bytes += q.capacity() * sizeof(connected_component);
+    }
+    size_t n_remaining = n_candidates;
+    print_memory(fmt::format("clique candidates {}",
+                             size_disp(candidate_bytes)));
 
+    /* number of components that compare >= C */
+    auto count_from = [&](connected_component const & C) {
+        size_t n = 0;
+        for (auto const & q : Q)
+            n += q.end() - std::ranges::lower_bound(q, C);
+        return n;
+    };
+
+    /* the n-th heaviest component of all Q[k], for 1 <= n <= n_remaining */
+    auto nth_heaviest = [&](size_t n) {
+        /* at least n components weigh lo or more, fewer weigh hi or more */
+        float lo = INFINITY;
+        float hi = -INFINITY;
+        for (auto const & q : Q) {
+            if (q.empty())
+                continue;
+            lo = std::min(lo, q.front().w);
+            hi = std::max(hi, q.back().w);
+        }
+        hi = std::nextafter(hi, INFINITY);
+        for (;;) {
+            float const mid = std::midpoint(lo, hi);
+            if (mid == lo || mid == hi)
+                break;
+            (count_from({0, mid}) >= n ? lo : hi) = mid;
+        }
+        /* among the components of weight lo, the ones with the largest
+         * rows complete the n heaviest */
+        size_t const n_ties = n - count_from({0, hi});
+        std::vector<connected_component> ties;
+        for (auto const & q : Q)
+            ties.insert(ties.end(),
+                    std::ranges::lower_bound(q, connected_component {0, lo}),
+                    std::ranges::lower_bound(q, connected_component {0, hi}));
+        std::ranges::nth_element(ties, ties.end() - n_ties);
+        return ties[ties.size() - n_ties];
+    };
+
+    std::vector<connected_component> heaviest;
+    auto take_heaviest = [&](size_t n) {
+        n = std::min(n, n_remaining);
+        if (!n)
+            return;
+        auto const P = nth_heaviest(n);
+        for (auto & q : Q) {
+            auto const it = std::ranges::lower_bound(q, P);
+            heaviest.insert(heaviest.end(), it, q.end());
+            q.erase(it, q.end());
+        }
+        n_remaining -= n;
+        std::ranges::sort(heaviest);
+    };
+    take_heaviest(max_nb_comp);
+
+    double const wct_sort1 = wct_seconds();
     fmt::print("Cliq. rem.: computed heaviest connected components at "
-            "{:2.2f}\n", seconds());
+            "{:2.2f} (wct {:2.2f})\n", seconds(), wct_elapsed());
+    fmt::print("Cliq. rem.: {} candidate components,"
+            " search took {:.2f}s wall, sort took {:.2f}s wall\n",
+            n_candidates, wct_sort0 - wct_search0, wct_sort1 - wct_sort0);
     fflush (stdout);
 
     if (verbose > 0)
-        print_stats_on_cliques (stdout, sum2, verbose);
+        print_stats_on_cliques (stdout, weight_two, verbose);
+
+    double const wct_delete0 = wct_seconds();
 
     size_t nb_clique_deleted = 0;
     float last_weight = 0.0;
 
-    /* We're not doing the removals in a multithreaded way, on purpose
-     * because we want determinism. But could it be a bit of an
-     * opinionated, expensive, and ultimately unnecessary decision?
+    /* The components are deleted in batches, and the components of one
+     * batch are deleted in parallel. The result is the same as if the
+     * components were deleted one by one from the heaviest, with a
+     * check of the excess before each deletion: the deletion of one
+     * component reduces the excess by at most one (a component with k
+     * rows contains at least k-1 columns of weight 2, and these columns
+     * disappear with the rows), so a batch of excess() - target_excess
+     * components keeps the excess above the target before each of its
+     * deletions.
+     *
+     * The components are disjoint, and delete_connected_component
+     * follows only the weight_two links inside its component, so the
+     * deletion order does not change the set of deleted rows.
      */
-    std::vector<size_t> buf;
     for( ; excess() > target_excess ; ) {
-        if (all_Q.empty()) {
+        if (heaviest.empty())
+            take_heaviest(max_nb_comp);
+        if (heaviest.empty()) {
             fmt::print(stderr, "Cliq. rem.:"
                     " Warning, the list of connected components is empty\n");
             break;
         }
 
-        auto [ i, w ] = all_Q.back();
-        last_weight = w;
-        delete_connected_component (i, sum2, buf);
-        all_Q.pop_back();
-        nb_clique_deleted++;
+        size_t const slack = excess() - target_excess;
+        size_t const q0 = heaviest.size() - std::min(slack, heaviest.size());
+
+        subdivision const S(heaviest.size() - q0, nthreads);
+        std::vector<std::thread> T;
+        T.reserve(nthreads);
+        for (size_t k = 0; k < nthreads; k++) {
+            T.emplace_back([&, k]() {
+                std::vector<size_t> buf;
+                std::vector<index_t> weight_one;
+                auto const [j0, j1] = S.nth_block(k);
+                for (size_t j = q0 + j0; j < q0 + j1; j++)
+                    delete_connected_component(heaviest[j].i, weight_two,
+                            buf, weight_one);
+                add_singleton_columns(weight_one);
+            });
+        }
+        for (auto & t: T)
+            t.join();
+
+        last_weight = heaviest[q0].w;
+        nb_clique_deleted += heaviest.size() - q0;
+        heaviest.resize(q0);
     }
 
     if (nb_clique_deleted)
         fmt::print("Cliq. rem.: weight of last removed connected component: {}\n",
                 last_weight);
+    fmt::print("Cliq. rem.: deletion of {} components took {:.2f}s wall\n",
+            nb_clique_deleted, wct_seconds() - wct_delete0);
 
     return nb_clique_deleted;
 }
@@ -448,14 +561,18 @@ void purge_matrix::clique_removal (int64_t target_excess,
     /* Then, call the core function that computes and deletes connected
      * components until excess is equal to target_excess.
      */
-    auto sum2 = compute_sum2(nthreads);
-    fmt::print("Cliq. rem.: computed sum2 at {:2.2f}\n", seconds());
+    double const wct0 = wct_seconds();
+    auto const weight_two = columns_of_weight(2, nthreads);
+    fmt::print("Cliq. rem.: marked the columns of weight 2 at {:2.2f}"
+            " (wct {:2.2f}, took {:.2f}s wall)\n",
+            seconds(), wct_elapsed(), wct_seconds() - wct0);
 
-    size_t nb_cliques_del = clique_removal_core (sum2, target_excess,
+    size_t nb_cliques_del = clique_removal_core (weight_two, target_excess,
             max_nb_comp, nthreads, verbose);
 
     fmt::print("Cliq. rem.: deleted {} heaviest connected "
-            "components at {:2.2f}\n", nb_cliques_del, seconds());
+            "components at {:2.2f} (wct {:2.2f})\n", nb_cliques_del, seconds(),
+            wct_elapsed());
     if (verbose > 0)
         fmt::print("# INFO: max_nb_comp_per_thread={} target_excess="
                 "{}\n", max_nb_comp, target_excess);

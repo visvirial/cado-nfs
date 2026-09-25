@@ -27,6 +27,9 @@
 #include "lingen_checkpoints.hpp"
 #include "lingen_expected_pi_length.hpp"
 #include "lingen_fft_select.hpp"
+#ifdef LINGEN_GPU
+#include "lingen_gpu.hpp"
+#endif
 #include "lingen_hints.hpp"
 #include "lingen_io_wrappers.hpp"
 #include "lingen_matpoly_ft.hpp"
@@ -84,6 +87,10 @@ struct matpoly_diverter<matpoly<is_binary>> {
     static constexpr const char * prefix = "";
     static matpoly<is_binary> callback(bmstatus<is_binary> & bm, matpoly<is_binary> & E) {
         return bw_lingen_single(bm, E);
+    }
+    static matpoly<is_binary> basecase(bmstatus<is_binary> & bm, matpoly<is_binary> & E) {
+        E.clear_high_word();
+        return bw_lingen_basecase(bm, E);
     }
 };
 
@@ -198,6 +205,67 @@ requires (!matpoly_type::is_binary)
             throw std::runtime_error("fft types over GF(2)[x] do not make sense here");
     }
     throw std::runtime_error("invalid fft_type");
+}
+#endif
+
+#ifdef LINGEN_GPU
+/* glingen: the recursion runs on dmatpoly, the polynomial matrices in
+ * the memory of the transform plugin (the GPU); the products and the
+ * base case run there too. */
+template<> struct matpoly_diverter<dmatpoly> {
+    static constexpr const char * prefix = "GPU-";
+    static dmatpoly callback(bmstatus<true> & bm, dmatpoly & E) {
+        return bw_lingen_single(bm, E);
+    }
+    static dmatpoly basecase(bmstatus<true> & bm, dmatpoly & E) {
+        return glingen_basecase(bm, E);
+    }
+};
+
+static dmatpoly
+generic_mp(dmatpoly & E, dmatpoly & pi_left, bmstatus<true> & bm, lingen_call_companion & C)
+{
+    tree_stats::smallstep_sentinel const dummy(bm.stats, C.mp.step_name());
+    return dmatpoly::mp(E, pi_left);
+}
+
+static dmatpoly
+generic_mul(dmatpoly & pi_left, dmatpoly & pi_right, bmstatus<true> & bm, lingen_call_companion & C)
+{
+    tree_stats::smallstep_sentinel const dummy(bm.stats, C.mul.step_name());
+    return dmatpoly::mul(pi_left, pi_right);
+}
+
+/* A Cantor product of n0 x n1 by n1 x n2 matrices in one batch, with
+ * the counts of its steps (the CPU code checks them, the GPU code
+ * ignores them) and no timings. */
+static void cantor_batch(lingen_call_companion::mul_or_mp_times & M,
+        unsigned int n0, unsigned int n1, unsigned int n2)
+{
+    M.S.fft_type = lingen_substep_schedule::FFT_CANTOR;
+    M.S.batch = { n0, n1, n2 };
+    M.tt = { 1, 0 };
+    M.t_dft_A = { n0 * n1, 0 };
+    M.t_dft_B = { n1 * n2, 0 };
+    M.t_conv = { n0 * n1 * n2, 0 };
+    M.t_ift_C = { n0 * n2, 0 };
+}
+
+/* no tuning: Cantor products, recursion down to threshold */
+lingen_hints glingen_hints(bw_dimensions<true> const & d, size_t L, unsigned int threshold)
+{
+    unsigned int const b = d.m + d.n;
+    lingen_hints hints;
+    for(int depth = 0 ; ; depth++, L -= L / 2) {
+        lingen_call_companion C;
+        C.complete = true;
+        C.mesh = L >= threshold;
+        C.total_ncalls = (size_t) 1 << depth;
+        cantor_batch(C.mp, d.m, b, b);
+        cantor_batch(C.mul, b, b, b);
+        hints[{ depth, L }] = C;
+        if (!C.recurse()) return hints;
+    }
 }
 #endif
 
@@ -367,13 +435,13 @@ static matpoly_type bw_lingen_recursive(bmstatus<matpoly_type::is_binary> & bm, 
 }/*}}}*/
 
 
-template<bool is_binary>
-static matpoly<is_binary> bw_lingen_single_nocp(bmstatus<is_binary> & bm, matpoly<is_binary> & E) /*{{{*/
+template<typename matpoly_type>
+static matpoly_type bw_lingen_single_nocp(bmstatus<matpoly_type::is_binary> & bm, matpoly_type & E) /*{{{*/
 {
     int rank;
     MPI_Comm_rank(bm.com[0], &rank);
     ASSERT_ALWAYS(!rank);
-    matpoly<is_binary> pi;
+    matpoly_type pi;
 
     lingen_call_companion const C = bm.companion(bm.depth, E.get_size());
 
@@ -383,8 +451,7 @@ static matpoly<is_binary> bw_lingen_single_nocp(bmstatus<is_binary> & bm, matpol
     if (!bm.recurse(E.get_size())) {
         tree_stats::transition_sentinel const dummy(bm.stats, "recursive_threshold", E.get_size(), C.total_ncalls);
         bm.t_basecase -= seconds();
-        E.clear_high_word();
-        pi = bw_lingen_basecase(bm, E);
+        pi = matpoly_diverter<matpoly_type>::basecase(bm, E);
         bm.t_basecase += seconds();
     } else {
         pi = bw_lingen_recursive(bm, E);
@@ -394,15 +461,15 @@ static matpoly<is_binary> bw_lingen_single_nocp(bmstatus<is_binary> & bm, matpol
     return pi;
 }/*}}}*/
 
-template<bool is_binary>
-matpoly<is_binary> bw_lingen_single(bmstatus<is_binary> & bm, matpoly<is_binary> & E) /*{{{*/
+template<typename matpoly_type>
+matpoly_type bw_lingen_single(bmstatus<matpoly_type::is_binary> & bm, matpoly_type & E) /*{{{*/
 {
     int rank;
     MPI_Comm_rank(bm.com[0], &rank);
     ASSERT_ALWAYS(!rank);
     unsigned int const t0 = bm.t;
     unsigned int const t1 = bm.t + E.get_size();
-    matpoly<is_binary> pi;
+    matpoly_type pi;
 
     save_checkpoint_file(bm, LINGEN_CHECKPOINT_E, E, t0, t1);
 
@@ -416,6 +483,15 @@ matpoly<is_binary> bw_lingen_single(bmstatus<is_binary> & bm, matpoly<is_binary>
 
     return pi;
 }/*}}}*/
+
+#ifdef LINGEN_GPU
+matpoly<true> bw_glingen(bmstatus<true> & bm, matpoly<true> & E)
+{
+    dmatpoly dE(E);
+    E = matpoly<true>();
+    return bw_lingen_single(bm, dE).download(&bm.d.ab);
+}
+#endif
 
 template<bool is_binary>
 bigmatpoly<is_binary> bw_biglingen_collective(bmstatus<is_binary> & bm, bigmatpoly<is_binary> & E)/*{{{*/
@@ -501,12 +577,12 @@ bigmatpoly<is_binary> bw_biglingen_collective(bmstatus<is_binary> & bm, bigmatpo
 
 #ifdef LINGEN_BINARY
 template
-matpoly<true> bw_lingen_single<true>(bmstatus<true> & bm, matpoly<true> & E);
+matpoly<true> bw_lingen_single<matpoly<true>>(bmstatus<true> & bm, matpoly<true> & E);
 template
 bigmatpoly<true> bw_biglingen_collective<true>(bmstatus<true> & bm, bigmatpoly<true> & E);
 #else
 template
-matpoly<false> bw_lingen_single<false>(bmstatus<false> & bm, matpoly<false> & E);
+matpoly<false> bw_lingen_single<matpoly<false>>(bmstatus<false> & bm, matpoly<false> & E);
 template
 bigmatpoly<false> bw_biglingen_collective<false>(bmstatus<false> & bm, bigmatpoly<false> & E);
 #endif	/* LINGEN_BINARY */

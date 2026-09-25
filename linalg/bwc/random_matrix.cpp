@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -695,79 +696,78 @@ matrix_u32 random_matrix_ddata::get_byrows(cxx_gmp_randstate & rstate)
     return ret;
 }
 
+/* The columns are independent, so each thread generates a contiguous
+ * range of them from its own generator, seeded from rstate; the ranges
+ * are then concatenated in column order. The matrix is a function of
+ * the seed and the thread count. */
 matrix_u32 random_matrix_ddata::get_bycolumns(cxx_gmp_randstate & rstate)
 {
     matrix_u32 ret { matrix_u32::withcoeffs_option { maxcoeff > 0 } };
 
+    time_t const t0 = time(nullptr);
+    unsigned int const nthr = std::max(1U, std::thread::hardware_concurrency());
+    std::vector<std::vector<uint32_t>> parts(nthr);
+    std::vector<double> part_sq(nthr, 0);
+    std::vector<unsigned long> part_coeffs(nthr, 0);
+    std::vector<unsigned long> seeds(nthr);
+    for(auto & s : seeds) s = gmp_urandomb_ui(rstate, 64);
+
+    auto generate = [&](unsigned int t) {
+        cxx_gmp_randstate rs;
+        gmp_randseed_ui(rs, seeds[t]);
+        std::vector<uint32_t> & out = parts[t];
+        std::vector<uint32_t> ptr;
+        unsigned long const j0 = ncols * (unsigned long) t / nthr;
+        unsigned long const j1 = ncols * (unsigned long) (t + 1) / nthr;
+        for(unsigned long j = j0 ; j < j1 ; j++) {
+            double const p = this->p(double(j));
+            ptr.clear();
+            if (p > 0.1) {
+                for(unsigned long i = 0 ; i < nrows ; i++) {
+                    if (random_uniform(rs) < p)
+                        ptr.push_back(i);
+                }
+            } else {
+                unsigned long const weight = (unsigned long) random_binomial(rs, nrows, p);
+                for(unsigned long i = 0 ; i < weight ; i++)
+                    ptr.push_back(gmp_urandomm_ui(rs, nrows));
+                std::ranges::sort(ptr);
+                ptr.erase(std::unique(ptr.begin(), ptr.end()), ptr.end());
+            }
+            unsigned long const weight = ptr.size();
+            out.push_back(weight);
+            for(auto i : ptr) {
+                out.push_back(i);
+                if (ret.withcoeffs)
+                    out.push_back(generate_coefficient(rs, j));
+            }
+            part_coeffs[t] += weight;
+            part_sq[t] += (double) weight * (double) weight;
+        }
+    };
+    std::vector<std::thread> threads;
+    for(unsigned int t = 0 ; t < nthr ; t++)
+        threads.emplace_back(generate, t);
+    for(auto & th : threads) th.join();
+
     total_coeffs = 0;
     double tot_sq = 0;
-
-    time_t const t0 = time(nullptr);
-    struct progress_info last_printed[1];
-    last_printed->t = t0;
-    last_printed->z = 0;
-
-    /* this will be used as a temporary buffer for the columns being
-     * created, before they get pushed to the main matrix (temp area
-     * is without coefficients -- those are generated on the second
-     * pass).
-     */
-    std::vector<uint32_t> ptr;
-
-    random_matrix_ddata G;
-    /* use a special ddata, for our specially simple process (which
-     * still needs the pick-and-punch thing */
-    G.alpha = 0;
-    G.ncols = nrows; /* yes */
-
-    /* Then in fact it's easier, as we can avoid inverse transform
-     * sampling for the computation of the coefficients */
-    // int heavy = 1;
-    punched_interval::pool_t pool;
-    for(unsigned long j = 0 ; j < ncols ; j++) {
-        double const p = this->p(double(j));
-        G.scale = p;
-        ptr.clear();
-        unsigned long weight;
-        if (p > 0.1) {
-            for(unsigned long i = 0 ; i < nrows ; i++) {
-                if (random_uniform(rstate) < p)
-                    ptr.push_back(i);
-            }
-        } else {
-            weight = (unsigned long) random_binomial(rstate, nrows, p);
-            for(unsigned long i = 0 ; i < weight ; i++)
-                ptr.push_back(gmp_urandomm_ui(rstate, nrows));
-            std::ranges::sort(ptr);
-            auto nt = ptr.begin();
-            for(auto it = ptr.begin(), jt = it ; it != ptr.end(); it = jt) {
-                for(++jt ; jt != ptr.end() && *it == *jt ; ++jt) ;
-                *nt++ = *it;
-            }
-            ptr.erase(nt, ptr.end());
-        }
-        weight = ptr.size();
-        ret.p.push_back(weight);
-        for(auto i : ptr) {
-            ret.p.push_back(i);
-            if (ret.withcoeffs) {
-                ret.p.push_back(generate_coefficient(rstate, j));
-                // if (r->rhs->n) v += co * (1+ptr[j]);
-            }
-        }
-        total_coeffs += weight;
-        tot_sq += (double) weight * (double) weight;
-        if (print && should_print_now(last_printed, ret.p.size() * sizeof(uint32_t))) {
-            time_t const dt = last_printed->t - t0;
-            fmt::print("{}, {} cols in {} s ; {}/s (last weight: {}) \n",
-                    size_disp(ret.p.size() * sizeof(uint32_t)),
-                    j,
-                    int(dt),
-                    size_disp(dt > 0 ? (size_t) (ret.p.size() * sizeof(uint32_t) / dt) : 0), weight);
-        }
+    size_t size = padcols;
+    for(unsigned int t = 0 ; t < nthr ; t++) {
+        total_coeffs += part_coeffs[t];
+        tot_sq += part_sq[t];
+        size += parts[t].size();
     }
-    for(unsigned long j = 0 ; j < padcols ; j++) {
-        ret.p.push_back(0);
+    ret.p.reserve(size);
+    for(auto & part : parts) {
+        ret.p.insert(ret.p.end(), part.begin(), part.end());
+        part = std::vector<uint32_t>();
+    }
+    ret.p.resize(size, 0);
+    if (print) {
+        time_t const dt = time(nullptr) - t0;
+        fmt::print("{}, {} cols in {} s on {} threads\n",
+                size_disp(ret.p.size() * sizeof(uint32_t)), ncols, int(dt), nthr);
     }
 
     double const e = double(total_coeffs) / double(nrows);
@@ -783,6 +783,8 @@ matrix_u32 random_matrix_ddata::get_bycolumns(cxx_gmp_randstate & rstate)
     return ret;
 }
 
+
+std::atomic<random_matrix_stream_fn> random_matrix_stream { nullptr };
 
 matrix_u32 random_matrix_get_u32(parallelizing_info & pi, cxx_param_list & pl, unsigned long data_nrows, unsigned long data_ncols, unsigned long padded_nrows, unsigned long padded_ncols, bool withcoeffs, bool transpose)
 {
@@ -811,6 +813,23 @@ matrix_u32 random_matrix_get_u32(parallelizing_info & pi, cxx_param_list & pl, u
 
     cxx_gmp_randstate rstate;
     gmp_randseed_ui(rstate, r.seed + pi.m.jrank * pi.m.ncores + pi.m.trank);
+
+    random_matrix_stream_fn const stream = random_matrix_stream;
+    if (stream && !withcoeffs) {
+        /* density is the row weight of one job's block, like the gmp
+         * path below generates it (see the comment in
+         * adjust_force_kernel), so it is the Poisson mean of a stored
+         * row. */
+        unsigned long const n = transpose ? data_ncols : data_nrows;
+        unsigned long const range = transpose ? data_nrows : data_ncols;
+        unsigned long const npad = transpose ? padded_ncols : padded_nrows;
+        matrix_u32 mat { matrix_u32::withcoeffs_option { false } };
+        mat.p = stream(n, range, r.density,
+                gmp_urandomb_ui(rstate, 64));
+        for(unsigned long i = n ; i < npad ; i++)
+            mat.p.push_back(0);
+        return mat;
+    }
 
     if (transpose) {
         auto mat = F.get_bycolumns(rstate);

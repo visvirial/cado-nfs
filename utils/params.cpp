@@ -28,10 +28,8 @@ using cado::params::cxx_param_list;
 
 void cxx_param_list::print_usage(FILE *f) const
 {
-    const auto argv0 = cmdline_argv0[0];
-
-    if (argv0 != nullptr)
-        fmt::print(f, "Usage: {} <parameters>\n", argv0);
+    if (cmdline_argv0)
+        fmt::print(f, "Usage: {} <parameters>\n", cmdline_argv0[0]);
 
     if (!usage_header.empty())
         fmt::print(f, "{}\n", usage_header);

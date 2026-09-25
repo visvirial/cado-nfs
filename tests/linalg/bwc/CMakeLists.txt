@@ -538,6 +538,22 @@ foreach(layer b64)
         APPEND PROPERTY COMPILE_OPTIONS ${our_compile_flags})
 
 
+    # dmatpoly (glingen) against matpoly on the CPU emulation of the
+    # CUDA plugin; run by hand with lingen_ft_impl=<impl>
+    add_executable(test_glingen EXCLUDE_FROM_ALL
+        test_glingen.cpp
+        ${PROJECT_SOURCE_DIR}/linalg/bwc/lingen.cpp
+        ${PROJECT_SOURCE_DIR}/linalg/bwc/lingen_gpu.cpp
+        ${PROJECT_SOURCE_DIR}/linalg/bwc/lingen_qcode_binary.cpp
+        ${PROJECT_SOURCE_DIR}/linalg/bwc/lingen_expected_pi_length.cpp
+        ${PROJECT_SOURCE_DIR}/linalg/bwc/lingen_bigmatpoly_ft.cpp
+        )
+    target_link_libraries(test_glingen lingen_${layer}_support)
+    mark_targets_as_mpi(test_glingen)
+    mark_targets_as_openmp(test_glingen)
+    set_property(TARGET test_glingen APPEND PROPERTY COMPILE_OPTIONS
+        ${our_compile_flags} -DLINGEN_GPU)
+
     cado_define_test(TEST_NAME test_matpoly_basecase_${layer}
         PROGRAM
         ${CMAKE_CURRENT_BINARY_DIR}/test_matpoly_${layer}

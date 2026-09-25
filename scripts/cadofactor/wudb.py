@@ -231,7 +231,37 @@ class WuAccess(object):
         Operations on instances of WuAcccess are directly carried
         out on the database persistent storage, i.e., they behave kind
         of as if the WuAccess instance were itself a persistent
-        storage device """
+        storage device
+
+        A call with commit=False keeps the transaction open on the
+        connection. The next call on the same connection joins it, so
+        that e.g. a state update and a workunit insert commit together,
+        or roll back together.
+
+        >>> from cadofactor.database import DBFactory
+        >>> from cadofactor.database.dictdb import DictDbDirectAccess
+        >>> conn = DBFactory('db:sqlite3://:memory:').connect()
+        >>> wuar = WuAccess(conn)
+        >>> wuar.create_tables()
+        >>> state = DictDbDirectAccess(conn, 'state')
+        >>> state.update({'adnext': 1}, commit=False)
+        >>> conn.in_transaction
+        True
+        >>> wuar.create(Workunit(id='wu1', commands=['true']), commit=True)
+        >>> conn.in_transaction
+        False
+        >>> state['adnext']
+        1
+        >>> state.update({'adnext': 2}, commit=False)
+        >>> wuar.create(Workunit(id='wu1', commands=['true']), commit=True)
+        Traceback (most recent call last):
+        ...
+        sqlite3.IntegrityError: UNIQUE constraint failed: workunits.wuid
+        >>> conn.in_transaction
+        False
+        >>> state['adnext']
+        1
+        """
 
     def __init__(self, db):
         if isinstance(db, DBFactory):
@@ -374,7 +404,8 @@ class WuAccess(object):
             self.conn.harness_transaction(EXCLUSIVE,
                                           self.mapper.table.insert,
                                           # cursor is implicitly added
-                                          d)
+                                          d,
+                                          commit=commit)
 
     def assign(self, clientid, commit=True, timeout_hint=None):
         """ Finds an available workunit and assigns it to clientid.
@@ -415,7 +446,8 @@ class WuAccess(object):
             return result
 
         return self.conn.harness_transaction(EXCLUSIVE,
-                                             transaction)
+                                             transaction,
+                                             commit=commit)
 
     def _get_by_wuid(self, cursor, wuid):
         r = self.mapper.where(cursor, eq={"wuid": wuid})
@@ -465,7 +497,7 @@ class WuAccess(object):
             self.mapper.table.update(cursor, d, eq={pk: data[pk]})
             return True
 
-        return self.conn.harness_transaction(EXCLUSIVE, t)
+        return self.conn.harness_transaction(EXCLUSIVE, t, commit=commit)
 
     def verification(self, wuid, ok, commit=True):
 
@@ -487,7 +519,7 @@ class WuAccess(object):
             self.mapper.table.update(cursor, d, eq={pk: data[pk]})
             return True
 
-        return self.conn.harness_transaction(EXCLUSIVE, t)
+        return self.conn.harness_transaction(EXCLUSIVE, t, commit=commit)
 
     def cancel(self, wuid, commit=True):
         self.cancel_by_condition(eq={"wuid": wuid},
@@ -511,6 +543,7 @@ class WuAccess(object):
                                       self.mapper.table.update,
                                       # cursor is implicitly added
                                       {"status": status},
+                                      commit=commit,
                                       **conditions)
 
     def query(self, limit=None, **conditions):

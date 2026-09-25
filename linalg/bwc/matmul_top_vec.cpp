@@ -254,7 +254,7 @@ void mmt_own_vec_set2(mmt_vec const & z, mmt_vec & w, mmt_vec const & v)
     size_t const sz = mmt_my_own_size_in_items(z);
     ASSERT_ALWAYS(sz == mmt_my_own_size_in_items(v));
     ASSERT_ALWAYS(sz == mmt_my_own_size_in_items(w));
-    v.abase->vec_set(
+    mmt_vec_copy_items(v.abase,
             w.abase->vec_subvec(w.v, off),
             v.abase->vec_subvec(v.v, off),
             sz);
@@ -290,6 +290,10 @@ void mmt_vec_share_across_threads(mmt_vec & v)
 {
     if (mmt_vec_is_shared(v)) return;
     pi_comm & wr = v.pi.wr[v.d];
+    /* every thread fetches its own arena, so that all sibling arenas
+     * are current on the host before any thread reads them */
+    mmt_vec_dev_fetch(v);
+    wr.serialize_threads(__FILE__, __LINE__);
     for(unsigned int t = 0 ; t < wr.ncores ; t++) {
         if (t == wr.trank)
             continue;
@@ -305,6 +309,7 @@ void mmt_vec_share_across_threads(mmt_vec & v)
                     sz);
         }
     }
+    mmt_vec_dev_invalidate(v);
 }
 
 void mmt_full_vec_set(mmt_vec & w, mmt_vec const & v)
@@ -320,7 +325,7 @@ void mmt_full_vec_set(mmt_vec & w, mmt_vec const & v)
     if (w.siblings) {
         /* w is not shared. Maybe v is, we don't really care */
         if (w.v != v.v) {
-            v.abase->vec_set(w.v, v.v, v.i1 - v.i0);
+            mmt_vec_copy_items(v.abase, w.v, v.v, v.i1 - v.i0);
         }
     } else if (mmt_vec_is_shared(v) || v.consistency == 2) {
         /* We make do with a single data source in v (either because
@@ -328,8 +333,9 @@ void mmt_full_vec_set(mmt_vec & w, mmt_vec const & v)
          * anyway
          */
         if (w.v != v.v) {
-            if (wr.trank == 0)
-                w.abase->vec_set(w.v, v.v, v.i1 - v.i0);
+            if (wr.trank == 0) {
+                mmt_vec_copy_items(v.abase, w.v, v.v, v.i1 - v.i0);
+            }
             wr.serialize_threads(__FILE__, __LINE__);
         }
     } else {
@@ -341,6 +347,7 @@ void mmt_full_vec_set(mmt_vec & w, mmt_vec const & v)
          * it seems reasonable to attempt to do the same.
          */
         mmt_vec const & vt = v.sibling(wr.trank);
+        mmt_vec_dev_fetch(vt);
 
         for(unsigned int j = 0 ; j < wr.njobs ; j++) {
             size_t const off = mmt_my_own_offset_in_items(vt, j);
@@ -351,19 +358,30 @@ void mmt_full_vec_set(mmt_vec & w, mmt_vec const & v)
                     v.abase->vec_subvec(vt.v, off),
                     sz);
         }
+        mmt_vec_dev_invalidate(w);
         wr.serialize_threads(__FILE__, __LINE__);
     }
     w.consistency = v.consistency;
 }
 
+/* zero the mirror when there is one, else the host copy */
+static void vec_set_zero(mmt_vec & v)
+{
+    size_t const n = v.i1 - v.i0;
+    if (bwc_dev_set_zero(v.v, v.abase->vec_elt_stride(n)))
+        return;
+    v.abase->vec_set_zero(v.v, n);
+    bwc_dev_adopt(v.v);
+}
+
 void mmt_full_vec_set_zero(mmt_vec & v)
 {
     if (v.siblings) {
-        v.abase->vec_set_zero(v.v, v.i1 - v.i0);
+        vec_set_zero(v);
     } else {
         v.pi.wr[v.d].serialize_threads(__FILE__, __LINE__);
         if (v.pi.wr[v.d].trank == 0)
-            v.abase->vec_set_zero(v.v, v.i1 - v.i0);
+            vec_set_zero(v);
     }
     v.consistency = 2;
     v.pi.wr[v.d].serialize_threads(__FILE__, __LINE__);
@@ -378,6 +396,7 @@ void mmt_vec_set_basis_vector_at(mmt_vec & v, int k, unsigned int j)
 void mmt_vec_add_basis_vector_at(mmt_vec & v, int k, unsigned int j)
 {
     if (v.i0 <= j && j < v.i1) {
+        mmt_vec_dev_fetch(v);
         if (v.siblings) {
             v.abase->simd_set_ui_at(v.abase->vec_item(v.v, j - v.i0), k, 1);
         } else {
@@ -386,6 +405,7 @@ void mmt_vec_add_basis_vector_at(mmt_vec & v, int k, unsigned int j)
                 v.abase->simd_set_ui_at(v.abase->vec_item(v.v, j - v.i0), k, 1);
             v.pi.wr[v.d].serialize_threads(__FILE__, __LINE__);
         }
+        mmt_vec_dev_invalidate(v);
     }
 }
 
@@ -402,6 +422,7 @@ void mmt_vec_set_basis_vector(mmt_vec & v, unsigned int j)
 void mmt_vec_downgrade_consistency(mmt_vec & v)
 {
     ASSERT_ALWAYS(v.consistency == 2);
+    mmt_vec_dev_fetch(v);
     size_t erase[2][2];
     size_t const off = mmt_my_own_offset_in_items(v);
     size_t const sz = mmt_my_own_size_in_items(v);
@@ -437,6 +458,7 @@ void mmt_vec_downgrade_consistency(mmt_vec & v)
                     erase[i][1] - erase[i][0]);
         }
     }
+    mmt_vec_dev_invalidate(v);
     v.consistency = 1;
     v.pi.wr[v.d].serialize_threads(__FILE__, __LINE__);
 }
@@ -476,9 +498,12 @@ void mmt_vec_clear_padding(mmt_vec & v, size_t unpadded, size_t padded)
     s0 = MIN(s0, v.i1 - v.i0);
     s1 = MIN(s1, v.i1 - v.i0);
 
-    if (s1 - s0)
+    if (s1 - s0) {
+        mmt_vec_dev_fetch(v);
         v.abase->vec_set_zero(
                 v.abase->vec_subvec(v.v, s0), s1-s0);
+        mmt_vec_dev_invalidate(v);
+    }
 
     v.pi.m.serialize(__FILE__, __LINE__);
 }
@@ -536,6 +561,7 @@ int mmt_vec_load(mmt_vec & v, std::string const & filename_pattern, unsigned int
             for(size_t i = 0 ; i < mmt_my_own_size_in_items(v) ; i++) {
                 v.abase->reduce(v.abase->vec_item(mychunk, i));
             }
+            mmt_vec_dev_invalidate(v);
             v.consistency = ok;
             /* not clear it's useful, but well. */
             if (ok) mmt_vec_broadcast(v);
@@ -557,12 +583,11 @@ int mmt_vec_load(mmt_vec & v, std::string const & filename_pattern, unsigned int
 }
 /* }}} */
 /* {{{ save */
-int mmt_vec_save(mmt_vec & v, std::string const & filename_pattern, unsigned int itemsondisk, unsigned int block_position)
+mmt_vec_staged mmt_vec_stage(mmt_vec & v, std::string const & filename_pattern, unsigned int itemsondisk, unsigned int block_position)
 {
     v.pi.m.serialize_threads(__FILE__, __LINE__);
-    int const tcan_print = v.pi.m.trank == 0 && v.pi.m.jrank == 0;
-
     ASSERT_ALWAYS(filename_pattern.find("{}-{}") != std::string::npos);
+    ASSERT_ALWAYS(v.consistency == 2);
 
     int const char2 = v.abase->is_characteristic_two();
     int const splitwidth = char2 ? 64 : 1;
@@ -575,60 +600,65 @@ int mmt_vec_save(mmt_vec & v, std::string const & filename_pattern, unsigned int
     size_t const bigstride = v.abase->vec_elt_stride(1);
     size_t const smallstride = bigstride / Adisk_multiplex;
 
-    int global_ok = 1;
+    bwc_dev_fetch(mychunk, mysize);
+    v.pi.m.serialize_threads(__FILE__, __LINE__);
 
+    mmt_vec_staged st { {}, sizeondisk / Adisk_multiplex, v.d };
     for(unsigned int b = 0 ; b < Adisk_multiplex ; b++) {
         unsigned int const b0 = block_position + b * Adisk_width;
         auto filename = fmt::format(fmt::runtime(filename_pattern), b0, b0 + splitwidth);
-        auto tmpfilename = filename + ".tmp";
-        double tt = -wct_seconds();
-        if (tcan_print) {
-            fmt::print("Saving {} ...", filename);
-            fflush(stdout);
-        }
-        pi_file_handle f(v.pi);
-        int ok = f.open(v.d, tmpfilename, "wb");
-        /* "ok" is globally consistent after pi_file_handle::open */
-        if (!ok) {
-            if (v.pi.m.trank == 0 && v.pi.m.jrank == 0) {
-                fmt::print(stderr, "WARNING: failed to save {}: {}\n", filename, strerror(errno));
-                unlink(tmpfilename.c_str());    // just in case
-            }
-        } else {
-            ASSERT_ALWAYS(v.consistency == 2);
-            v.pi.m.serialize_threads(__FILE__, __LINE__);
-            size_t const s = f.write_chunk(mychunk, mysize, sizeondisk,
-                    bigstride, b * smallstride, (b+1) * smallstride);
-            v.pi.m.serialize_threads(__FILE__, __LINE__);
-            ok = s == sizeondisk / Adisk_multiplex;
-            /* "ok" is globally consistent after pi_file_handle::write_chunk */
-            if (!ok && v.pi.m.trank == 0 && v.pi.m.jrank == 0) {
-                fmt::print(stderr, "ERROR: failed to save {}: short write, {}\n", filename, errno ? strerror(errno) : "no error reported via errno");
-            }
-            ok = f.close();
-            if (!ok && v.pi.m.trank == 0 && v.pi.m.jrank == 0) {
-                fmt::print(stderr, "ERROR: failed to save {}: failed fclose, {}\n", filename, errno ? strerror(errno) : "no error reported via errno");
-            }
-            if (v.pi.m.trank == 0 && v.pi.m.jrank == 0) {
-                ok = rename(tmpfilename.c_str(), filename.c_str()) == 0;
-                if (!ok) {
-                    fmt::print(stderr, "ERROR: failed to save {}: failed rename, {}\n", filename, errno ? strerror(errno) : "no error reported via errno");
-                }
-            }
-            v.pi.m.bcast(&ok, 1, BWC_PI_INT, 0, 0);
-        }
-        tt += wct_seconds();
-        if (tcan_print) {
-            fmt::print(" done [{} in {:.2f}, {}/s]\n",
-                    size_disp(sizeondisk / Adisk_multiplex),
-                    tt,
-                    size_disp(sizeondisk / Adisk_multiplex / tt));
-        }
-        global_ok = global_ok && ok;
+        st.files.push_back({ filename, pi_gather_stage(v.pi, v.d, mychunk,
+                    mysize, bigstride, b * smallstride,
+                    (b+1) * smallstride) });
     }
+    return st;
+}
 
+std::vector<bwc_file> mmt_vec_exchange(parallelizing_info & pi, MPI_Comm comm, mmt_vec_staged st)
+{
+    for(auto & f : st.files)
+        f.data = pi_gather_exchange(pi, st.d, comm, f.data, st.outsize);
+    return std::move(st.files);
+}
+
+void mmt_vec_untwist_file(bwc_file & f, std::vector<uint32_t> const & perm, size_t unpadded)
+{
+    auto const * src = (const uint64_t *) f.data.data();
+    std::vector<char> out(unpadded * sizeof(uint64_t));
+    auto * dst = (uint64_t *) out.data();
+    for(size_t j = 0 ; j < unpadded ; j++)
+        dst[j] = src[perm[j]];
+    f.data = std::move(out);
+}
+
+std::vector<bwc_file> mmt_vec_gather(mmt_vec & v, std::string const & filename_pattern, unsigned int itemsondisk, unsigned int block_position)
+{
+    mmt_vec_staged st = mmt_vec_stage(v, filename_pattern, itemsondisk, block_position);
+    std::vector<bwc_file> files;
+    if (v.pi.m.trank == 0)
+        files = mmt_vec_exchange(v.pi, v.pi.m.pals, std::move(st));
     v.pi.m.serialize_threads(__FILE__, __LINE__);
-    return global_ok;
+    return files;
+}
+
+int mmt_vec_save(mmt_vec & v, std::string const & filename_pattern, unsigned int itemsondisk, unsigned int block_position)
+{
+    std::vector<bwc_file> const files = mmt_vec_gather(v, filename_pattern, itemsondisk, block_position);
+    int const leader = v.pi.m.trank == 0 && v.pi.m.jrank == 0;
+    int ok = 1;
+    for(auto const & f : files) {
+        if (!leader)
+            break;
+        fmt::print("Saving {} ...", f.name);
+        fflush(stdout);
+        double tt = -wct_seconds();
+        ok = bwc_write_file(f) && ok;
+        tt += wct_seconds();
+        fmt::print(" done [{} in {:.2f}, {}/s]\n", size_disp(f.data.size()),
+                tt, size_disp(f.data.size() / tt));
+    }
+    v.pi.m.bcast(&ok, 1, BWC_PI_INT, 0, 0);
+    return ok;
 }
 /* }}} */
 /* }}} */
@@ -726,6 +756,8 @@ void mmt_vec_set_random_through_file(mmt_vec & v, std::string const & filename_p
 
 unsigned long mmt_vec_hamming_weight(mmt_vec const & y) {
     ASSERT_ALWAYS(y.consistency == 2);
+    mmt_vec_dev_fetch(y);
+    y.pi.wr[y.d].serialize_threads(__FILE__, __LINE__);
     unsigned long w = y.abase->vec_simd_hamming_weight(y.v, y.i1 - y.i0);
     /* all threads / cores in wiring wr[y.d] share the same data and
      * thus deduce the same count */

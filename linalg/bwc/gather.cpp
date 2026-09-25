@@ -146,6 +146,7 @@ static std::vector<unsigned int> indices_of_zero_or_nonzero_values(mmt_vec & y, 
     std::vector<unsigned int> myz;
 
     if (pi.wr[y.d].trank == 0 && pi.wr[y.d].jrank == 0) {
+        mmt_vec_dev_fetch(y);
         for(unsigned int i = 0 ; i < maxidx ; i++) {
             if (y.i0 <= i && i < y.i1) {
                 if (!!want_nonzero == !A->is_zero(A->vec_item(y.v, i - y.i0))) {
@@ -277,6 +278,8 @@ static void compress_vector_to_sparse(arith_generic::elt * matrix, unsigned int 
     int const char2 = mpz_cmp_ui(bw->p, 2) == 0;
     ASSERT_ALWAYS(char2 || A->simd_groupsize() == 1);
 
+    bwc_dev_fetch(mmt_my_own_subvec(my),
+            A->vec_elt_stride(mmt_my_own_size_in_items(my)));
     for(unsigned int ii = 0 ; ii < rows.size() ; ii++) {
         unsigned int const i = rows[ii];
         if (own_i0 <= i && i < own_i1) {
@@ -422,6 +425,7 @@ struct rhs /*{{{*/ {
 
         mmt_vec vi(mmt,Av,Av_pi, bw->dir, /* shared ! */ 1, mmt.n[bw->dir]);
 
+        bwc_dev_fetch(mmt_my_own_subvec(y), A->vec_elt_stride(eblock));
         for(unsigned int j = 0 ; j < nrhs ; j++) {
             int const ok = mmt_vec_load(vi, bwc_V_file::pattern(0), unpadded, j);
             ASSERT_ALWAYS(ok);
@@ -432,6 +436,7 @@ struct rhs /*{{{*/ {
                     A->vec_subvec(rhscoeffs, j),
                     eblock);
         }
+        bwc_dev_push(mmt_my_own_subvec(y), A->vec_elt_stride(eblock));
 
         /* addmul_tiny degrades consistency ! */
         y.consistency = 1;
@@ -474,6 +479,8 @@ static std::tuple<int, int> check_zero_and_padding(mmt_vec & y, unsigned int max
         my_input_coordinates = mmt_my_own_size_in_items(y);
         my_pad_coordinates = 0;
     }
+    bwc_dev_fetch(mmt_my_own_subvec(y),
+            y.abase->vec_elt_stride(mmt_my_own_size_in_items(y)));
     int input_is_zero = y.abase->vec_is_zero(
             mmt_my_own_subvec(y),
             my_input_coordinates);
@@ -519,6 +526,8 @@ static std::tuple<int, int, int> test_one_vector(matmul_top_data & mmt, mmt_vect
 
         /* This "is zero" check is also valid on the padded matrix of
          * course, so we don't heave the same headache as above */
+        bwc_dev_fetch(mmt_my_own_subvec(y),
+                A->vec_elt_stride(mmt_my_own_size_in_items(y)));
         int is_zero = A->vec_is_zero(
                 mmt_my_own_subvec(y), mmt_my_own_size_in_items(y));
         pi.m.allreduce(nullptr, &is_zero, 1, BWC_PI_INT, BWC_PI_MIN);
@@ -1288,7 +1297,12 @@ static void * gather_prog(parallelizing_info & pi, cxx_param_list & pl, void * a
         int const splitwidth = char2 ? 64 : 1;
         unsigned int const Av_multiplex = (sol_range[1] - sol_range[0]) / splitwidth;
         for(unsigned int i = 0 ; i < Av_multiplex ; ++i) {
-            auto tmp = std::string(bwc_K_file(sol_range, winning_iter));
+            /* the K files are saved per splitwidth chunk of the
+             * solution range */
+            bwc_solution_range const chunk(
+                    sol_range[0] + i * splitwidth,
+                    sol_range[0] + (i + 1) * splitwidth);
+            auto tmp = std::string(bwc_K_file(chunk, winning_iter));
             /* {{{ append the RHS coefficients if relevant */
             if (R) {
                 fmt::print("Expanding {} so as to include"
@@ -1313,15 +1327,21 @@ static void * gather_prog(parallelizing_info & pi, cxx_param_list & pl, void * a
             {
                 auto f = fopen_helper(tmp, "rb");
                 auto f2 = fopen_helper(tmp2, "w");
-                arith_generic::elt * data = A->alloc(1);
+                /* each K file holds one splitwidth-wide chunk of the
+                 * solution range, so the ascii version prints with a
+                 * splitwidth-wide arithmetic backend */
+                std::unique_ptr<arith_generic> const Ac(
+                        arith_generic::instance(bw->p, splitwidth));
+                ASSERT_ALWAYS(Ac->elt_stride() == A->elt_stride() / Av_multiplex);
+                arith_generic::elt * data = Ac->alloc(1);
                 for(uint32_t i = 0 ; i < mmt.n0[bw->dir] ; i++) {
-                    size_t const rc = fread(data, A->elt_stride() / Av_multiplex, 1, f.get());
+                    size_t const rc = fread(data, Ac->elt_stride(), 1, f.get());
                     ASSERT_ALWAYS(rc == 1);
                     std::ostringstream os;
-                    A->cxx_out(os, *data);
+                    Ac->cxx_out(os, *data);
                     fmt::print(f2.get(), "{}\n", os.str());
                 }
-                A->free(data);
+                Ac->free(data);
                 R.fprint_rhs_coeffs(f2.get());
             }
 

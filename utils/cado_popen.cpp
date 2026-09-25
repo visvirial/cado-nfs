@@ -1,5 +1,6 @@
 #include "cado.h" // IWYU pragma: keep
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 
@@ -8,6 +9,7 @@
 #include <string>
 #include <stdexcept>
 
+#include <spawn.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -34,14 +36,23 @@
  * that we can wait() the children as soon as we close the file
  * descriptors that are tied to them.
  *
- * 2 - ensure serialization of the pipe()+fcntl() and fork() calls, in
- * order to avoid the situation where a forked child lacks the
- * close-on-exec flags. (pipe2 would alleviate this)
+ * 2 - ensure serialization of the pipe()+fcntl() and posix_spawn()
+ * calls, in order to avoid the situation where a spawned child lacks
+ * the close-on-exec flags. (pipe2 would alleviate this)
  *
  * 3 - ensure serialization of the close()+access of the fd_to_pid table,
  * otherwise the table can be modified inbetween.
  *
  */
+
+/* The child is started with posix_spawn() and not fork(): fork() copies
+ * the page tables of the parent, and holds the mmap lock of the parent
+ * meanwhile, so that the other threads stall on their page faults. A
+ * program such as purge opens hundreds of compressed files while it
+ * holds a matrix of tens of GB.
+ */
+
+extern char ** environ;
 
 /* we need to prevent static destruction order fiasco here :-( */
 static std::mutex& get_popen_lock() {
@@ -76,6 +87,7 @@ int cado_fd_popen(const char * command, const char * mode)
     int pipefd[2];
 
     pid_t child;
+    const char * argv[] = { "sh", "-c", command, nullptr };
 
     try {
         const std::scoped_lock dummy(get_popen_lock());
@@ -92,18 +104,28 @@ int cado_fd_popen(const char * command, const char * mode)
         if (!fresh)
             throw std::logic_error("key clash in map");
 
-        /* We _must_ serialize pipe() and fork(), otherwise the forked
-         * child might not have the FD_CLOEXEC flag set!! */
-        child = fork();
-        if (child < 0) {
+        /* We _must_ serialize pipe() and posix_spawn(), otherwise the
+         * child might not have the FD_CLOEXEC flag set!!
+         *
+         * If father wants to read, the child closes its standard input
+         * (0==imode), and binds its standard output (1==imode^1) to the
+         * other end. */
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_addclose(&actions, imode);
+        posix_spawn_file_actions_adddup2(&actions, pipefd[imode^1], imode^1);
+        const int err = posix_spawn(&child, "/bin/sh", &actions, nullptr,
+                const_cast<char **>(argv), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        if (err) {
             get_fd_to_pid().erase(iter);
-            perror("fork");
+            errno = err;
+            perror("posix_spawn");
             close(pipefd[0]);
             close(pipefd[1]);
             return -1;
-        } else {
-            iter->second = child;
         }
+        iter->second = child;
     } catch(...) {
         /* either OOM or logic_error. Both deserve to be re-thrown */
         close(pipefd[0]);
@@ -111,39 +133,10 @@ int cado_fd_popen(const char * command, const char * mode)
         throw;
     }
 
-    /* pipefd[0] is the read end, pipefd[1] is the write end */
-
-    if (child) {
-        /* I'm the father. I only want to use pipefd[imode]. */
-        close(pipefd[imode^1]);
-        /*
-        fmt::print(stderr, "{} child {} ({}) through fd {}\n",
-                imode ?  "Writing to" : "Reading from",
-                child, command, pipefd[imode]);
-                */
-        return pipefd[imode];
-    } else {
-        /* if father wants to read, we close our standard input
-         * (0==imode), and bind our standard output (1==imode^1) to the
-         * other end. */
-        close(imode);
-        close(pipefd[imode]);
-        dup2(pipefd[imode^1], imode^1);
-        close(pipefd[imode^1]);
-        /*
-        fmt::print(stderr, "Child process {} (parent {}) executing {} ; closed [{} {} {}] open [{}]\n",
-                getpid(),
-                getppid(),
-                command,
-                imode, pipefd[imode], pipefd[imode^1],
-                imode^1
-                );
-                */
-        execl("/bin/sh", "sh", "-c", command, NULL);
-        perror("execl() failed");
-        exit(EXIT_FAILURE);
-    }
-    return -1;
+    /* pipefd[0] is the read end, pipefd[1] is the write end.
+     * I only want to use pipefd[imode]. */
+    close(pipefd[imode^1]);
+    return pipefd[imode];
 }
 
 FILE * cado_popen(const char * command, const char * mode)

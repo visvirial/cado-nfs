@@ -16,6 +16,7 @@
 #include "lingen_bw_dimensions.hpp"
 #include "lingen_checkpoints.hpp"
 #include "lingen_expected_pi_length.hpp"
+#include "lingen_ft_plugin.hpp"
 #include "lingen_io_matpoly.hpp"
 #include "lingen_io_wrappers.hpp"
 #include "lingen_matpoly_ft.hpp"
@@ -52,6 +53,10 @@ static void lingen_decl_usage(cxx_param_list & pl)/*{{{*/
             "activate tuning mode");
     pl.declare_usage("allow_zero_on_rhs",
             "do not cry if the generator corresponds to a zero contribution on the RHS vectors");
+#ifdef LINGEN_GPU
+    pl.declare_usage("glingen_threshold",
+            "input length below which the GPU base case is used (at least 2, default 2048)");
+#endif
 
     /* we must be square ! */
     pl.declare_usage("mpi", "number of MPI nodes across which the execution will span, with mesh dimensions");
@@ -320,6 +325,7 @@ static int wrapped_main(int argc, char const *argv[])
     lingen_tuning_decl_usage(pl);
     lingen_checkpoint<is_binary>::decl_usage(pl);
     lingen_io_matpoly<is_binary>::decl_usage(pl);
+    lingen_ft_plugin_decl_usage(pl);
     tree_stats::declare_usage(pl);
 
     bw_common_parse_cmdline(bw, pl, &argc, &argv);
@@ -500,6 +506,14 @@ static int wrapped_main(int argc, char const *argv[])
     logline_interpret_parameters(pl);
     lingen_checkpoint<is_binary>::interpret_parameters(pl);
     lingen_io_matpoly<is_binary>::interpret_parameters(pl);
+#ifdef LINGEN_GPU
+    unsigned int glingen_threshold = 2048;
+    pl.parse("glingen_threshold", glingen_threshold);
+    ASSERT_ALWAYS(glingen_threshold >= 2);
+    if (!pl.lookup_old("lingen_ft_impl"))
+        pl.add_key("lingen_ft_impl", "cuda", cado::params::origin::FROM_FILE);
+#endif
+    lingen_ft_plugin_init(pl);
 
     if (pl.warn_unused()) {
         int rank;
@@ -536,6 +550,11 @@ static int wrapped_main(int argc, char const *argv[])
 
     size_t const L = E_series->guessed_length();
 
+#ifdef LINGEN_GPU
+    ASSERT_ALWAYS(size == 1);
+    ASSERT_ALWAYS(!global_flag_tune);
+    bm.hints = glingen_hints(bm.d, L - bm.t, glingen_threshold);
+#else
     {
         typename matpoly<is_binary>::memory_guard const blanket(SIZE_MAX);
         blanket_allowances<is_binary> const dummy;
@@ -546,6 +565,7 @@ static int wrapped_main(int argc, char const *argv[])
             MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
         }
     }
+#endif
 
     if (global_flag_tune) {
         MPI_Finalize();
@@ -565,12 +585,21 @@ static int wrapped_main(int argc, char const *argv[])
         char buf[20];
         fmt::print("# Estimated memory for JUST transforms (per node): {}\n",
                 size_disp(2*c0, buf));
+#ifdef LINGEN_GPU
+        fmt::print("# glingen keeps the polynomial matrices in host memory;"
+                " the peak is not estimated\n");
+#else
         fmt::print("# Estimated peak total memory (per node): max at depth {}: {}\n",
                 bm.hints.ipeak,
                 size_disp(bm.hints.peak, buf));
+#endif
     }
 
+#ifdef LINGEN_GPU
+    int const go_mpi = 0;
+#else
     int const go_mpi = bm.companion(0, L).go_mpi();
+#endif
 
     if (go_mpi) {
         if (!rank) {
@@ -639,7 +668,11 @@ static int wrapped_main(int argc, char const *argv[])
         pipe(*E_series, fill_E, "Read");
         bm.delta.assign(bm.d.m + bm.d.n, F0.t0);
         logline_init_timer();
+#ifdef LINGEN_GPU
+        auto pi = bw_glingen(bm, E);
+#else
         auto pi = bw_lingen_single(bm, E);
+#endif
         bm.stats.final_print();
         bm.display_deltas();
         if (!rank) fmt::print("(pi.alloc = {})\n", pi.capacity());

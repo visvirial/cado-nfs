@@ -272,13 +272,29 @@ int doinit(int * p_argc, char const *** p_argv, char ** pmpiinit_diag MAYBE_UNUS
 
 int bw_common_init(struct bw_params * bw, int * p_argc, char const *** p_argv)/*{{{*/
 {
+    return bw_common_init(bw, p_argc, p_argv, MPI_THREAD_SERIALIZED);
+}
+
+bool bw_common_threaded_mpi()
+{
+    int prov;
+    MPI_Query_thread(&prov);
+    ASSERT_ALWAYS(prov >= MPI_THREAD_SERIALIZED);
+    return prov >= MPI_THREAD_MULTIPLE;
+}
+
+int bw_common_init(struct bw_params * bw, int * p_argc, char const *** p_argv, int mpi_thread_level)
+{
     char * mpiinit_diag = NULL;
     int init_done = 0;
     
     cado_sighandlers_install();
 
-    // init_done = init_done || doinit(p_argc, p_argv, &mpiinit_diag, MPI_THREAD_MULTIPLE, "MPI_THREAD_MULTIPLE");
-    init_done = init_done || doinit(p_argc, p_argv, &mpiinit_diag, MPI_THREAD_SERIALIZED, "MPI_THREAD_SERIALIZED");
+    const char * const level_name = mpi_thread_level == MPI_THREAD_MULTIPLE
+        ? "MPI_THREAD_MULTIPLE" : "MPI_THREAD_SERIALIZED";
+    ASSERT_ALWAYS(mpi_thread_level == MPI_THREAD_MULTIPLE
+            || mpi_thread_level == MPI_THREAD_SERIALIZED);
+    init_done = init_done || doinit(p_argc, p_argv, &mpiinit_diag, mpi_thread_level, level_name);
 
     // MPI_Init(p_argc, p_argv);
     

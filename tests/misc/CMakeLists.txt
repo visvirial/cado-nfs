@@ -2,6 +2,12 @@ cado_define_test(SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test_check_rels.sh
     PROVIDE_TEMPORARY_WDIR
     TARGET_DEPENDENCIES check_rels)
 
+cado_define_test(SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test_check_matrix.sh
+    -purged ${CADO_NFS_SOURCE_DIR}/tests/filter/testsm.p59.purged.gz
+    -target_density 50
+    PROVIDE_TEMPORARY_WDIR
+    TARGET_DEPENDENCIES check_matrix merge replay)
+
 if (HAVE_GMPECM)
 cado_define_test(descent_init_Fp_jl
     SCRIPT

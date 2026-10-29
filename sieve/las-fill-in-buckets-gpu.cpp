@@ -6,7 +6,9 @@
 #include <cstring>
 
 #include <algorithm>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "bucket.hpp"
@@ -44,10 +46,8 @@ static_assert(std::is_same_v<decltype(fib_update_t::x), uint16_t>);
 
 /* {{{ the cache */
 
-struct las_gpu_fib_cache {
-    /* what the flattened arrays were built from; the factor base
-     * slicing changes when the siever config does, and not otherwise */
-    void const * fbs = nullptr;
+/* The flattened form of one factor base slicing, and its device copy. */
+struct las_gpu_fib_image {
     gpu_engine * eng = nullptr;
     gpu_fib_task * task = nullptr;
 
@@ -55,14 +55,11 @@ struct las_gpu_fib_cache {
     std::vector<gpu_fib_slice> slices;
     std::vector<slice_index_t> slice_indices;
 
-    /* scratch, kept across special-q's so that a pass allocates
-     * nothing */
-    std::vector<uint32_t> counts;
-    std::vector<uint32_t> host_entries;
-    std::vector<uint64_t> bucket_begin;
-    std::vector<uint64_t> bucket_room;
+    las_gpu_fib_image() = default;
+    las_gpu_fib_image(las_gpu_fib_image const &) = delete;
+    las_gpu_fib_image & operator=(las_gpu_fib_image const &) = delete;
 
-    ~las_gpu_fib_cache()
+    ~las_gpu_fib_image()
     {
         if (eng && task)
             eng->fib_task_destroy(task);
@@ -80,6 +77,25 @@ struct las_gpu_fib_cache {
     }
 };
 
+struct las_gpu_fib_cache {
+    /* One image per factor base slicing. A side does not have just one:
+     * the slicing is keyed on, among other things, the lognorm scale,
+     * which depends on the special-q, so las goes back and forth
+     * between a handful of them. They are cached by las_info and live
+     * as long as it does, so their addresses are stable keys. Keeping
+     * only the latest image here would rebuild and re-upload the
+     * factor base on most special-q's. */
+    gpu_engine * eng = nullptr;
+    std::map<void const *, std::unique_ptr<las_gpu_fib_image>> images;
+
+    /* scratch, kept across special-q's so that a pass allocates
+     * nothing */
+    std::vector<uint32_t> counts;
+    std::vector<uint32_t> host_entries;
+    std::vector<uint64_t> bucket_begin;
+    std::vector<uint64_t> bucket_room;
+};
+
 void las_gpu_fib_cache_deleter::operator()(las_gpu_fib_cache * p) const
 {
     delete p;
@@ -88,42 +104,39 @@ void las_gpu_fib_cache_deleter::operator()(las_gpu_fib_cache * p) const
 /* }}} */
 /* {{{ building the flattened factor base */
 
-static void build_cache(las_gpu_fib_cache & C, nfs_work const & ws, int side)
+static std::unique_ptr<las_gpu_fib_image>
+build_image(fb_factorbase::slicing const & fbs)
 {
-    nfs_work::side_data const & wss(ws.sides[side]);
-    fb_factorbase::slicing::part const & P = wss.fbs->get_part(1);
-
-    C.entries.clear();
-    C.slices.clear();
-    C.slice_indices.clear();
+    auto I = std::make_unique<las_gpu_fib_image>();
+    fb_factorbase::slicing::part const & P = fbs.get_part(1);
 
     P.foreach_slice([&](auto const & sl) {
         using entry_t = typename std::decay_t<decltype(sl)>::entry_t;
         if constexpr (las_gpu_fib_takes_slice<entry_t>()) {
             gpu_fib_slice gs {};
-            gs.first = uint32_t(C.entries.size());
+            gs.first = uint32_t(I->entries.size());
             gs.slice_index = sl.get_index();
             slice_offset_t i_entry = 0;
             for (auto const & e: sl) {
                 /* one lattice per root, which is the unit of work the
                  * kernel parallelises over */
                 for (int k = 0; k < entry_t::fixed_nr_roots; k++)
-                    C.entries.push_back(gpu_fib_entry {
+                    I->entries.push_back(gpu_fib_entry {
                             e.p, e.invq, e.roots[size_t(k)], i_entry, 0});
                 i_entry++;
             }
-            gs.count = uint32_t(C.entries.size()) - gs.first;
-            C.slices.push_back(gs);
-            C.slice_indices.push_back(sl.get_index());
+            gs.count = uint32_t(I->entries.size()) - gs.first;
+            I->slices.push_back(gs);
+            I->slice_indices.push_back(sl.get_index());
         }
     });
 
-    C.eng = las_gpu::engine();
-    C.task = C.eng->fib_task_create(C.entries.data(),
-                                    uint32_t(C.entries.size()),
-                                    C.slices.data(),
-                                    uint32_t(C.slices.size()));
-    C.fbs = wss.fbs;
+    I->eng = las_gpu::engine();
+    I->task = I->eng->fib_task_create(I->entries.data(),
+                                      uint32_t(I->entries.size()),
+                                      I->slices.data(),
+                                      uint32_t(I->slices.size()));
+    return I;
 }
 
 /* }}} */
@@ -188,24 +201,29 @@ static void replay_one(bucket_array_t<1, shorthint_t> & BA,
    walks in, and nothing downstream depends on that order.
  */
 
-static void crosscheck(las_gpu_fib_cache & C, gpu_fib_plan const & plan,
+static void crosscheck(las_gpu_fib_cache & C, las_gpu_fib_image const & I,
+                       gpu_fib_plan const & plan,
                        gpu_fib_result const & res,
                        gpu_fib_update const * out, size_t storage, int side)
 {
     size_t const nb = plan.n_buckets;
-    size_t const nslices = C.slices.size();
+    size_t const nslices = I.slices.size();
 
+    /* one reference task per image, never freed: this is a debugging
+     * aid, and the images themselves live until las exits */
     static gpu_engine * ref = gpu_engine_cpu_create();
-    static gpu_fib_task * reftask = nullptr;
-    static void const * reffbs = nullptr;
-    if (reffbs != C.fbs) {
-        if (reftask)
-            ref->fib_task_destroy(reftask);
-        reftask = ref->fib_task_create(C.entries.data(),
-                                       uint32_t(C.entries.size()),
-                                       C.slices.data(),
-                                       uint32_t(C.slices.size()));
-        reffbs = C.fbs;
+    static std::mutex mu;
+    static std::map<las_gpu_fib_image const *, gpu_fib_task *> reftasks;
+    gpu_fib_task * reftask;
+    {
+        std::lock_guard<std::mutex> const lock(mu);
+        gpu_fib_task *& t = reftasks[&I];
+        if (!t)
+            t = ref->fib_task_create(I.entries.data(),
+                                     uint32_t(I.entries.size()),
+                                     I.slices.data(),
+                                     uint32_t(I.slices.size()));
+        reftask = t;
     }
 
     std::vector<gpu_fib_update> mine(storage);
@@ -321,21 +339,24 @@ void las_gpu_fib_run(worker_thread * worker, int side, nfs_work & ws,
     WHERE_AM_I_UPDATE(w, side, side);
     WHERE_AM_I_UPDATE(w, N, 0);
 
-    if (!wss.gpu_fib || wss.gpu_fib->fbs != wss.fbs ||
-            wss.gpu_fib->eng != las_gpu::engine()) {
+    if (!wss.gpu_fib || wss.gpu_fib->eng != las_gpu::engine()) {
         wss.gpu_fib.reset(new las_gpu_fib_cache);
-        build_cache(*wss.gpu_fib, ws, side);
+        wss.gpu_fib->eng = las_gpu::engine();
     }
     las_gpu_fib_cache & C(*wss.gpu_fib);
+    auto & slot = C.images[wss.fbs];
+    if (!slot)
+        slot = build_image(*wss.fbs);
+    las_gpu_fib_image & I(*slot);
 
-    if (C.slices.empty())
+    if (I.slices.empty())
         return;
 
     auto acquired = wss.reserve_BA<1, shorthint_t>();
     auto & BA = acquired.access();
 
     size_t const nb = BA.n_bucket;
-    size_t const nslices = C.slices.size();
+    size_t const nslices = I.slices.size();
 
     /* The kernels index the per-bucket arrays by x >> log_bucket_region
      * for every x below J << logI, so the bucket array has to be at
@@ -375,7 +396,7 @@ void las_gpu_fib_run(worker_thread * worker, int side, nfs_work & ws,
 
     gpu_fib_result res {};
     for (;;) {
-        res = C.eng->fib_run(C.task, plan, C.bucket_begin.data(),
+        res = I.eng->fib_run(I.task, plan, C.bucket_begin.data(),
                              C.bucket_room.data(), out, C.counts.data(),
                              C.host_entries.data(), C.host_entries.size());
         if (res.nhost > C.host_entries.size()) {
@@ -396,17 +417,17 @@ void las_gpu_fib_run(worker_thread * worker, int side, nfs_work & ws,
 
     static bool const xcheck = getenv("LAS_GPU_FIB_CROSSCHECK") != nullptr;
     if (xcheck)
-        crosscheck(C, plan, res, out,
+        crosscheck(C, I, plan, res, out,
                    size_t(BA.gpu_bucket_begin(nb - 1) +
                           BA.gpu_bucket_room(nb - 1)),
                    side);
 
-    BA.gpu_commit(C.slice_indices.data(), nslices, C.counts.data());
+    BA.gpu_commit(I.slice_indices.data(), nslices, C.counts.data());
 
     for (uint64_t k = 0; k < res.nhost; k++) {
         uint32_t const idx = C.host_entries[size_t(k)];
-        size_t const s = C.slice_of(idx);
-        replay_one(BA, C.entries[idx], C.slices[s].slice_index, Q,
+        size_t const s = I.slice_of(idx);
+        replay_one(BA, I.entries[idx], I.slices[s].slice_index, Q,
                    ws.conf.logI, ws.J, w);
     }
 }

@@ -149,6 +149,10 @@ static void declare_usage(cxx_param_list & pl)/*{{{*/
     pl.declare_usage("prepend-relation-time", "prefix all relation produced with time offset since beginning of special-q processing");
     pl.declare_usage("gpu", "backend for the offloaded sieve stages"
             " (none, cpu, cuda, cuda:<n>, auto); see sieve/gpu");
+    pl.declare_usage("gpu-stages", "which stages -gpu offloads"
+            " (comma-separated: norms, survivors, buckets; or all, none)."
+            " Defaults to buckets, the only one a device is reliably"
+            " faster at");
     pl.declare_usage("sync", "synchronize all threads at each special-q");
     pl.declare_usage("sync-thread-pool", "synchronize the thread pool (implies -t 1 !!)");
     where_am_I::decl_usage(pl);
@@ -1498,6 +1502,10 @@ int main (int argc0, char const * argv0[])/*{{{*/
         std::string gpu_backend = "none";
         pl.parse("gpu", gpu_backend);
         las_gpu::select(gpu_backend);
+
+        std::string gpu_stages = "buckets";
+        pl.parse("gpu-stages", gpu_stages);
+        las_gpu::select_stages(gpu_stages);
     }
 
     pl.parse("trialdiv-first-side", trialdiv_first_side);

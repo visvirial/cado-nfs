@@ -189,6 +189,32 @@ cado_divert_test(F9 sieve
             REFERENCE_REVISION=2c5ac2cff
         )
 
+# The same sieve, with the stages that -gpu can offload actually
+# offloaded. Both must produce the very same relations -- that is the
+# contract of the whole gpu/ directory -- and, because they share
+# CHECKSUM_FILE with the run above, the very same sieve regions too.
+#
+# The default stage set is "buckets"; the second diversion adds norm
+# initialisation and the survivor search, which are slower on a device
+# but have to stay correct. Both run multi-threaded, which is where a
+# device-side object shared between workers would show up.
+if(HAVE_CUDA)
+    cado_divert_test(F9 sieve_gpu
+            APPEND_ENVIRONMENT
+                REL_COUNT=432
+                REFERENCE_SHA1=ffe3f2036e7b80b2a7a56bc397f665506430f386
+                REFERENCE_REVISION=2c5ac2cff
+            APPEND_ARGUMENTS -gpu cuda
+            )
+    cado_divert_test(F9 sieve_gpu_all
+            APPEND_ENVIRONMENT
+                REL_COUNT=432
+                REFERENCE_SHA1=ffe3f2036e7b80b2a7a56bc397f665506430f386
+                REFERENCE_REVISION=2c5ac2cff
+            APPEND_ARGUMENTS -gpu cuda -gpu-stages all
+            )
+endif()
+
 cado_define_test(bogus_fbc_is_consistent
     PROGRAM
     ${CADO_NFS_SOURCE_DIR}/sieve/inspect-fbc-file.pl -fbc
@@ -843,6 +869,34 @@ set_property(TARGET torture-redc+asm_cmov
 
 cado_define_test(test_fb_root.cpp
     LIBRARIES las_core_a utils tests)
+
+# The device-portable transcription of the bucket-sieving arithmetic must
+# agree with the ordinary sieve code exactly -- see sieve/gpu. This test
+# needs no device: it compares the shared header against the reference on
+# the host, which is where a numerical disagreement would come from.
+cado_define_test(test_fib_gpu.cpp
+    LIBRARIES las_core_a utils tests
+    TIMEOUT 120)
+target_include_directories(test_fib_gpu PRIVATE ${PROJECT_SOURCE_DIR}/sieve)
+
+# The device plumbing on top of that arithmetic: counting, laying the
+# slices out inside each bucket, the atomic scatter, and the copy back.
+# Only worth building when there is a device to compare against.
+if(HAVE_CUDA)
+    cado_define_test(test_fib_engine.cpp
+        $<TARGET_OBJECTS:las_gpu>
+        $<TARGET_OBJECTS:las_core_b0>
+        $<TARGET_OBJECTS:las_core_a>
+        $<TARGET_OBJECTS:las_core_0>
+        ${PROJECT_SOURCE_DIR}/sieve/las-config.cpp
+        ${PROJECT_SOURCE_DIR}/sieve/las-multiobj-globals.cpp
+        LIBRARIES utils tests
+        TIMEOUT 180)
+    target_include_directories(test_fib_engine PRIVATE
+        ${PROJECT_SOURCE_DIR}/sieve)
+    target_link_libraries(test_fib_engine PRIVATE
+        $<TARGET_OBJECTS:las_gpu_cuda> CUDA::cudart)
+endif()
 
 cado_define_test(test_batchinv.cpp LIBRARIES utils tests)
 

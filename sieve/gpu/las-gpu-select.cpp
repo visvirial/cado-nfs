@@ -12,6 +12,7 @@ namespace las_gpu {
 
 namespace {
 std::unique_ptr<gpu_engine> the_engine;
+unsigned the_stages = STAGE_BUCKETS;
 }
 
 void select(std::string const & spec)
@@ -66,6 +67,44 @@ void select(std::string const & spec)
         }
         the_engine.reset(gpu_engine_cpu_create());
     }
+}
+
+void select_stages(std::string const & spec)
+{
+    if (spec == "none") {
+        the_stages = 0;
+        return;
+    }
+    if (spec == "all") {
+        the_stages = STAGE_NORMS | STAGE_SURVIVORS | STAGE_BUCKETS;
+        return;
+    }
+
+    unsigned s = 0;
+    for (size_t i = 0; i < spec.size();) {
+        size_t const j = spec.find(',', i);
+        std::string const name = spec.substr(i, j - i);
+        if (name == "norms")
+            s |= STAGE_NORMS;
+        else if (name == "survivors")
+            s |= STAGE_SURVIVORS;
+        else if (name == "buckets")
+            s |= STAGE_BUCKETS;
+        else
+            throw std::runtime_error(fmt::format(
+                "las-gpu: unknown stage \"{}\""
+                " (expected norms, survivors, buckets, all or none)",
+                name));
+        if (j == std::string::npos)
+            break;
+        i = j + 1;
+    }
+    the_stages = s;
+}
+
+bool stage_enabled(stage s)
+{
+    return the_engine && (the_stages & unsigned(s));
 }
 
 gpu_engine * engine()

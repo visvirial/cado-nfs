@@ -517,6 +517,54 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
                 bucket_write.get(), bucket_write.get() + pointer_pack);
         slice_index.push_back(new_slice_index);
     }
+
+    /* {{{ filling the whole array from a device
+     *
+     * The GPU bucket-sieving path (sieve/las-fill-in-buckets-gpu.cpp)
+     * produces every slice of every bucket in a single pass, so instead
+     * of push_update()ing one at a time it writes straight into our
+     * storage and then tells us what it did. These three members are
+     * the only way in, so that the invariants tying bucket_write to
+     * slice_start stay in one place.
+     */
+
+    /* The storage itself; offsets below are relative to it. */
+    update_t * gpu_storage() { return bucket_start[0]; }
+
+    /* Where the device should start writing bucket i, and how many
+     * updates still fit there. We hand out the current write head
+     * rather than the start of the bucket, so that the device can share
+     * an array with the ordinary per-slice tasks: reserve_BA() gives
+     * exclusive use for the duration, but the array may well have been
+     * used by a CPU task for an earlier slice.
+     */
+    uint64_t gpu_bucket_begin(size_t const i) const
+    {
+        return uint64_t(bucket_write[i] - bucket_start[0]);
+    }
+
+    uint64_t gpu_bucket_room(size_t const i) const
+    {
+        return uint64_t(bucket_start[i + 1] - bucket_write[i]);
+    }
+
+    /* counts[] holds nslices * n_bucket values: how many updates slice
+     * s wrote into bucket b. The slices must be given in the order the
+     * device laid them out, which is the order in which their updates
+     * appear in each bucket.
+     */
+    void gpu_commit(slice_index_t const * indices, size_t nslices,
+                    uint32_t const * counts)
+    {
+        for (size_t s = 0; s < nslices; s++) {
+            /* records the current write heads as slice s's starting
+             * points, which is where the device put them */
+            add_slice_index(indices[s]);
+            for (size_t b = 0; b < n_bucket; b++)
+                bucket_write[b] += counts[s * n_bucket + b];
+        }
+    }
+    /* }}} */
     double max_full(unsigned int * fullest_index = nullptr) const;
     double average_full() const;
     /* Push an update to the designated bucket. Also check for overflow, if

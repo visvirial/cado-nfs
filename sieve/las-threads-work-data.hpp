@@ -14,6 +14,7 @@
 #include "las-bkmult.hpp"
 #include "las-config.hpp"
 #include "las-dumpfile.hpp"
+#include "las-fill-in-buckets-gpu.hpp"
 #include "las-norms.hpp"
 #include "las-norms-gpu.hpp"
 #include "las-plattice.hpp"
@@ -136,6 +137,14 @@ class nfs_work {
          * logs may differ by one and the relation set with it.
          */
         std::unique_ptr<lognorm_gpu> lognorms_gpu;
+
+        /* Device-side state for the offloaded toplevel bucket sieving:
+         * the factor base in the flat form the kernels want, and
+         * whatever the backend keeps on the device. It is built from
+         * fbs and therefore outlives a special-q -- which is the whole
+         * reason the offload is worth its transfers.
+         */
+        las_gpu_fib_cache_ptr gpu_fib;
 
         /* fbK depends on
          *      conf.logI

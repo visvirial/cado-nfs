@@ -12,6 +12,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
+
+#include <mutex>
+#include <vector>
 
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -20,6 +24,8 @@
 #include <thrust/iterator/counting_iterator.h>
 
 #include "las-gpu-engine.hpp"
+#include "las-gpu-fib-kernels.hpp"
+#include "las-gpu-fib-plan.hpp"
 #include "las-gpu-kernels.hpp"
 #include "las-gpu-plan.hpp"
 
@@ -90,13 +96,109 @@ __global__ void kernel_survivor_flags(unsigned char * __restrict__ S0,
 }
 
 /* }}} */
+/* {{{ bucket sieving kernels
+ *
+ * One thread per (factor base entry, root) pair. The walk is a serial
+ * state machine, so there is nothing to parallelise inside one lattice;
+ * the parallelism is that there are tens of thousands of them.
+ *
+ * The pass is done twice, once to count and once to write. That is the
+ * price of keeping the updates grouped by slice in each bucket, which
+ * is how apply_one_bucket recovers logp: the slice boundaries have to
+ * be known before the first update can be placed. Re-walking is
+ * cheaper than storing every position and sorting it.
+ */
+
+__global__ void kernel_fib_count(gpu_fib_entry const * __restrict__ entries,
+                                 uint32_t const * __restrict__ entry_slice,
+                                 uint32_t nentries, gpu_fib_plan plan,
+                                 uint32_t * __restrict__ counts, uint32_t nb,
+                                 uint32_t * __restrict__ host_entries,
+                                 uint64_t host_capacity,
+                                 unsigned long long * __restrict__ nhost)
+{
+    gpu_fib_fence const F = gpu_fib_fence_for(plan.logI, plan.J);
+    int const logB = plan.log_bucket_region;
+    uint32_t const stride = blockDim.x * gridDim.x;
+
+    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < nentries;
+         k += stride) {
+        gpu_fib_entry const e = entries[k];
+        if (!gpu_fib_entry_is_sieved(plan, e.p))
+            continue;
+
+        gpu_ple ple {};
+        int const kind = gpu_fib_prepare(&ple, e, plan.basis, F, plan.logI);
+        if (kind == GPU_FIB_HOST) {
+            unsigned long long const slot = atomicAdd(nhost, 1ULL);
+            if (slot < host_capacity)
+                host_entries[slot] = k;
+            continue;
+        }
+
+        uint32_t * const row = counts + size_t(entry_slice[k]) * nb;
+        gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
+            atomicAdd(&row[x >> logB], 1u);
+        });
+    }
+}
+
+__global__ void kernel_fib_scatter(gpu_fib_entry const * __restrict__ entries,
+                                   uint32_t const * __restrict__ entry_slice,
+                                   uint32_t nentries, gpu_fib_plan plan,
+                                   uint64_t * __restrict__ cursor, uint32_t nb,
+                                   gpu_fib_update * __restrict__ updates)
+{
+    gpu_fib_fence const F = gpu_fib_fence_for(plan.logI, plan.J);
+    int const logB = plan.log_bucket_region;
+    uint32_t const bmask = (UINT32_C(1) << logB) - 1;
+    uint32_t const stride = blockDim.x * gridDim.x;
+
+    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < nentries;
+         k += stride) {
+        gpu_fib_entry const e = entries[k];
+        if (!gpu_fib_entry_is_sieved(plan, e.p))
+            continue;
+
+        gpu_ple ple {};
+        int const kind = gpu_fib_prepare(&ple, e, plan.basis, F, plan.logI);
+        if (kind == GPU_FIB_HOST)
+            continue;
+
+        uint64_t * const row = cursor + size_t(entry_slice[k]) * nb;
+        uint16_t const hint = e.hint;
+        gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
+            uint64_t const slot = atomicAdd(
+                reinterpret_cast<unsigned long long *>(&row[x >> logB]), 1ULL);
+            updates[slot] = gpu_fib_update {hint, uint16_t(x & bmask)};
+        });
+    }
+}
+
+/* }}} */
 /* {{{ tasks */
+
+/* Scratch for one in-flight norm fill. A task is shared by every
+ * worker thread -- lognorm_gpu lives in nfs_work::side_data, and
+ * process_bucket_region fills norms from all of them at once -- so the
+ * buffer the kernel writes into cannot live in the task. Each call
+ * takes a slot and gives it back; the pool grows to the number of
+ * threads that ever ask at the same time.
+ */
+struct cuda_norm_slot {
+    unsigned char * d_S = nullptr;
+    unsigned char * h_S = nullptr;
+    size_t bytes = 0;
+    cudaStream_t stream = nullptr;
+};
 
 struct cuda_norm_task {
     gpu_norm_plan plan;          /* .segments points to device memory */
     gpu_norm_segment * d_segments = nullptr;
-    unsigned char * d_S = nullptr;
-    size_t d_S_bytes = 0;
+
+    std::mutex mu;
+    std::vector<cuda_norm_slot *> free_slots;
+    std::vector<cuda_norm_slot *> all_slots;
 };
 
 /* How many survivors we fetch without being asked twice. A 64kB region
@@ -104,6 +206,49 @@ struct cuda_norm_task {
  * covers it with room to spare; the slow path below catches the rest.
  */
 #define CUDA_SURVIVOR_PREFETCH 4096
+
+struct cuda_fib_task {
+    /* uploaded once, reused for every special-q: the factor base does
+     * not depend on q */
+    gpu_fib_entry * d_entries = nullptr;
+    uint32_t * d_entry_slice = nullptr;
+    uint32_t nentries = 0;
+    uint32_t nslices = 0;
+
+    /* resized as the sieve area and the bucket allocation grow */
+    uint32_t nb = 0;
+    gpu_fib_update * d_updates = nullptr;
+    /* Page-locked landing zone for them. The bucket array itself is
+     * ordinary memory, and a device-to-pageable copy is staged by the
+     * driver anyway; doing the staging ourselves turns the one copy
+     * per bucket -- hundreds of them -- into a single transfer plus a
+     * host-side scatter, which is both faster and free of any question
+     * about how pageable asynchronous copies interleave when the two
+     * sides are sieving at the same time. */
+    gpu_fib_update * h_updates = nullptr;
+    uint64_t updates_capacity = 0;
+
+    uint32_t * d_counts = nullptr;
+    uint64_t * d_cursor = nullptr;
+    size_t grid_capacity = 0;       /* in nslices*nb units */
+
+    uint32_t * d_host_entries = nullptr;
+    uint64_t host_capacity = 0;
+    unsigned long long * d_nhost = nullptr;
+
+    /* Page-locked staging for the two small arrays that cross the bus
+     * on every pass, so that the copies can be queued rather than
+     * blocking. */
+    uint32_t * h_counts = nullptr;
+    uint64_t * h_cursor = nullptr;
+    size_t staged_grid = 0;
+
+    /* where each bucket's updates sit in d_updates */
+    std::vector<uint64_t> compact;
+    std::vector<uint64_t> used;
+
+    cudaStream_t stream = nullptr;
+};
 
 struct cuda_survivor_task {
     gpu_jdiv_entry * d_jdiv = nullptr;
@@ -178,7 +323,13 @@ struct cuda_engine : public gpu_engine {
             return;
         cudaSetDevice(device);
         cudaFree(t->d_segments);
-        cudaFree(t->d_S);
+        for (auto * sl: t->all_slots) {
+            cudaFree(sl->d_S);
+            cudaFreeHost(sl->h_S);
+            if (sl->stream)
+                cudaStreamDestroy(sl->stream);
+            delete sl;
+        }
         delete t;
     }
 
@@ -189,10 +340,26 @@ struct cuda_engine : public gpu_engine {
         CUDA_CHECK(cudaSetDevice(device));
 
         size_t const bytes = (size_t(nregions) << t->plan.log_bucket_region);
-        if (bytes > t->d_S_bytes) {
-            cudaFree(t->d_S);
-            CUDA_CHECK(cudaMalloc(&t->d_S, bytes));
-            t->d_S_bytes = bytes;
+
+        cuda_norm_slot * sl = nullptr;
+        {
+            std::lock_guard<std::mutex> const lock(t->mu);
+            if (!t->free_slots.empty()) {
+                sl = t->free_slots.back();
+                t->free_slots.pop_back();
+            } else {
+                sl = new cuda_norm_slot;
+                CUDA_CHECK(cudaStreamCreate(&sl->stream));
+                t->all_slots.push_back(sl);
+            }
+        }
+
+        if (bytes > sl->bytes) {
+            cudaFree(sl->d_S);
+            cudaFreeHost(sl->h_S);
+            CUDA_CHECK(cudaMalloc(&sl->d_S, bytes));
+            CUDA_CHECK(cudaHostAlloc(&sl->h_S, bytes, cudaHostAllocDefault));
+            sl->bytes = bytes;
         }
 
         int const block = 256;
@@ -200,9 +367,18 @@ struct cuda_engine : public gpu_engine {
         if (grid > 65535)
             grid = 65535;
 
-        kernel_fill_norms<<<grid, block>>>(t->d_S, t->plan, N0, nregions);
+        kernel_fill_norms<<<grid, block, 0, sl->stream>>>(sl->d_S, t->plan, N0,
+                                                          nregions);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaMemcpy(S, t->d_S, bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(sl->h_S, sl->d_S, bytes,
+                                   cudaMemcpyDeviceToHost, sl->stream));
+        CUDA_CHECK(cudaStreamSynchronize(sl->stream));
+        memcpy(S, sl->h_S, bytes);
+
+        {
+            std::lock_guard<std::mutex> const lock(t->mu);
+            t->free_slots.push_back(sl);
+        }
     }
 
     /* --- survivors ----------------------------------------------- */
@@ -361,6 +537,207 @@ struct cuda_engine : public gpu_engine {
                                   cudaMemcpyDeviceToHost));
         }
         return n;
+    }
+
+    /* --- bucket sieving ------------------------------------------ */
+
+    gpu_fib_task * fib_task_create(gpu_fib_entry const * entries,
+                                   uint32_t nentries,
+                                   gpu_fib_slice const * slices,
+                                   uint32_t nslices) override
+    {
+        CUDA_CHECK(cudaSetDevice(device));
+        auto * t = new cuda_fib_task;
+        t->nentries = nentries;
+        t->nslices = nslices;
+
+        /* The kernels want the slice of an entry, not the entries of a
+         * slice: one thread is one entry. Flatten it here, once. */
+        std::vector<uint32_t> es(nentries);
+        for (uint32_t s = 0; s < nslices; s++)
+            for (uint32_t k = 0; k < slices[s].count; k++)
+                es[slices[s].first + k] = s;
+
+        size_t const ebytes = size_t(nentries) * sizeof(gpu_fib_entry);
+        CUDA_CHECK(cudaMalloc(&t->d_entries, ebytes));
+        CUDA_CHECK(cudaMemcpy(t->d_entries, entries, ebytes,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&t->d_entry_slice,
+                              size_t(nentries) * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemcpy(t->d_entry_slice, es.data(),
+                              size_t(nentries) * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice));
+
+        CUDA_CHECK(cudaMalloc(&t->d_nhost, sizeof(unsigned long long)));
+        CUDA_CHECK(cudaStreamCreate(&t->stream));
+        return reinterpret_cast<gpu_fib_task *>(t);
+    }
+
+    void fib_task_destroy(gpu_fib_task * task) override
+    {
+        auto * t = reinterpret_cast<cuda_fib_task *>(task);
+        if (!t)
+            return;
+        cudaSetDevice(device);
+        cudaFree(t->d_entries);
+        cudaFree(t->d_entry_slice);
+        cudaFree(t->d_updates);
+        cudaFreeHost(t->h_updates);
+        cudaFree(t->d_counts);
+        cudaFree(t->d_cursor);
+        cudaFree(t->d_host_entries);
+        cudaFree(t->d_nhost);
+        cudaFreeHost(t->h_counts);
+        cudaFreeHost(t->h_cursor);
+        if (t->stream)
+            cudaStreamDestroy(t->stream);
+        delete t;
+    }
+
+    gpu_fib_result fib_run(gpu_fib_task * task, gpu_fib_plan const & plan,
+                           uint64_t const * bucket_begin,
+                           uint64_t const * bucket_room,
+                           gpu_fib_update * out, uint32_t * counts,
+                           uint32_t * host_entries,
+                           uint64_t host_capacity) override
+    {
+        auto * t = reinterpret_cast<cuda_fib_task *>(task);
+        CUDA_CHECK(cudaSetDevice(device));
+        cudaStream_t const stream = t->stream;
+
+        uint32_t const nb = plan.n_buckets;
+        size_t const grid = size_t(t->nslices) * nb;
+
+        if (nb != t->nb) {
+            t->compact.resize(size_t(nb) + 1);
+            t->used.resize(nb);
+            t->nb = nb;
+        }
+        if (grid > t->grid_capacity) {
+            cudaFree(t->d_counts);
+            cudaFree(t->d_cursor);
+            CUDA_CHECK(cudaMalloc(&t->d_counts, grid * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&t->d_cursor, grid * sizeof(uint64_t)));
+            t->grid_capacity = grid;
+        }
+        if (grid > t->staged_grid) {
+            cudaFreeHost(t->h_counts);
+            cudaFreeHost(t->h_cursor);
+            CUDA_CHECK(cudaHostAlloc(&t->h_counts, grid * sizeof(uint32_t),
+                                     cudaHostAllocDefault));
+            CUDA_CHECK(cudaHostAlloc(&t->h_cursor, grid * sizeof(uint64_t),
+                                     cudaHostAllocDefault));
+            t->staged_grid = grid;
+        }
+        if (host_capacity > t->host_capacity) {
+            cudaFree(t->d_host_entries);
+            CUDA_CHECK(cudaMalloc(&t->d_host_entries,
+                                  size_t(host_capacity) * sizeof(uint32_t)));
+            t->host_capacity = host_capacity;
+        }
+
+        CUDA_CHECK(cudaMemsetAsync(t->d_counts, 0, grid * sizeof(uint32_t),
+                                   stream));
+        CUDA_CHECK(cudaMemsetAsync(t->d_nhost, 0, sizeof(unsigned long long),
+                                   stream));
+
+        int const block = 128;
+        int grid_e = int((t->nentries + block - 1) / block);
+        if (grid_e > 65535)
+            grid_e = 65535;
+
+        kernel_fib_count<<<grid_e, block, 0, stream>>>(
+            t->d_entries, t->d_entry_slice, t->nentries, plan, t->d_counts, nb,
+            t->d_host_entries, host_capacity, t->d_nhost);
+        CUDA_CHECK(cudaGetLastError());
+
+        unsigned long long nhost = 0;
+        CUDA_CHECK(cudaMemcpyAsync(t->h_counts, t->d_counts,
+                                   grid * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(&nhost, t->d_nhost,
+                                   sizeof(unsigned long long),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        gpu_fib_result res {};
+        res.nhost = nhost;
+
+        /* The layout is a few thousand additions over a 100kB array, so
+         * the host does it: a kernel for it would cost more in
+         * synchronisation than it saves. The device side of it is
+         * compact -- bucket b's updates sit back to back in d_updates,
+         * with nothing in between -- because we copy each bucket back
+         * into its own place in out[], and the gaps in out[] may hold
+         * updates that an ordinary CPU task put there. */
+        memcpy(counts, t->h_counts, grid * sizeof(uint32_t));
+        uint64_t off = 0;
+        for (uint32_t b = 0; b < nb; b++) {
+            t->compact[b] = off;
+            uint64_t u = 0;
+            for (uint32_t s = 0; s < t->nslices; s++) {
+                t->h_cursor[size_t(s) * nb + b] = off + u;
+                u += counts[size_t(s) * nb + b];
+            }
+            t->used[b] = u;
+            if (u > bucket_room[b] && !res.overflow) {
+                res.overflow = true;
+                res.overflow_bucket = b;
+                res.overflow_needed = u;
+                res.overflow_room = bucket_room[b];
+            }
+            off += u;
+        }
+        t->compact[nb] = off;
+
+        if (res.overflow || nhost > host_capacity)
+            return res;
+
+        if (off > t->updates_capacity) {
+            /* Grow generously: the high-water mark drifts up over the
+             * first few special-q's and reallocating page-locked memory
+             * is not cheap. */
+            uint64_t const want = off + off / 4;
+            cudaFree(t->d_updates);
+            cudaFreeHost(t->h_updates);
+            CUDA_CHECK(cudaMalloc(&t->d_updates,
+                                  size_t(want) * sizeof(gpu_fib_update)));
+            CUDA_CHECK(cudaHostAlloc(&t->h_updates,
+                                     size_t(want) * sizeof(gpu_fib_update),
+                                     cudaHostAllocDefault));
+            t->updates_capacity = want;
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(t->d_cursor, t->h_cursor,
+                                   grid * sizeof(uint64_t),
+                                   cudaMemcpyHostToDevice, stream));
+
+        kernel_fib_scatter<<<grid_e, block, 0, stream>>>(
+            t->d_entries, t->d_entry_slice, t->nentries, plan, t->d_cursor, nb,
+            t->d_updates);
+        CUDA_CHECK(cudaGetLastError());
+
+        if (nhost)
+            CUDA_CHECK(cudaMemcpyAsync(host_entries, t->d_host_entries,
+                                       size_t(nhost) * sizeof(uint32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+
+        CUDA_CHECK(cudaMemcpyAsync(t->h_updates, t->d_updates,
+                                   size_t(off) * sizeof(gpu_fib_update),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        /* Device-side the buckets are back to back; in the bucket array
+         * they are not, and the gaps may hold updates that an ordinary
+         * CPU task put there. */
+        for (uint32_t b = 0; b < nb; b++) {
+            if (!t->used[b])
+                continue;
+            memcpy(out + bucket_begin[b], t->h_updates + t->compact[b],
+                   size_t(t->used[b]) * sizeof(gpu_fib_update));
+        }
+
+        return res;
     }
 };
 

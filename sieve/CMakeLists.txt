@@ -117,6 +117,7 @@ set(las_multi_a_sources
         bucket.cpp
         las-config.cpp
         las-fill-in-buckets.cpp
+        las-fill-in-buckets-gpu.cpp
         las-smallsieve.cpp
         siqs-smallsieve.cpp
         las-cofac-standalone.cpp

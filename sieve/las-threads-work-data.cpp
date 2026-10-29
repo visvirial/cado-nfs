@@ -107,9 +107,9 @@ void nfs_work::thread_data::release_gpu_survivor_task()
 
 gpu_survivor_task * nfs_work::thread_data::get_gpu_survivor_task()
 {
-    gpu_engine * const e = las_gpu::engine();
-    if (!e)
+    if (!las_gpu::stage_enabled(las_gpu::STAGE_SURVIVORS))
         return nullptr;
+    gpu_engine * const e = las_gpu::engine();
 
     if (gpu_survivors && gpu_survivors_engine == e && gpu_survivors_jd == ws.jd)
         return gpu_survivors;
@@ -425,7 +425,7 @@ void nfs_work::prepare_for_new_q(las_info & las0, special_q_task * task, typenam
 
         /* Rebuilt for every special-q, like lognorms itself: the
          * approximation it evaluates depends on the q-lattice. */
-        if (las_gpu::engine()) {
+        if (las_gpu::stage_enabled(las_gpu::STAGE_NORMS)) {
             wss.lognorms_gpu = std::make_unique<lognorm_gpu>(
                     conf, las.cpoly, side, Q, conf.logI, J);
         } else {

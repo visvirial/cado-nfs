@@ -26,6 +26,7 @@
 #include "las-auxiliary-data.hpp"
 #include "las-bkmult.hpp"
 #include "las-config.hpp"
+#include "las-fill-in-buckets-gpu.hpp"
 #include "las-fill-in-buckets.hpp"
 #include "las-globals.hpp"
 #include "las-process-bucket-region.hpp"
@@ -387,6 +388,18 @@ static void fill_in_buckets_one_side(nfs_work & ws, nfs_aux & aux,
         Vpre = &Vpre_ref;
     }
 
+    /* The device, when there is one, takes the slices of simple
+     * entries -- the overwhelming majority -- in a single pass. The
+     * loop below then only has the others left to push. The two sets
+     * are disjoint by construction, so the part is still covered
+     * exactly once. */
+    bool gpu = false;
+    double gpu_weight = 0;
+#ifndef SIQS_SIEVE
+    if constexpr (LEVEL == 1 && std::is_same_v<TARGET_HINT, shorthint_t>)
+        gpu = las_gpu_fib_usable(ws, Q);
+#endif
+
     size_t pushed = 0;
     P.foreach_slice([&](auto const & s) {
         auto w_copy = std::make_shared<where_am_I>(w);
@@ -395,12 +408,28 @@ static void fill_in_buckets_one_side(nfs_work & ws, nfs_aux & aux,
         plattices_dense_vector_t * pre = Vpre ? &((*Vpre)[idx]) : nullptr;
         using entry_t = std::decay_t<decltype(s)>::entry_t;
 
+        if (gpu && las_gpu_fib_takes_slice<entry_t>()) {
+            gpu_weight += s.get_weight();
+            pushed++;
+            return;
+        }
+
         pool.add_task(thread_pool::QUEUE_GENERIC, s.get_weight(),
             run_fill_in_buckets_toplevel<LEVEL, entry_t, TARGET_HINT>,
             side, std::ref(ws), std::ref(aux), std::ref(Q), pre, std::cref(s), w_copy);
 
         pushed++;
     });
+
+#ifndef SIQS_SIEVE
+    if constexpr (LEVEL == 1 && std::is_same_v<TARGET_HINT, shorthint_t>) {
+        if (gpu && gpu_weight) {
+            pool.add_task(thread_pool::QUEUE_GENERIC, gpu_weight,
+                    las_gpu_fib_run, side, std::ref(ws), std::ref(aux),
+                    std::ref(Q), std::make_shared<where_am_I>(w));
+        }
+    }
+#endif
 }
 
 /* This is a compile-time loop over the possible values from 1 to level,

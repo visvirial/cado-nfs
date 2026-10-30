@@ -64,6 +64,7 @@
 #include "runtime_numeric_cast.hpp"
 #include "fstream_maybe_compressed.hpp"
 #include "cado_math_aux.hpp"
+#include "cado_main.hpp"
 #include "utils_cxx.hpp"
 #include "linalg/bblas/bblas_bitrev.hpp"
 
@@ -442,31 +443,55 @@ requires requires { m.from_ab(cxx_mpz(), cxx_mpz()); }
     } else {
         /* We _can_ seek. Good news ! */
         const long endpos = ftell(depfile);
-        /* Find accurate starting positions for everyone */
         unsigned int nthreads = omp_get_max_threads();
         /* cap the number of I/O threads */
         if (nthreads > MAX_IO_THREADS)
             nthreads = MAX_IO_THREADS;
-        fmt::print(stderr, "{}: Doing I/O with {} threads\n", message, nthreads);
         std::vector<long> spos_tab;
-        spos_tab.reserve(nthreads);
-        for(unsigned int i = 0 ; i < nthreads ; i++)
-            spos_tab.push_back((endpos * i) / nthreads);
-        spos_tab.push_back(endpos);
         /* All threads get their private reading head. */
 #pragma omp parallel num_threads(nthreads)
         {
+            /* num_threads() is only an upper bound. When dynamic
+             * adjustment of the number of threads is enabled
+             * (OMP_DYNAMIC=true, which our test suite sets), the runtime
+             * may hand us a smaller team, and libgomp routinely hands us
+             * a single thread. Hence we must find accurate starting
+             * positions for as many threads as we have *for real*.
+             * Cutting the file before the parallel region would leave
+             * the pieces of the threads that we did not get entirely
+             * unread, and we would then silently compute the product
+             * over only part of the (a,b) pairs.
+             */
+#pragma omp single
+            {
+                const unsigned int nt = omp_get_num_threads();
+                fmt::print(stderr, "{}: Doing I/O with {} threads\n", message, nt);
+                spos_tab.reserve(nt + 1);
+                for(unsigned int j = 0 ; j < nt ; j++)
+                    spos_tab.push_back((endpos * j) / nt);
+                spos_tab.push_back(endpos);
+            }
+            /* the omp single construct above ends with an implicit
+             * barrier, so that spos_tab is set and visible to everyone
+             * here */
             const int i = omp_get_thread_num();
             FILE * fi = fopen_maybe_compressed_lock (depname.c_str(), "rb");
             const int rc = fseek(fi, spos_tab[i], SEEK_SET);
             ASSERT_ALWAYS(rc == 0);
             if (i > 0) {
-                /* Except when we're at the end of the stream, read until
-                 * we get a newline */
-                for( ; fgetc(fi) != '\n' ; ) ;
+                /* Except when we're at the beginning of the stream, read
+                 * until we get a newline. Note that we must stop at end
+                 * of file too: a file whose last line is not terminated
+                 * would otherwise have us spin forever, since fgetc()
+                 * keeps returning EOF. */
+                for(int c ; (c = fgetc(fi)) != '\n' && c != EOF ; ) ;
             }
             spos_tab[i] = ftell(fi);
 #pragma omp barrier
+            /* Cut positions are only ever moved forwards, and they start
+             * out sorted, so this holds. We would read the same (a,b)
+             * pairs twice, or skip some, if it did not. */
+            ASSERT_ALWAYS(spos_tab[i] <= spos_tab[i + 1]);
             std::vector<typename M::T> loc_prd;
             unsigned long loc_nab = 0;
             unsigned long loc_nfree = 0;
@@ -609,8 +634,7 @@ calculateSqrtRat (std::string const & prefix, unsigned int numdep, cxx_cado_poly
 
   if (mpz_sgn (prod) < 0)
     {
-      fmt::print (stderr, "Error, product is negative: try another dependency\n");
-      exit(EXIT_FAILURE);
+      throw cado::error("Error, product is negative: try another dependency");
     }
 
 #pragma omp critical
@@ -662,7 +686,7 @@ calculateSqrtRat (std::string const & prefix, unsigned int numdep, cxx_cado_poly
           p = getprime_mt (pi);
         }
       prime_info_clear (pi);
-      exit(EXIT_FAILURE);
+      throw cado::error("{} prime(s) appear to odd power", errors);
     }
 
   mpz_mod (prod, prod, Np);
@@ -976,9 +1000,8 @@ cxx_mpz_polymodF_sqrt (cxx_mpz_polymodF & res, cxx_mpz_polymodF & AA, cxx_mpz_po
 
         if (mpz_sizeinbase (pk, 2) > target_size)
         {
-            fmt::print (stderr, "Failed to reconstruct an integer polynomial\n");
             fmt::print ("Failed\n");
-            exit(EXIT_FAILURE);
+            throw cado::error("Failed to reconstruct an integer polynomial");
         }
 
         /* invariant: invsqrtA = 1/sqrt(A) bmod p^k */
@@ -1122,9 +1145,8 @@ FindSuitableModP (cxx_mpz_poly const & F, cxx_mpz const & N)
             return p;
     }
 
-    fmt::print (stderr, "Error, found no suitable prime up to {}\n", MAXP);
-    fmt::print (stderr, "See paragraph \"Factoring with SNFS\" in README\n");
-    exit(EXIT_FAILURE);
+    throw cado::error("Error, found no suitable prime up to {}\n"
+            "See paragraph \"Factoring with SNFS\" in README", MAXP);
 
     return 0;
 }
@@ -1363,9 +1385,8 @@ static int calculateSqrtQS( /* {{{ */
     }
 
     if (mpz_sgn(prod.first) < 0) {
-        fmt::print(stderr, "Error, product is negative: try another "
-                            "dependency\n");
-        exit(EXIT_FAILURE);
+        throw cado::error("Error, product is negative: try another "
+                          "dependency");
     }
 
 #pragma omp critical
@@ -1412,7 +1433,7 @@ static int calculateSqrtQS( /* {{{ */
                   break;
             }
         }
-        exit(EXIT_FAILURE);
+        throw cado::error("{} prime(s) appear to odd power", errors);
     }
 
     mpz_mod(prod.first, prod.first, Np);
@@ -1981,8 +2002,15 @@ static void declare_usage(cxx_param_list & pl) /* {{{ */
     pl.declare_usage("v", "More verbose output");
 } /* }}} */
 
+static int main_(int argc, char const *argv[]);
+
 // coverity[root_function]
 int main(int argc, char const *argv[])
+{
+    return cado::main_wrapper(main_, argc, argv);
+}
+
+static int main_(int argc, char const *argv[])
 {
     fmt::print (stderr, "{}\n", collect_command_line(argc, argv));
 

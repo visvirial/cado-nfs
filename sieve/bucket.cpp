@@ -74,6 +74,7 @@ template <int LEVEL, hint_type HINT>
 void bucket_array_t<LEVEL, HINT>::allocate_memory(
     las_memory_accessor & memory, uint32_t const new_n_bucket,
     double const fill_ratio, int MAYBE_UNUSED logI,
+    bool MAYBE_UNUSED parity_skip,
     slice_index_t const prealloc_slices)
 {
     static_assert(LEVEL < FB_MAX_PARTS);
@@ -99,6 +100,10 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
      * Bucket regions for which this line ordinate is even will receive
      * updates for 50% of the locations only, in contrast to 100% when the
      * ordinate is even.
+     *
+     * All of this is only true if parity_skip is set. Under sublattices,
+     * the fill does not skip anything, and all locations receive
+     * updates.
      */
 
     size_t const Q = 0.25 * fill_ratio * BUCKET_REGIONS[LEVEL];
@@ -123,7 +128,12 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
     bs_odd = bucket_misalignment(bs_odd, sizeof(update_t));
     new_big_size = bs_odd * new_n_bucket;
 #else
-    if (LOG_BUCKET_REGIONS[LEVEL] <= logI) {
+    if (!parity_skip) {
+        bs_even = bs_odd = 4 * Q + ndev * sqrt(4 * Q);
+        bs_even = bucket_misalignment(bs_even, sizeof(update_t));
+        bs_odd = bucket_misalignment(bs_odd, sizeof(update_t));
+        new_big_size = bs_odd * new_n_bucket;
+    } else if (LOG_BUCKET_REGIONS[LEVEL] <= logI) {
         bitmask_line_ordinate = UINT32_C(1)
                                 << (logI - LOG_BUCKET_REGIONS[LEVEL]);
         ASSERT_ALWAYS(new_n_bucket % 2 == 0);
@@ -531,42 +541,44 @@ void downsort(fb_factorbase::slicing const & fbs MAYBE_UNUSED,
         }
     }
 
-    for (auto const & ru: BA_in.row_updates[bucket_number]) {
-        WHERE_AM_I_UPDATE(w, i, ru.slice_index);
-        WHERE_AM_I_UPDATE(w, p, fbs[ru.slice_index].get_prime(ru.hint));
-        WHERE_AM_I_UPDATE(w, h, ru.hint);
-        /* XXX
-         * we have a problem here when
-         * logB[INPUT_LEVEL] >= logI > logB[INPUT_LEVEL-1]
-         * ru.n corresponds to a full line, but that doesn't fit in one
-         * region at level INPUT_LEVEL-1.
-         */
+    if (bucket_number < BA_in.n_bucket) {
+        for (auto const & ru: BA_in.row_updates[bucket_number]) {
+            WHERE_AM_I_UPDATE(w, i, ru.slice_index);
+            WHERE_AM_I_UPDATE(w, p, fbs[ru.slice_index].get_prime(ru.hint));
+            WHERE_AM_I_UPDATE(w, h, ru.hint);
+            /* XXX
+             * we have a problem here when
+             * logB[INPUT_LEVEL] >= logI > logB[INPUT_LEVEL-1]
+             * ru.n corresponds to a full line, but that doesn't fit in one
+             * region at level INPUT_LEVEL-1.
+             */
 
-        /* This assumes that we push separate row updates for each
-         * lowest-level bucket.
-         */
-        ASSERT(((ru.x + ru.n * ru.inc) >> logB) == (ru.x >> logB));
-        longhint_t h(0, ru.hint, ru.slice_index);
-        lower_update_t u_low(ru.x & maskB, h);
-        lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
-        BA_out.row_updates[ru.x >> logB].push_back(ru_low);
-
-        /* I think that the approach below would work as well, but it's
-         * not tested. It would also be more costly.
-         */
-#if 0
-        auto x0 = ru.x;
-        for(int nx = ru.n + 1 ; nx ; ) {
-            auto x = x0;
-            int n;
-            for(n = 0 ; (x & maskB) == (x0 & maskB) ; x += ru.inc, nx--, n++);
-            /* we can fit n updates in this sub-bucket */
-            lower_update_t u_low(x0 & maskB, h);
+            /* This assumes that we push separate row updates for each
+             * lowest-level bucket.
+             */
+            ASSERT(((ru.x + ru.n * ru.inc) >> logB) == (ru.x >> logB));
+            longhint_t h(0, ru.hint, ru.slice_index);
+            lower_update_t u_low(ru.x & maskB, h);
             lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
-            BA_out.row_updates[x0 >> logB].push_back(ru_low);
-            x0 = x;
-        }
+            BA_out.row_updates[ru.x >> logB].push_back(ru_low);
+
+            /* I think that the approach below would work as well, but it's
+             * not tested. It would also be more costly.
+             */
+#if 0
+            auto x0 = ru.x;
+            for(int nx = ru.n + 1 ; nx ; ) {
+                auto x = x0;
+                int n;
+                for(n = 0 ; (x & maskB) == (x0 & maskB) ; x += ru.inc, nx--, n++);
+                /* we can fit n updates in this sub-bucket */
+                lower_update_t u_low(x0 & maskB, h);
+                lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
+                BA_out.row_updates[x0 >> logB].push_back(ru_low);
+                x0 = x;
+            }
 #endif
+        }
     }
 }
 
@@ -591,13 +603,15 @@ void downsort(fb_factorbase::slicing const & fbs MAYBE_UNUSED /* unused */,
         BA_out.push_update(it.x >> logB, lower_update_t(it.x & maskB, it), w);
     }
 
-    for (auto const & ru: BA_in.row_updates[bucket_number]) {
-        WHERE_AM_I_UPDATE(w, i, ru.slice_index);
-        WHERE_AM_I_UPDATE(w, p, fbs[ru.slice_index].get_prime(ru.hint));
-        WHERE_AM_I_UPDATE(w, h, ru.hint);
-        lower_update_t u_low(ru.x & maskB, ru);
-        lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
-        BA_out.row_updates[ru.x >> logB].push_back(ru_low);
+    if (bucket_number < BA_in.n_bucket) {
+        for (auto const & ru: BA_in.row_updates[bucket_number]) {
+            WHERE_AM_I_UPDATE(w, i, ru.slice_index);
+            WHERE_AM_I_UPDATE(w, p, fbs[ru.slice_index].get_prime(ru.hint));
+            WHERE_AM_I_UPDATE(w, h, ru.hint);
+            lower_update_t u_low(ru.x & maskB, ru);
+            lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
+            BA_out.row_updates[ru.x >> logB].push_back(ru_low);
+        }
     }
 }
 
@@ -630,15 +644,17 @@ void downsort(fb_factorbase::slicing const & fbs,
             BA_out.push_update(it.x >> logB, u_low, w);
         }
     }
-    for (auto const & ru: BA_in.row_updates[bucket_number]) {
-        WHERE_AM_I_UPDATE(w, i, ru.slice_index);
-        // we have no slice offset here, so no p.
-        // WHERE_AM_I_UPDATE(w, p, fbs[ru.slice_index].get_prime(ru.hint));
-        // WHERE_AM_I_UPDATE(w, h, ru);
-        logphint_t h { fbs[ru.slice_index].get_logp() };
-        lower_update_t u_low(ru.x & maskB, h);
-        lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
-        BA_out.row_updates[ru.x >> logB].push_back(ru_low);
+    if (bucket_number < BA_in.n_bucket) {
+        for (auto const & ru: BA_in.row_updates[bucket_number]) {
+            WHERE_AM_I_UPDATE(w, i, ru.slice_index);
+            // we have no slice offset here, so no p.
+            // WHERE_AM_I_UPDATE(w, p, fbs[ru.slice_index].get_prime(ru.hint));
+            // WHERE_AM_I_UPDATE(w, h, ru);
+            logphint_t h { fbs[ru.slice_index].get_logp() };
+            lower_update_t u_low(ru.x & maskB, h);
+            lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
+            BA_out.row_updates[ru.x >> logB].push_back(ru_low);
+        }
     }
 }
 
@@ -662,14 +678,16 @@ void downsort(fb_factorbase::slicing const & fbs MAYBE_UNUSED /* unused */,
     for (auto const & it: BA_in.slice_range(bucket_number, 0)) {
         BA_out.push_update(it.x >> logB, lower_update_t(it.x & maskB, it), w);
     }
-    for (auto const & ru: BA_in.row_updates[bucket_number]) {
-        WHERE_AM_I_UPDATE(w, i, ru.slice_index);
-        // no slice_offset in logphint either
-        // WHERE_AM_I_UPDATE(w, p, fbs[ru.slice_index].get_prime(ru.hint));
-        // WHERE_AM_I_UPDATE(w, h, ru);
-        lower_update_t u_low(ru.x & maskB, ru);
-        lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
-        BA_out.row_updates[ru.x >> logB].push_back(ru_low);
+    if (bucket_number < BA_in.n_bucket) {
+        for (auto const & ru: BA_in.row_updates[bucket_number]) {
+            WHERE_AM_I_UPDATE(w, i, ru.slice_index);
+            // no slice_offset in logphint either
+            // WHERE_AM_I_UPDATE(w, p, fbs[ru.slice_index].get_prime(ru.hint));
+            // WHERE_AM_I_UPDATE(w, h, ru);
+            lower_update_t u_low(ru.x & maskB, ru);
+            lower_row_update_t ru_low(u_low, ru.slice_index, ru.inc, ru.n);
+            BA_out.row_updates[ru.x >> logB].push_back(ru_low);
+        }
     }
 }
 

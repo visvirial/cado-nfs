@@ -40,7 +40,10 @@ struct lognorm_gpu : public lognorm_smart {
     lognorm_gpu & operator=(lognorm_gpu &&) = delete;
     ~lognorm_gpu() override;
 
-    void fill(unsigned char * S, unsigned int N) const override;
+    /* The device knows nothing of sublattices: under one, this is
+     * lognorm_smart::fill(). */
+    void fill(unsigned char * S, unsigned int N,
+              sublat_runtime_t const & sl) const override;
 
     /* Fill nregions consecutive bucket regions in one go. This is the
      * call that actually makes the device worth using; fill() above is

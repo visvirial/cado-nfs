@@ -85,8 +85,13 @@ void lognorm_gpu::build_plan()
     plan.nsegments = int(segments.size());
 }
 
-void lognorm_gpu::fill(unsigned char * S, unsigned int N) const
+void lognorm_gpu::fill(unsigned char * S, unsigned int N,
+                       sublat_runtime_t const & sl) const
 {
+    if (sl.m != 1) {
+        lognorm_smart::fill(S, N, sl);
+        return;
+    }
     fill_many(S, N, 1);
 }
 
@@ -96,7 +101,8 @@ void lognorm_gpu::fill_many(unsigned char * S, unsigned int N0,
     if (!task) {
         /* No backend selected: behave exactly like our base class. */
         for (unsigned int r = 0; r < nregions; r++)
-            lognorm_smart::fill(S + (size_t(r) << LOG_BUCKET_REGION), N0 + r);
+            lognorm_smart::fill(S + (size_t(r) << LOG_BUCKET_REGION), N0 + r,
+                                sublat_runtime_t::no_sublat());
         return;
     }
     eng->norm_fill(task, S, N0, nregions);

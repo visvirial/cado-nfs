@@ -705,13 +705,18 @@ set(test_spmv_prime_p3_alltests YES)
 
 macro(create_test_spmv test_spmv_base)
     if(HAVE_PERL_DIGEST_MD5)
-        if (test_spmv_base MATCHES "^prime")
-            set(deps bwc_matmul_gf2)
-        else()
+        # A macro argument is not a variable, so a bare test_spmv_base in
+        # if() compares the literal string and never matches.
+        if ("${test_spmv_base}" MATCHES "^prime")
             set(deps bwc_matmul_gfp)
+        else()
+            set(deps bwc_matmul_gf2)
         endif()
+        # The test_spmv_*_alltests variables spell the base with
+        # underscores, the bases we are called with have a dash.
+        string(MAKE_C_IDENTIFIER "${test_spmv_base}" test_spmv_base_id)
         set(mpiconfs)
-        if(${test_spmv_${test_spmv_base}_alltests})
+        if(${test_spmv_${test_spmv_base_id}_alltests})
             set(mpiconfs mpi_rect1 mpi_rect2 mpi_square1 mpi_square2)
         endif()
         if (NOT HAVE_MPI OR CMAKE_VERSION VERSION_LESS 3.9)
@@ -746,7 +751,7 @@ macro(create_test_spmv test_spmv_base)
 
 
             cado_divert_test(test_spmv_${test_spmv_base}${suffix} 11 APPEND_ARGUMENTS thr=1x1)
-            if(${test_spmv_${test_spmv_base}_alltests})
+            if(${test_spmv_${test_spmv_base_id}_alltests})
                 if(DEFINED ENV{CHECKS_EXPENSIVE})
                     cado_divert_test(test_spmv_${test_spmv_base}${suffix}
                         12
@@ -806,15 +811,43 @@ foreach(mpiconf nompi ${mpiconfs})
 endforeach()
 
 
+# arith_generic::instance() only falls back to the variable-width layer
+# when no fixed-width backend serves the requested width. A test that
+# means to exercise bz must therefore ask for a width that is not
+# compiled in, or it silently tests a fixed-width backend instead.
+set(gf2_compiled_layers)
+foreach(arith_layer ${BWC_GF2_ARITHMETIC_BACKENDS})
+    parse_arith_layer(${arith_layer} dummy)
+    list(APPEND gf2_compiled_layers ${canonical_arith_layer})
+endforeach()
+# Take the first multiple of 64 that no fixed-width backend serves. The
+# search is not restricted to powers of two, and has no upper bound: any
+# set of compiled backends is finite, so it terminates.
+set(bwc_variable_width 64)
+set(bwc_variable_multiplex 1)
+while("b${bwc_variable_width}" IN_LIST gf2_compiled_layers)
+    math(EXPR bwc_variable_multiplex "${bwc_variable_multiplex} + 1")
+    math(EXPR bwc_variable_width "64 * ${bwc_variable_multiplex}")
+endwhile()
+if(NOT "bz" IN_LIST gf2_compiled_layers)
+    set(bwc_variable_width)
+endif()
+
 foreach(arith_layer ${BWC_GF2_ARITHMETIC_BACKENDS})
     parse_arith_layer(${arith_layer} dummy)
     set(arith_layer ${canonical_arith_layer})
 
     string(JOIN " " mm_backends ${BWC_GF2_MATMUL_BACKENDS})
 
+    set(extra)
+    if(arith_layer STREQUAL "bz" AND bwc_variable_width)
+        set(extra --width ${bwc_variable_width})
+    endif()
+
     create_test_spmv(binary-${arith_layer}
         --backends "${mm_backends}"
         --arith-layer ${arith_layer}
+        ${extra}
         TIMEOUT 40)
 endforeach()
 
@@ -843,8 +876,12 @@ cado_define_test(TEST_NAME spmv_bucket_30075
 
 #########################################################################
 
+set(extra)
+if(bwc_variable_width)
+    set(extra --variable-width ${bwc_variable_width})
+endif()
 cado_define_test(SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-matcache.sh
-    --matrix-size 1000 --density 10
+    --matrix-size 1000 --density 10 ${extra}
     TARGET_DEPENDENCIES
     random_matrix build_matcache
     bench_matcache

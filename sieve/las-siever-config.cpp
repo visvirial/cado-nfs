@@ -95,8 +95,7 @@ bool siever_config::parse_default(siever_config & sc, cxx_param_list & pl, int n
         if (pl.has("A")) {
             complete &= pl.parse("A", sc.logA);
             if (pl.has("I")) {
-                fprintf(stderr, "# -A and -I are incompatible\n");
-                exit(EXIT_FAILURE);
+                throw cado::error("# -A and -I are incompatible");
             }
         } else if (pl.has("I")) {
             int I;
@@ -123,8 +122,7 @@ bool siever_config::parse_default(siever_config & sc, cxx_param_list & pl, int n
     for(auto const & s : sc.sides) {
         if (s.lim > 4294967295UL)
         {
-            fprintf (stderr, "Error, lim0/lim1 must be < 2^32\n");
-            exit (EXIT_FAILURE);
+            throw cado::error("Error, lim0/lim1 must be < 2^32");
         }
     }
 #endif
@@ -134,18 +132,18 @@ bool siever_config::parse_default(siever_config & sc, cxx_param_list & pl, int n
 
     }
 
-    // Sublattices?
-    sc.sublat_bound = 0; // no sublattices by default.
+    // Sublattices? The default is to have none (i.e., sublat_bound == 1)
     pl.parse("sublat", sc.sublat_bound);
 
     /* Parse optional siever configuration parameters */
-    pl.parse("tdthresh", (sc.td_thresh));
-    pl.parse("skipped", (sc.skipped));
+    pl.parse("tdthresh", sc.td_thresh);
+    pl.parse("skipped", sc.skipped);
 
-    if (pl.parse("unsievethresh", (sc.unsieve_thresh))) {
+    if (pl.parse("unsievethresh", sc.unsieve_thresh)) {
         verbose_fmt_print(0, 1, "# Un-sieving primes > {}\n",
                 sc.unsieve_thresh);
     }
+
 
     // XXX note that when the sieving range size varies with the
     // special-q, we need to accept that the bucket threshold varies,
@@ -195,10 +193,6 @@ bool siever_config::parse_default(siever_config & sc, cxx_param_list & pl, int n
  * our mind on using.
  *
  * XXX NOTE XXX : the scale field is set to 0 by this function.
- *
- * XXX NOTE XXX : the nr_workspaces field is set to 0 by this function,
- * because the caller is expected to set that instead.
- *
  *
  */
 fb_factorbase::key_type siever_config::instantiate_thresholds(int side) const
@@ -333,10 +327,9 @@ void siever_config_pool::parse_hints_file(const char * filename)/*{{{*/
     FILE * f;
     f = fopen(filename, "r");
     if (f == nullptr) {
-        fprintf(stderr, "%s: %s\n", filename, strerror(errno));
         /* There's no point in proceeding, since it would really change
          * the behaviour of the program to do so */
-        exit(1);
+        throw cado::error("{}: {}", filename, strerror(errno));
     }
     for(;;) {
         char * x = fgets(line, sizeof(line), f);
@@ -366,8 +359,7 @@ void siever_config_pool::parse_hints_file(const char * filename)/*{{{*/
                 ASSERT_ALWAYS(side < 2);
                 break;
             default:
-                fprintf(stderr, "%s: parse error at %s\n", filename, line);
-                exit(1);
+                throw cado::error("{}: parse error at {}", filename, line);
         }
         for( ; *x && isspace(*x) ; x++) ;
         t = strtod(x, &x); ASSERT_ALWAYS(t >= 0);
@@ -384,8 +376,7 @@ void siever_config_pool::parse_hints_file(const char * filename)/*{{{*/
         } else if (letter == 'A') {
             sc.logA = z;
         } else {
-            fprintf(stderr, "%s: parse error (want I= or A=) at %s\n", filename, line);
-            exit(EXIT_FAILURE);
+            throw cado::error("{}: parse error (want I= or A=) at {}", filename, line);
         }
         
         for(auto & S : sc.sides) {
@@ -422,8 +413,8 @@ void siever_config_pool::parse_hints_file(const char * filename)/*{{{*/
             if (*x == '#')
                 break;
             if (!isspace(*x)) {
-                fprintf(stderr, "Error: found leftover data in hint file while reading line %d@%d (note that the polynomial file has %zu sides). Leftover text is %s\n", bitsize, side, sc.sides.size(), x);
-                exit(EXIT_FAILURE);
+                throw cado::error("Error: found leftover data in hint file while reading line {}@{} (note that the polynomial file has {} sides). Leftover text is {}",
+                        bitsize, side, sc.sides.size(), x);
             }
         }
 
@@ -431,9 +422,7 @@ void siever_config_pool::parse_hints_file(const char * filename)/*{{{*/
         key_type const K(side, bitsize);
 
         if (hints.find(K) != hints.end()) {
-            fprintf(stderr, "Error: two hints found for %d@%d\n",
-                    bitsize, side);
-            exit(EXIT_FAILURE);
+            throw cado::error("Error: two hints found for {}@{}", bitsize, side);
         }
 
         hints[K] = h;
@@ -470,9 +459,7 @@ siever_config_pool::siever_config_pool(
         }
         if (!filename) {
             if (!default_config_ptr) {
-                fprintf(stderr,
-                        "Error: no default config set, and no hint table either\n");
-                exit(EXIT_FAILURE);
+                throw cado::error("Error: no default config set, and no hint table either");
             }
             return;
         }
@@ -486,20 +473,18 @@ siever_config_pool::siever_config_pool(
          * config!
          */
         if (base.logA < LOG_BUCKET_REGION) {
-            fprintf(stderr, "Error: I=%d (or A=%d) is incompatible with LOG_BUCKET_REGION=%d. Try -B %d\n",
+            throw cado::error("Error: I={} (or A={}) is incompatible with LOG_BUCKET_REGION={}. Try -B {}",
                     (base.logA + 1) / 2, base.logA, LOG_BUCKET_REGION,
                     base.logA);
-            exit(EXIT_FAILURE);
         }
     }
 
     for(auto const & kh : hints) {
         siever_config const & sc(kh.second);
         if (sc.logA < LOG_BUCKET_REGION) {
-            fprintf(stderr, "Error: I=%d (or A=%d) is incompatible with LOG_BUCKET_REGION=%d. Try -B %d\n",
+            throw cado::error("Error: I={} (or A={}) is incompatible with LOG_BUCKET_REGION={}. Try -B {}",
                     (sc.logA + 1) / 2, sc.logA, LOG_BUCKET_REGION,
                     sc.logA);
-            exit(EXIT_FAILURE);
         }
     }
 }/*}}}*/

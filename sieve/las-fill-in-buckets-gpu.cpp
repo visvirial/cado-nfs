@@ -340,7 +340,7 @@ bool las_gpu_fib_usable_for(siever_config const & conf MAYBE_UNUSED,
 #else
     if (!las_gpu::stage_enabled(las_gpu::STAGE_BUCKETS))
         return false;
-    if (Q.sublat.m || conf.sublat_bound)
+    if (Q.sublat.m > 1 || conf.sublat_bound > 1)
         return false;
     /* The kernel filters the primes dividing the special-q against a
      * small fixed-size list, like Q.is_coprime_to() does. A q with more
@@ -371,12 +371,16 @@ bool las_gpu_fib_usable(nfs_work const & ws, qlattice_basis const & Q)
  * device busy, little enough that the three in flight per side -- one
  * being processed, one waited for, one being computed -- fit beside the
  * factor base on the device. They are a power of two of at least
- * FIB_CHUNK_MIN buckets, which is the size of the batches in which
- * process_many_bucket_regions() works, so that a batch never straddles
- * two chunks.
+ * fib_chunk_min() buckets, a multiple of the batches in which
+ * process_many_bucket_regions() works at toplevel 1 -- 1 <<
+ * LOG_BUCKET_REGION_step regions -- so that a batch never straddles two
+ * chunks.
  */
 static constexpr double FIB_CHUNK_TARGET = double(UINT64_C(1) << 26);
-static constexpr uint32_t FIB_CHUNK_MIN = SMALL_SIEVE_START_POSITIONS_MAX_ADVANCE;
+static uint32_t fib_chunk_min()
+{
+    return std::max(UINT32_C(1024), UINT32_C(1) << LOG_BUCKET_REGION_step);
+}
 
 /* Buckets per chunk, or 0 when the device path cannot take this area at
  * all. nb is a power of two, as las makes it.
@@ -398,7 +402,7 @@ static uint32_t chunk_buckets(double weight, int logI, uint32_t J,
         return per_bucket * double(std::min<uint64_t>(K, used));
     };
     uint32_t K = nb;
-    while (K > FIB_CHUNK_MIN && !(K & 1) &&
+    while (K > fib_chunk_min() && !(K & 1) &&
             (expected(K) > FIB_CHUNK_TARGET ||
              uint64_t(K) * nslices >= (UINT64_C(1) << 24)))
         K /= 2;

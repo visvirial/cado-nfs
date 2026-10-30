@@ -30,8 +30,6 @@
 #include <utility>
 #include <vector>
 
-#include <dirent.h>
-
 #include <gmp.h>
 #include "fmt/base.h"
 #include "fmt/format.h"
@@ -53,6 +51,7 @@
 #include "las-config.hpp"
 #include "las-divide-primes.hpp"
 #include "las-dlog-base.hpp"
+#include "las-downsort.hpp"
 #include "las-duplicate.hpp"
 #include "las-fill-in-buckets-gpu.hpp"
 #include "las-fill-in-buckets.hpp"
@@ -65,12 +64,10 @@
 #include "las-parallel.hpp"
 #include "las-plattice.hpp"
 #include "las-process-bucket-region.hpp"
-#include "las-qlattice.hpp"
 #include "las-report-stats.hpp"
 #include "las-side-config.hpp"
 #include "las-sieve-shared-data.hpp"
 #include "las-siever-config.hpp"
-#include "las-smallsieve.hpp"
 #include "las-special-q-task-collection.hpp"
 #include "las-special-q-task.hpp"
 #include "las-threads-work-data.hpp"
@@ -91,6 +88,7 @@
 #include "threadpool.hpp"
 #include "timing.h"
 #include "utils_cxx.hpp"
+#include "cado_main.hpp"
 #include "verbose.hpp"
 
 #ifdef SIQS_SIEVE
@@ -105,6 +103,8 @@ static void configure_aliases(cxx_param_list & pl)
 {
     pl.configure_alias("log-bucket-region", "B");
     pl.configure_alias("log-bucket-region-step", "Bi");
+    pl.configure_alias("bucket-batch-size", "bbs");
+    pl.configure_alias("nr-workspaces", "nw");
     las_output::configure_aliases(pl);
     tdict::configure_aliases(pl);
 }
@@ -312,8 +312,6 @@ static size_t expected_memory_usage_per_subjob(siever_config const & sc,/*{{{*/
     bkmult_specifier const bkmult =
         hypothetical_bkmult ? *hypothetical_bkmult : las.get_bk_multiplier();
 
-    /* FIXME: I think that this code misses the case of sublat. */
-
     /* sc.instantiate_thresholds() depends on sc.logI */
     std::vector<fb_factorbase::key_type> K;
 
@@ -324,6 +322,8 @@ static size_t expected_memory_usage_per_subjob(siever_config const & sc,/*{{{*/
 
     size_t memory = 0;
     size_t more;
+
+    bool const with_sublat = sc.sublat_bound > 1;
 
 #if 0 && defined(__linux__) && defined(HAVE_GLIBC) && defined(__x86_64__)
     /* count threads. Each costs 8M+4k for the stack, 64MB for the
@@ -356,7 +356,7 @@ static size_t expected_memory_usage_per_subjob(siever_config const & sc,/*{{{*/
     ASSERT_ALWAYS(1 <= toplevel && toplevel <= MAX_TOPLEVEL);
     */
 
-    int const nba = NUMBER_OF_BAS_FOR_THREADS(nthreads);
+    int const nba = nfs_work::number_of_bas_for_threads(nthreads, las.nr_workspaces);
 
     std::array<double, MAX_TOPLEVEL + 1> ms, ss;
     std::array<round_me, MAX_TOPLEVEL + 1> rs;
@@ -498,8 +498,12 @@ static size_t expected_memory_usage_per_subjob(siever_config const & sc,/*{{{*/
                 iceildiv(size_t(1) << sc.logA, BUCKET_REGIONS[fib_level])
                 : (size_t(1) << (LOG_BUCKET_REGIONS[fib_level + 1] - LOG_BUCKET_REGIONS[fib_level]));
             size_t nup_per_reg = 0.25 * w * BUCKET_REGIONS[fib_level] / nba;
-            /* assume LOG_BUCKET_REGIONS[fib_level] > logI */
-            nup_per_reg *= 3;
+            /* The plain siever skips the positions where i and j are
+             * both even, so that only 3/4 of the positions receive
+             * updates. Under sublattices, all of them do (see
+             * bucket_array_t::allocate_memory).
+             */
+            nup_per_reg *= with_sublat ? 4 : 3;
             nup_per_reg += NB_DEVIATIONS_BUCKET_REGIONS * sqrt(nup_per_reg);
             size_t const nupdates = nup_per_reg * nreg * nba;
             {
@@ -518,6 +522,19 @@ static size_t expected_memory_usage_per_subjob(siever_config const & sc,/*{{{*/
                         fib_level,
                         side, nprimes,
                         size_disp(more = nprimes * sizeof(plattice_enumerator)));
+                memory += more;
+            } else if (with_sublat) {
+                /* The Franke-Kleinjung bases of the toplevel primes are
+                 * computed for the first sublattice, and kept for the
+                 * other ones.
+                 */
+                verbose_fmt_print(0, 3 + hush,
+                        "# level {}, side {}: {} primes => dense plattices"
+                        " kept across sublattices: {}\n",
+                        fib_level,
+                        side, nprimes,
+                        size_disp(more = nprimes * sizeof(plattice_info_dense_t)));
+                memory += more;
             }
             {
                 /* Count the slice_start pointers as well. We need to know
@@ -551,8 +568,10 @@ static size_t expected_memory_usage_per_subjob(siever_config const & sc,/*{{{*/
             for(int level = fib_level - 1 ; level >= 1 ; level--) {
                 {
                     // how many downsorted updates are alive at a given point in
-                    // time ?
-                    size_t const nupdates_D = nupdates >> 8;
+                    // time ? Those of one bucket of the level above.
+                    size_t const nreg_above = iceildiv(size_t(1) << sc.logA,
+                            BUCKET_REGIONS[level + 1]);
+                    size_t const nupdates_D = iceildiv(nupdates, nreg_above);
                     verbose_fmt_print(0, 3 + hush,
                             "# level {}, side {}:"
                             " {} downsorted {}-updates [{}l]: {}\n",
@@ -696,12 +715,10 @@ static void check_whether_q_above_large_prime_bound(siever_config const & conf, 
                     (int) mpz_sizeinbase(doing.p, 2),
                     doing.side,
                     conf.sides[doing.side].lpb);
-            fmt::print(stderr, "       You can disable this check with "
-                    "the -allow-largesq argument,\n");
-            fmt::print(stderr, "       It is for instance useful for the "
-                    "descent.\n");
-            fmt::print(stderr, "       Use tasks.sieve.allow_largesq=true.\n");
-            exit(EXIT_FAILURE);
+            throw cado::error("       You can disable this check with"
+                    " the -allow-largesq argument,\n"
+                    "       It is for instance useful for the descent.\n"
+                    "       Use tasks.sieve.allow_largesq=true.");
         }
     } else for (auto const & f: doing.prime_factors) {
         if ((unsigned int) nbits(f) > conf.sides[doing.side].lpb) {
@@ -712,12 +729,10 @@ static void check_whether_q_above_large_prime_bound(siever_config const & conf, 
                     f, nbits(f),
                     doing.side,
                     conf.sides[doing.side].lpb);
-            fmt::print(stderr, "       You can disable this check with "
-                    "the -allow-largesq argument,\n");
-            fmt::print(stderr, "       It is for instance useful for the "
-                    "descent.\n");
-            fmt::print(stderr, "       Use tasks.sieve.allow_largesq=true.\n");
-            exit(EXIT_FAILURE);
+            throw cado::error("       You can disable this check with"
+                    " the -allow-largesq argument,\n"
+                    "       It is for instance useful for the descent.\n"
+                    "       Use tasks.sieve.allow_largesq=true.");
         }
     }
 }
@@ -811,7 +826,7 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
             nfs_work::side_data  const& wss(ws.sides[side]);
             if (wss.no_fb()) continue;
 
-            fill_in_buckets_toplevel_multiplex(ws, aux, Q, pool, side, w);
+            fill_in_buckets_toplevel_entry(ws, aux, Q, pool, side, w);
 
             fill_in_buckets_prepare_plattices(ws, Q, pool, side, precomp_plattices[side]);
 
@@ -853,21 +868,8 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
                                 wss.lognorms.scale);
 
                         wss.ssd->small_sieve_info("small sieve", side);
-                    });
 
-            if (ws.toplevel == 1) {
-                /* when ws.toplevel > 1, this start_many call
-                 * is done several times.
-                 */
-                sss_tg.on_complete([&ws, &Q, side, &pool, &sss_tg]() {
-                        nfs_work::side_data & wss(ws.sides[side]);
-                        wss.ssd->small_sieve_prepare_many_start_positions(
-                                pool, &sss_tg,
-                                0,
-                                std::min(SMALL_SIEVE_START_POSITIONS_MAX_ADVANCE, ws.nb_buckets[1]),
-                                ws.conf.logI, Q.sublat);
-                        });
-            }
+                    });
         }
 
         /* Note: we haven't done any downsorting yet ! */
@@ -876,10 +878,9 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
             if (wss.no_fb()) continue;
             auto & sss_tg(sss_tgs[side]);
             sss_tg.wait();
-            if (ws.toplevel == 1)
-                wss.ssd->small_sieve_activate_many_start_positions();
         }
-            
+
+
         pool.drain_queue(thread_pool::QUEUE_GENERIC);
 
         ws.check_buckets_max_full_toplevel(ws.toplevel);
@@ -901,62 +902,25 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
     {
         CHILD_TIMER(timer_special_q, "process_bucket_region outer container");
         TIMER_CATEGORY(timer_special_q, sieving_mixed());
-        if (ws.toplevel == 1) {
-            /* Process bucket regions in parallel */
 #ifndef SIQS_SIEVE
-            /* When the device fills the buckets of a large area, it
-             * does so in chunks, which have to be moved along. */
-            bool const gpu = std::ranges::any_of(ws.sides,
-                    [](auto const & wss) { return wss.gpu_fib_weight > 0; });
-            std::function<bool(int)> advance;
-            if (gpu) {
-                advance = [&ws, &pool](int region) {
-                    return las_gpu_fib_advance(ws, pool, region);
-                };
-            }
-            process_many_bucket_regions(ws, wc_p, aux_p, Q, pool, 0, w,
-                    advance);
-#else
-            process_many_bucket_regions(ws, wc_p, aux_p, Q, pool, 0, w);
-#endif
-        } else {
-            // Prepare plattices at internal levels
-
-            // Visit the downsorting tree depth-first.
-            // If toplevel = 1, then this is just processing all bucket
-            // regions.
-            size_t  const(&BRS)[FB_MAX_PARTS] = BUCKET_REGIONS;
-            static_assert(MAX_TOPLEVEL == 3);
-            for (int i = 0; i < ws.nb_buckets[ws.toplevel]; i++) {
-                if (ws.task->must_take_decision())
-                    break;
-                /* Dividing by BRS[1] is actually correct if we want to
-                 * fill the first_region0_index parameter. Of course we
-                 * must make sure that for the recursive downsort, this
-                 * doesn't entail an extra multiplication (e.g. by
-                 * BRS[2]/BRS[1]. XXX we must check this!
-                 */
-                switch (ws.toplevel) {
-#if MAX_TOPLEVEL >= 2
-                    case 2:
-                        downsort_tree<1>(ws, wc_p, aux_p, Q, pool,
-                                i, i*BRS[2]/BRS[1],
-                                precomp_plattices, w);
-                        break;
-#endif
-
-#if MAX_TOPLEVEL >= 3
-                    case 3:
-                        downsort_tree<2>(ws, wc_p, aux_p, Q, pool, i,
-                                i*BRS[3]/BRS[1],
-                                precomp_plattices, w);
-                        break;
-#endif
-                    default:
-                        ASSERT_ALWAYS(0);
-                }
-            }
+        /* When the device fills the buckets of a large area, it does so
+         * in chunks, which have to be moved along. */
+        bool const gpu = std::ranges::any_of(ws.sides,
+                [](auto const & wss) { return wss.gpu_fib_weight > 0; });
+        std::function<bool(int)> advance;
+        if (gpu) {
+            advance = [&ws, &pool](int region) {
+                return las_gpu_fib_advance(ws, pool, region);
+            };
         }
+#else
+        std::function<bool(int)> const advance;
+#endif
+        /* if ws.toplevel == 1, this will simplify to calling
+         * process_many_bucket_regions.
+         */
+        downsort_toplevel(ws, wc_p, aux_p, Q, pool, precomp_plattices, w,
+                advance);
     }
 
     BOOKKEEPING_TIMER(timer_special_q);
@@ -1069,23 +1033,11 @@ do_one_special_q(
         }
     }
 
-    unsigned int sublat_bound = Q.sublat.m;
-    if (sublat_bound == 0)
-        sublat_bound = 1;
-
-    for (unsigned int i_cong = 0; i_cong < sublat_bound; ++i_cong) {
-        for (unsigned int j_cong = 0; j_cong < sublat_bound; ++j_cong) {
-            if (Q.sublat.m) {
-                if (i_cong == 0 && j_cong == 0)
-                    continue;
-                Q.sublat.i0 = i_cong;
-                Q.sublat.j0 = j_cong;
-                verbose_fmt_print(0, 1,
-                        "# Sublattice (i,j) == ({}, {}) mod {}\n",
-                        Q.sublat.i0, Q.sublat.j0, Q.sublat.m);
-            }
-            do_one_special_q_sublat(ws, wc_p, aux_p, Q, pool, look_ahead);
-        }
+    for (auto const & ij: Q.sublat.sublattices()) {
+        Q.sublat = ij;
+        if (Q.sublat.m > 1)
+            verbose_fmt_print(0, 1, "# Sublattice {}\n", Q.sublat);
+        do_one_special_q_sublat(ws, wc_p, aux_p, Q, pool, look_ahead);
     }
 
     /* It's better than before, but still. We're going to keep this data
@@ -1534,8 +1486,7 @@ static void quick_subjob_loop_using_cache(las_info & las)/*{{{*/
             std::istringstream is(line);
             relation rel;
             if (!(is >> rel)) {
-                fmt::print(stderr, "# parse error in relation\n");
-                exit(EXIT_FAILURE);
+                throw cado::error("# parse error in relation");
             }
             if (!sq_finds_relation(las, doing, conf, Q, J, rel))
                 continue;
@@ -1566,8 +1517,15 @@ static void quick_subjob_loop_using_cache(las_info & las)/*{{{*/
 
 }/*}}}*/
 
+static int las_main (int argc0, char const * argv0[]);
+
 // coverity[root_function]
-int main (int argc0, char const * argv0[])/*{{{*/
+int main (int argc0, char const * argv0[])
+{
+    return cado::main_wrapper(las_main, argc0, argv0);
+}
+
+static int las_main (int argc0, char const * argv0[])/*{{{*/
 {
     double t0, wct;
     int argc = argc0;
@@ -1593,9 +1551,7 @@ int main (int argc0, char const * argv0[])/*{{{*/
             argv++,argc--;
             continue;
         }
-        fmt::print(stderr, "Unhandled parameter {}\n", argv[0]);
-        pl.print_usage(stderr);
-        exit(EXIT_FAILURE);
+        pl.fail("Unhandled parameter {}", argv[0]);
     }
 
     pl.parse("-allow-largesq", allow_largesq);

@@ -5,7 +5,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <exception>
 #include <fstream>
+#include <string>
 
 #include "fmt/base.h"
 
@@ -17,6 +19,7 @@
 #include "macros.h"
 #include "params.hpp"
 #include "tab_decomp.hpp"
+#include "cado_main.hpp"
 #include "tab_fm.hpp"
 #include "tab_strategy.hpp"
 
@@ -81,8 +84,7 @@ static void declare_usage(cxx_param_list & pl)
 /*     MAIN                                                             */
 /************************************************************************/
 
-// coverity[root_function]
-int main(int argc, char const * argv[])
+static int gst(int argc, char const * argv[])
 {
     cxx_param_list pl;
     declare_usage(pl);
@@ -279,6 +281,25 @@ int main(int argc, char const * argv[])
             tabular_fm_concat(data_pp1, data_pp1_27);
             tabular_fm_concat(data_pp1, data_pp1_65);
 
+            /* The code below indexes tab[0] of each of these tables, and
+             * later on feeds them to the convex hull computation. A
+             * family that the input file does not mention at all is a
+             * user error, not something we can paper over. */
+            struct {
+                tabular_fm_t const * data;
+                char const * name;
+            } const families[] = {
+                {data_pm1, "PM1"},
+                {data_pp1, "PP1-27 or PP1-65"},
+                {data_ecm_b12, "ECM-B12"},
+                {data_ecm_m12, "ECM-M12"},
+                {data_ecm_m16, "ECM-M16"},
+            };
+            for (auto const & f : families)
+                if (f.data->size == 0)
+                    pl.fail("Error: file {} contains no {} method\n",
+                            name_file_in, f.name);
+
             // add zero method if doesn't exist!
             fm_t * zero = fm_create();
             unsigned long method_zero[4] = {0, 0, 0, 0};
@@ -347,9 +368,9 @@ int main(int argc, char const * argv[])
                 // Check parameters
 
                 if (lim0 == 0 || lpb0 == -1 || mfb0 == -1 || lim1 == 0 ||
-                    lpb1 == -1 || mfb1 == -1 || ncurves)
+                    lpb1 == -1 || mfb1 == -1 || ncurves == -1)
                     pl.fail("Error: parameters -lim0 -lpb0 -mfb0"
-                            " -lim1 -lpb1 -mfb1 are mandatories\n");
+                            " -lim1 -lpb1 -mfb1 -ncurves are mandatories\n");
                 /*
                   computes the matrix of strategies where for each couple
                   (r0, r1) we will optain the best strategies to find a
@@ -396,4 +417,16 @@ int main(int argc, char const * argv[])
         }
     }
     return EXIT_SUCCESS;
+}
+
+/* Bad parameters and bad input files are reported by an exception;
+ * cado::main_wrapper is what turns it into a message on stderr and a
+ * nonzero exit status, rather than whatever the C++ runtime prints
+ * before it aborts -- which differs between libstdc++ and libc++, and
+ * can be nothing at all.
+ */
+// coverity[root_function]
+int main(int argc, char const * argv[])
+{
+    return cado::main_wrapper(gst, argc, argv);
 }

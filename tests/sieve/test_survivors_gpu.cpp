@@ -54,7 +54,7 @@ std::vector<uint32_t> reference_search(unsigned char * S0, unsigned char * S1,
                                        j_divisibility_helper const & jd,
                                        unsigned int td_max,
                                        unsieve_data const & us,
-                                       sublat_t sublat)
+                                       sublat_runtime_t sublat)
 {
     std::vector<uint32_t> sv;
 
@@ -98,7 +98,7 @@ void one_case(gpu_engine * eng, gpu_survivor_task * task,
               j_divisibility_helper const & jd, unsieve_data const & us,
               int logI, int logA, unsigned int N, int nsides, int drop_side,
               unsigned char b0, unsigned char b1, unsigned int td_max,
-              sublat_t sublat, uint64_t seed)
+              sublat_runtime_t sublat, uint64_t seed)
 {
     size_t const region_size = size_t(1) << LOG_BUCKET_REGION;
 
@@ -137,7 +137,8 @@ void one_case(gpu_engine * eng, gpu_survivor_task * task,
     R.bound[1] = b1;
     R.logI = logI;
     R.td_max = td_max;
-    R.sublat_m = sublat.m;
+    /* the kernel's "no sublattice" is m == 0 */
+    R.sublat_m = sublat.m == 1 ? 0 : sublat.m;
     R.sublat_i0 = sublat.i0;
     R.sublat_j0 = sublat.j0;
     {
@@ -267,14 +268,11 @@ int main(int argc, char const * argv[])
 
             for (int nsides = 2; nsides >= 1; nsides--) {
                 for (int drop = 0; drop < (nsides == 1 ? 2 : 1); drop++) {
-                    sublat_t const nosub { 0, 0, 0 };
+                    /* No sublattices: las does not offload the survivor
+                     * search under them (see search_survivors()). */
                     one_case(eng, task, jd, us, logI, logA, N, nsides, drop,
-                             b0, b1, td_max, nosub,
+                             b0, b1, td_max, sublat_runtime_t(),
                              seed + uint64_t(nb_cases));
-                    nb_cases++;
-                    sublat_t const sub { 6, pick.below(6), pick.below(6) };
-                    one_case(eng, task, jd, us, logI, logA, N, nsides, drop,
-                             b0, b1, td_max, sub, seed + uint64_t(nb_cases));
                     nb_cases++;
                 }
             }

@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <exception>
+#include <iostream>
 #include <string>
 #include <vector>
 
@@ -20,6 +22,7 @@
 #include "typedefs.h"
 #include "verbose.hpp"
 #include "utils_cxx.hpp"
+#include "cado_main.hpp"
 
 static void declare_usage(cxx_param_list & pl)
 {
@@ -159,8 +162,7 @@ static void bench_random_lookups(renumber_t const & tab)
     gmp_randclear(rstate);
 }
 
-// coverity[root_function]
-int main(int argc, char const * argv[])
+static int debug_renumber(int argc, char const * argv[])
 {
     int check = 0;
     int build = 0;
@@ -202,8 +204,7 @@ int main(int argc, char const * argv[])
         pl.fail("Error, --lpbs is only valid with --build\n");
 
     if (!cpoly.read(polyfilename)) {
-        fprintf(stderr, "Error reading polynomial file\n");
-        exit(EXIT_FAILURE);
+        throw cado::error("Error reading polynomial file");
     }
 
     renumber_t tab(cpoly);
@@ -256,4 +257,15 @@ int main(int argc, char const * argv[])
         bench_random_lookups(tab);
 
     return EXIT_SUCCESS;
+}
+
+/* A corrupt table is reported by an exception. Catching it here is what
+ * makes the complaint land on stderr in a form we control, rather than
+ * as whatever the C++ runtime prints before it aborts -- which differs
+ * between libstdc++ and libc++, and can be nothing at all.
+ */
+// coverity[root_function]
+int main(int argc, char const * argv[])
+{
+    return cado::main_wrapper(debug_renumber, argc, argv);
 }

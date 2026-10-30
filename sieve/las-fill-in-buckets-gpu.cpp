@@ -309,6 +309,21 @@ bool las_gpu_fib_usable(nfs_work const & ws, qlattice_basis const & Q)
     return ws.toplevel == 1 && las_gpu_fib_usable_for(ws.conf, Q);
 }
 
+double las_gpu_fib_weight(nfs_work const & ws, int side,
+                          qlattice_basis const & Q)
+{
+    nfs_work::side_data const & wss(ws.sides[side]);
+    if (wss.no_fb() || !las_gpu_fib_usable(ws, Q))
+        return 0;
+    double w = 0;
+    wss.fbs->get_part(1).foreach_slice([&](auto const & sl) {
+        using entry_t = typename std::decay_t<decltype(sl)>::entry_t;
+        if constexpr (las_gpu_fib_takes_slice<entry_t>())
+            w += sl.get_weight();
+    });
+    return w;
+}
+
 /* One device pass. It outlives the special-q's bucket filling: the
  * bucket arrays point into its output, so it is held by the side data
  * until the next special-q's pass replaces it. */

@@ -256,7 +256,13 @@ struct cuda_fib_scratch {
     /* Page-locked mirrors, so that every copy can be queued. The
      * bucket arrays point straight into h_updates rather than getting
      * a copy, which is why a pass keeps its scratch until it is
-     * released. */
+     * released.
+     *
+     * h_updates, by far the largest, is not owned by the scratch: it is
+     * taken from the engine's pool by fib_wait and given back by
+     * fib_release. A pass that has been launched but not waited for --
+     * one prefetched for the next special-q -- therefore holds none,
+     * which halves the page-locked memory las needs. */
     uint32_t * h_counts = nullptr;
     uint32_t * h_offsets = nullptr;
     gpu_fib_update * h_updates = nullptr;
@@ -567,6 +573,62 @@ struct cuda_engine : public gpu_engine {
     std::vector<cuda_fib_scratch *> fib_free;
     std::vector<cuda_fib_scratch *> fib_all;
 
+    /* page-locked landing zones for the updates, see cuda_fib_scratch */
+    struct host_buffer {
+        gpu_fib_update * p;
+        uint32_t capacity;
+    };
+    std::vector<host_buffer> fib_host_free;
+
+    void fib_host_take(cuda_fib_scratch * sc, uint32_t total)
+    {
+        host_buffer hb {nullptr, 0};
+        {
+            std::lock_guard<std::mutex> const lock(fib_mu);
+            /* the smallest that fits, or else the largest, to grow */
+            auto best = fib_host_free.end();
+            for (auto it = fib_host_free.begin(); it != fib_host_free.end(); ++it) {
+                if (best == fib_host_free.end())
+                    best = it;
+                else if (it->capacity >= total &&
+                        (best->capacity < total || it->capacity < best->capacity))
+                    best = it;
+                else if (best->capacity < total && it->capacity > best->capacity)
+                    best = it;
+            }
+            if (best != fib_host_free.end()) {
+                hb = *best;
+                fib_host_free.erase(best);
+            }
+        }
+        if (hb.capacity < total) {
+            /* Grow generously: the high-water mark drifts up over the
+             * first few special-q's and allocating page-locked memory
+             * is not cheap. */
+            cudaFreeHost(hb.p);
+            uint64_t want = uint64_t(total) + total / 4;
+            if (want > UINT32_MAX)
+                want = UINT32_MAX;
+            CUDA_CHECK(cudaHostAlloc(&hb.p,
+                                     size_t(want) * sizeof(gpu_fib_update),
+                                     cudaHostAllocDefault));
+            hb.capacity = uint32_t(want);
+        }
+        sc->h_updates = hb.p;
+        sc->h_updates_capacity = hb.capacity;
+    }
+
+    void fib_host_give(cuda_fib_scratch * sc)
+    {
+        if (!sc->h_updates)
+            return;
+        std::lock_guard<std::mutex> const lock(fib_mu);
+        fib_host_free.push_back(host_buffer {sc->h_updates,
+                                             sc->h_updates_capacity});
+        sc->h_updates = nullptr;
+        sc->h_updates_capacity = 0;
+    }
+
     ~cuda_engine() override
     {
         cudaSetDevice(device);
@@ -587,6 +649,8 @@ struct cuda_engine : public gpu_engine {
                 cudaStreamDestroy(sc->stream);
             delete sc;
         }
+        for (auto const & hb: fib_host_free)
+            cudaFreeHost(hb.p);
     }
 
     cuda_fib_scratch * fib_scratch_take()
@@ -771,14 +835,7 @@ struct cuda_engine : public gpu_engine {
             sc->updates_capacity = uint32_t(want);
             fib_enqueue_scatter(sc, grid);
         }
-        if (total > sc->h_updates_capacity) {
-            cudaFreeHost(sc->h_updates);
-            CUDA_CHECK(cudaHostAlloc(&sc->h_updates,
-                                     size_t(sc->updates_capacity) *
-                                         sizeof(gpu_fib_update),
-                                     cudaHostAllocDefault));
-            sc->h_updates_capacity = sc->updates_capacity;
-        }
+        fib_host_take(sc, total);
 
         if (nhost)
             CUDA_CHECK(cudaMemcpyAsync(sc->h_host_entries, sc->d_host_entries,
@@ -800,6 +857,7 @@ struct cuda_engine : public gpu_engine {
     {
         auto * sc = reinterpret_cast<cuda_fib_scratch *>(pass);
         sc->task = nullptr;
+        fib_host_give(sc);
         std::lock_guard<std::mutex> const lock(fib_mu);
         fib_free.push_back(sc);
     }

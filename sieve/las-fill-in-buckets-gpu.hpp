@@ -43,6 +43,14 @@ constexpr bool las_gpu_fib_takes_slice()
  */
 bool las_gpu_fib_usable(nfs_work const & ws, qlattice_basis const & Q);
 
+/* The weight -- expected updates per sieve cell, the unit of
+ * fb_factorbase::slicing::stats.weight -- of the slices that the device
+ * will take on this side, or 0 if it takes none. The level-1 bucket
+ * arrays need no room for those: the device's updates stay in its own
+ * buffer. */
+double las_gpu_fib_weight(nfs_work const & ws, int side,
+                          qlattice_basis const & Q);
+
 /* The same, for a special-q that is not being sieved yet, as far as it
  * can be told before prepare_for_new_q(). */
 bool las_gpu_fib_usable_for(siever_config const & conf,

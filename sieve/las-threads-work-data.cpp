@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include <algorithm>
+#include <type_traits>
 #include <ostream>
 #include <sstream>
 #include <utility>
@@ -215,11 +216,20 @@ void nfs_work::allocate_buckets(nfs_aux & aux, thread_pool & pool)
 
     for (auto & wss : sides) {
         if (wss.no_fb()) continue;
+        /* The device's updates stay in its own buffer (see
+         * las_gpu_fib_start), so the level-1 arrays only need room for
+         * what the ordinary tasks push. Keep a sliver anyway: the
+         * allocation code is not meant for empty arrays, and the
+         * bucket multiplier takes care of any shortfall. */
+        auto fill_ratio = wss.fbs->stats.weight;
+        if (wss.gpu_fib_weight > 0)
+            fill_ratio[1] = std::max(fill_ratio[1] - wss.gpu_fib_weight,
+                                     fill_ratio[1] / 100);
         wss.group.allocate_buckets(
                 local_memory,
                 nb_buckets,
                 bk_multiplier,
-                wss.fbs->stats.weight,
+                fill_ratio,
                 conf.logI,
                 aux, pool, do_resieve);
     }
@@ -452,6 +462,14 @@ void nfs_work::prepare_for_new_q(las_info & las0, special_q_task * task, typenam
     }
     bk_multiplier = las0.get_bk_multiplier();
     compute_toplevel_and_buckets();
+
+    for(int side = 0 ; side < las.cpoly.nsides() ; side++) {
+        sides[side].gpu_fib_weight = 0;
+#ifndef SIQS_SIEVE
+        if constexpr (std::is_same_v<Algo, NFS>)
+            sides[side].gpu_fib_weight = las_gpu_fib_weight(*this, side, Q);
+#endif
+    }
 
     jd = las0.get_j_divisibility_helper(J);
     us = las0.get_unsieve_data(conf);

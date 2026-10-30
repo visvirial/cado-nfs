@@ -157,6 +157,11 @@ class nfs_work {
          * being sieved yet; see las_gpu_fib_prefetch(). */
         std::shared_ptr<void> gpu_fib_prefetched;
 
+        /* The part of fbs->stats.weight[1] that the device takes for
+         * the current special-q, and that the bucket arrays therefore
+         * need no room for. Set by prepare_for_new_q. */
+        double gpu_fib_weight = 0;
+
         /* fbK depends on
          *      conf.logI
          *      conf.sides[side].lim

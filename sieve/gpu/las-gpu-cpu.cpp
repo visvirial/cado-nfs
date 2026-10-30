@@ -272,8 +272,10 @@ gpu_engine * gpu_engine_cpu_create()
 }
 
 #ifndef HAVE_CUDA
-gpu_engine * gpu_engine_cuda_create(int)
+gpu_engine * gpu_engine_cuda_create(int, bool * out_of_memory)
 {
+    if (out_of_memory)
+        *out_of_memory = false;
     return nullptr;
 }
 bool gpu_engine_cuda_compiled()

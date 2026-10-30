@@ -20,11 +20,15 @@ namespace las_gpu {
  *   "cuda"      first usable CUDA device
  *   "cuda:<n>"  CUDA device number n
  * Throws std::runtime_error on an unknown spec, or when "cuda" or
- * "cuda:<n>" names a device that cannot be used.
+ * "cuda:<n>" names a device that cannot be used. A device that is there
+ * but has no memory free -- other processes hold it -- is not an error:
+ * offloading starts out suspended, and the device is opened once a
+ * suspension runs out and it has memory free (see suspend()).
  */
 void select(std::string const & spec);
 
-/* nullptr when no backend was selected. */
+/* nullptr when no backend was selected -- or not yet: a CUDA device
+ * that has no memory free for las is opened later, once it has. */
 gpu_engine * engine();
 
 /* Which sieve stages the backend is used for.
@@ -48,13 +52,26 @@ enum stage : unsigned {
 };
 
 void select_stages(std::string const & spec);
+
+/* Whether stage s is to be offloaded right now. */
 bool stage_enabled(stage s);
 
-/* Stop offloading for good, e.g. because the device ran out of memory;
- * stage_enabled() returns false from then on. The engine itself stays,
- * so that passes already in flight can complete. Prints `why` once.
- * Thread-safe. */
-void disable(char const * why);
+/* Whether it is to be offloaded at all, at least once offloading is no
+ * longer suspended -- what to go by when deciding on things that last
+ * the whole run. */
+bool stage_selected(stage s);
+
+/* Stop offloading for a while, e.g. because the device ran out of
+ * memory -- most likely held by another process, which may give it
+ * back. stage_enabled() returns false until the time is up; the time
+ * doubles with every failure in a row, from 30 seconds up to half an
+ * hour. The engine itself stays, so that passes already in flight can
+ * complete. Prints `why`, once per suspension. Thread-safe. */
+void suspend(char const * why);
+
+/* A device pass went through: the next suspension, if any, is a short
+ * one again. Thread-safe, and cheap. */
+void pass_succeeded();
 
 /* Human-readable name of the active backend, "none" if there is none. */
 std::string describe();

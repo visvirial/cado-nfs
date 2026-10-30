@@ -41,21 +41,29 @@
     } while (0)
 
 /* For the allocations of the bucket-sieving path, which las can recover
- * from: the device may well be shared with other las processes, and run
+ * from: the device may well be shared with other processes, and run
  * out. Memory exhaustion is reported as a failure, which las answers by
- * going back to the CPU; anything else is a bug and aborts as above.
- * The error is cleared either way, or the next
- * CUDA_CHECK(cudaGetLastError()) would trip over it. */
-#define CUDA_ALLOC(call) cuda_alloc_ok((call), #call, __FILE__, __LINE__)
+ * going back to the CPU for a while; anything else is a bug and aborts
+ * as above. The error is cleared either way, or the next
+ * CUDA_CHECK(cudaGetLastError()) would trip over it.
+ *
+ * Within cuda_engine, CUDA_ALLOC first tries quietly, and on failure
+ * trims the engine's pools and tries once more: the scratch of passes
+ * that are not in flight is often what stands in the way. */
+#define CUDA_ALLOC_ONCE(call, quiet)                                          \
+    cuda_alloc_ok((call), #call, __FILE__, __LINE__, (quiet))
+#define CUDA_ALLOC(call)                                                      \
+    (CUDA_ALLOC_ONCE(call, true) || (trim(), CUDA_ALLOC_ONCE(call, false)))
 static bool cuda_alloc_ok(cudaError_t err, char const * what,
-                          char const * file, int line)
+                          char const * file, int line, bool quiet)
 {
     if (err == cudaSuccess)
         return true;
     (void) cudaGetLastError();
     if (err == cudaErrorMemoryAllocation) {
-        fprintf(stderr, "# las-gpu: %s failed: %s\n", what,
-                cudaGetErrorString(err));
+        if (!quiet)
+            fprintf(stderr, "# las-gpu: %s failed: %s\n", what,
+                    cudaGetErrorString(err));
         return false;
     }
     fprintf(stderr, "%s:%d: CUDA error in %s: %s\n", file, line, what,
@@ -133,6 +141,15 @@ __global__ void kernel_survivor_flags(unsigned char * __restrict__ S0,
  * cheaper than storing every position and sorting it.
  */
 
+/* Where the hint of an entry comes from when the entries are shared
+ * between the slicings of a factor base: it is the entry's index within
+ * its slice, and every root of an entry is a lattice of its own, so the
+ * hint of lattice k is (k - first) / nroots. See fib_task_create. */
+struct cuda_fib_geom {
+    uint32_t first;
+    uint32_t nroots;
+};
+
 /* Where a lattice's walk starts in this pass: from scratch in the
  * first chunk, from where the previous chunk left it otherwise. */
 static __device__ __forceinline__ void
@@ -191,6 +208,7 @@ __global__ void kernel_fib_count(gpu_fib_entry const * __restrict__ entries,
  * -- and the host grows the buffer and runs it again. */
 __global__ void kernel_fib_scatter(gpu_fib_entry const * __restrict__ entries,
                                    uint32_t const * __restrict__ entry_slice,
+                                   cuda_fib_geom const * __restrict__ geom,
                                    uint32_t nentries, gpu_fib_plan plan,
                                    uint32_t nslices,
                                    uint32_t const * __restrict__ total,
@@ -222,8 +240,10 @@ __global__ void kernel_fib_scatter(gpu_fib_entry const * __restrict__ entries,
             continue;
         fib_resume(ple, plan, state, k);
 
-        uint32_t * const col = cursor + entry_slice[k];
-        uint16_t const hint = e.hint;
+        uint32_t const s = entry_slice[k];
+        uint32_t * const col = cursor + s;
+        uint16_t const hint = geom
+            ? uint16_t((k - geom[s].first) / geom[s].nroots) : e.hint;
         uint64_t const resume = gpu_fib_walk_until(ple, kind, F, x_end,
                 [&](uint64_t x) {
             uint32_t const slot = atomicAdd(
@@ -271,11 +291,29 @@ struct cuda_norm_task {
 /* see fib_launch */
 static constexpr uint32_t CUDA_FIB_HOST_MAX = UINT32_C(1) << 20;
 
+/* The device copy of a flattened factor base, minus its hints. las has
+ * one task per slicing, and several slicings per side that differ only
+ * in where the slices start and end; at c270 sizes, a copy for each is
+ * gigabytes. So the tasks share the entries when they can, and keep to
+ * themselves only which slice each entry is in. Owned by the engine,
+ * which counts the tasks that use it. */
+struct cuda_fib_entries {
+    gpu_fib_entry * d = nullptr;
+    uint32_t n = 0;
+    uint64_t hash = 0;
+    unsigned refs = 0;
+};
+
 struct cuda_fib_task {
     /* uploaded once, reused for every special-q: the factor base does
      * not depend on q */
-    gpu_fib_entry * d_entries = nullptr;
+    gpu_fib_entry const * d_entries = nullptr;
     uint32_t * d_entry_slice = nullptr;
+    /* with shared entries, whence the hints; nullptr when the entries
+     * are this task's own, hints included */
+    cuda_fib_geom * d_geom = nullptr;
+    cuda_fib_entries * shared = nullptr;
+    gpu_fib_entry * d_own = nullptr;
     uint32_t nentries = 0;
     uint32_t nslices = 0;
 };
@@ -699,6 +737,47 @@ struct cuda_engine : public gpu_engine {
         sc->h_updates_capacity = 0;
     }
 
+    size_t available_memory() override
+    {
+        size_t free = 0, total = 0;
+        CUDA_CHECK(cudaSetDevice(device));
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        return free;
+    }
+
+    /* Only the scratch nobody holds: a slot in fib_free has no pass in
+     * flight (fib_release synchronised its stream), and the lock keeps
+     * fib_scratch_take from handing it out meanwhile. The capacities go
+     * to zero, so that the next fib_launch allocates afresh. */
+    void trim() override
+    {
+        cudaSetDevice(device);
+        std::lock_guard<std::mutex> const lock(fib_mu);
+        for (auto * sc: fib_free) {
+            cudaFree(sc->d_counts);
+            cudaFree(sc->d_offsets);
+            cudaFree(sc->d_cursor);
+            cudaFree(sc->d_scan_temp);
+            cudaFree(sc->d_updates);
+            cudaFree(sc->d_host_entries);
+            cudaFreeHost(sc->h_counts);
+            cudaFreeHost(sc->h_offsets);
+            cudaFreeHost(sc->h_host_entries);
+            sc->d_counts = sc->d_offsets = sc->d_cursor = nullptr;
+            sc->d_scan_temp = nullptr;
+            sc->d_updates = nullptr;
+            sc->d_host_entries = nullptr;
+            sc->h_counts = sc->h_offsets = sc->h_host_entries = nullptr;
+            sc->grid_capacity = 0;
+            sc->scan_temp_bytes = 0;
+            sc->updates_capacity = 0;
+            sc->host_capacity = 0;
+        }
+        for (auto const & hb: fib_host_free)
+            cudaFreeHost(hb.p);
+        fib_host_free.clear();
+    }
+
     ~cuda_engine() override
     {
         cudaSetDevice(device);
@@ -751,6 +830,84 @@ struct cuda_engine : public gpu_engine {
         return sc;
     }
 
+    std::mutex fib_entries_mu;
+    std::vector<cuda_fib_entries *> fib_entries;
+
+    /* Of what the kernels read from an entry other than the hint. */
+    static uint64_t fib_entries_hash(gpu_fib_entry const * entries,
+                                     uint32_t n)
+    {
+        uint64_t h = 0x9e3779b97f4a7c15 ^ n;
+        for (uint32_t k = 0; k < n; k++) {
+            uint64_t v = (uint64_t(entries[k].p) << 32 | entries[k].invq) ^
+                         (uint64_t(entries[k].r) * 0xff51afd7ed558ccd);
+            v ^= v >> 33;
+            v *= 0xc4ceb9fe1a85ec53;
+            h = (h ^ v) * 0x100000001b3 + k;
+        }
+        return h;
+    }
+
+    /* A hash match is checked in full against the device copy, a piece
+     * at a time: a wrong match would lose relations without a word. */
+    bool fib_entries_equal(cuda_fib_entries const * E,
+                           gpu_fib_entry const * entries)
+    {
+        constexpr uint32_t piece = 1u << 20;
+        std::vector<gpu_fib_entry> buf(std::min(E->n, piece));
+        for (uint32_t k0 = 0; k0 < E->n; k0 += piece) {
+            uint32_t const m = std::min(piece, E->n - k0);
+            CUDA_CHECK(cudaMemcpy(buf.data(), E->d + k0,
+                                  size_t(m) * sizeof(gpu_fib_entry),
+                                  cudaMemcpyDeviceToHost));
+            for (uint32_t k = 0; k < m; k++) {
+                gpu_fib_entry const & a = buf[k];
+                gpu_fib_entry const & b = entries[k0 + k];
+                if (a.p != b.p || a.invq != b.invq || a.r != b.r)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    /* The device copy of these entries, shared with the tasks that
+     * already have the same ones, or uploaded. nullptr when out of
+     * memory. Called with fib_entries_mu held. */
+    cuda_fib_entries * fib_entries_take(gpu_fib_entry const * entries,
+                                        uint32_t n)
+    {
+        uint64_t const h = fib_entries_hash(entries, n);
+        for (auto * E: fib_entries) {
+            if (E->n == n && E->hash == h && fib_entries_equal(E, entries)) {
+                E->refs++;
+                return E;
+            }
+        }
+        auto * E = new cuda_fib_entries;
+        size_t const bytes = size_t(n) * sizeof(gpu_fib_entry);
+        if (!CUDA_ALLOC(cudaMalloc(&E->d, bytes))) {
+            delete E;
+            return nullptr;
+        }
+        CUDA_CHECK(cudaMemcpy(E->d, entries, bytes, cudaMemcpyHostToDevice));
+        E->n = n;
+        E->hash = h;
+        E->refs = 1;
+        fib_entries.push_back(E);
+        return E;
+    }
+
+    void fib_entries_give(cuda_fib_entries * E)
+    {
+        std::lock_guard<std::mutex> const lock(fib_entries_mu);
+        if (--E->refs)
+            return;
+        cudaFree(E->d);
+        fib_entries.erase(std::find(fib_entries.begin(), fib_entries.end(),
+                                    E));
+        delete E;
+    }
+
     gpu_fib_task * fib_task_create(gpu_fib_entry const * entries,
                                    uint32_t nentries,
                                    gpu_fib_slice const * slices,
@@ -768,19 +925,68 @@ struct cuda_engine : public gpu_engine {
             for (uint32_t k = 0; k < slices[s].count; k++)
                 es[slices[s].first + k] = s;
 
-        size_t const ebytes = size_t(nentries) * sizeof(gpu_fib_entry);
-        if (!CUDA_ALLOC(cudaMalloc(&t->d_entries, ebytes)) ||
-                !CUDA_ALLOC(cudaMalloc(&t->d_entry_slice,
-                                       size_t(nentries) * sizeof(uint32_t)))) {
-            cudaFree(t->d_entries);
+        /* The entries can be shared when the hints follow from the
+         * slices, which is how las lays them out: an entry's roots one
+         * after the other, numbered from 0 in each slice. */
+        std::vector<cuda_fib_geom> geom(nslices);
+        bool derivable = true;
+        for (uint32_t s = 0; s < nslices && derivable; s++) {
+            gpu_fib_slice const & sl = slices[s];
+            geom[s].first = sl.first;
+            geom[s].nroots = 1;
+            if (!sl.count)
+                continue;
+            uint32_t const nh =
+                uint32_t(entries[sl.first + sl.count - 1].hint) + 1;
+            if (sl.count % nh) {
+                derivable = false;
+                break;
+            }
+            geom[s].nroots = sl.count / nh;
+            for (uint32_t k = 0; k < sl.count && derivable; k++)
+                derivable = entries[sl.first + k].hint ==
+                    uint16_t(k / geom[s].nroots);
+        }
+
+        auto fail = [&]() {
+            cudaFree(t->d_entry_slice);
+            cudaFree(t->d_geom);
+            cudaFree(t->d_own);
+            if (t->shared)
+                fib_entries_give(t->shared);
             delete t;
             return nullptr;
-        }
-        CUDA_CHECK(cudaMemcpy(t->d_entries, entries, ebytes,
-                              cudaMemcpyHostToDevice));
+        };
+
+        if (!CUDA_ALLOC(cudaMalloc(&t->d_entry_slice,
+                                   size_t(nentries) * sizeof(uint32_t))))
+            return fail();
         CUDA_CHECK(cudaMemcpy(t->d_entry_slice, es.data(),
                               size_t(nentries) * sizeof(uint32_t),
                               cudaMemcpyHostToDevice));
+        if (derivable) {
+            if (!CUDA_ALLOC(cudaMalloc(&t->d_geom,
+                                       std::max<size_t>(1, nslices) *
+                                           sizeof(cuda_fib_geom))))
+                return fail();
+            CUDA_CHECK(cudaMemcpy(t->d_geom, geom.data(),
+                                  size_t(nslices) * sizeof(cuda_fib_geom),
+                                  cudaMemcpyHostToDevice));
+            {
+                std::lock_guard<std::mutex> const lock(fib_entries_mu);
+                t->shared = fib_entries_take(entries, nentries);
+            }
+            if (!t->shared)
+                return fail();
+            t->d_entries = t->shared->d;
+        } else {
+            size_t const ebytes = size_t(nentries) * sizeof(gpu_fib_entry);
+            if (!CUDA_ALLOC(cudaMalloc(&t->d_own, ebytes)))
+                return fail();
+            CUDA_CHECK(cudaMemcpy(t->d_own, entries, ebytes,
+                                  cudaMemcpyHostToDevice));
+            t->d_entries = t->d_own;
+        }
         return reinterpret_cast<gpu_fib_task *>(t);
     }
 
@@ -790,8 +996,11 @@ struct cuda_engine : public gpu_engine {
         if (!t)
             return;
         cudaSetDevice(device);
-        cudaFree(t->d_entries);
         cudaFree(t->d_entry_slice);
+        cudaFree(t->d_geom);
+        cudaFree(t->d_own);
+        if (t->shared)
+            fib_entries_give(t->shared);
         delete t;
     }
 
@@ -802,7 +1011,7 @@ struct cuda_engine : public gpu_engine {
                                    grid * sizeof(uint32_t),
                                    cudaMemcpyDeviceToDevice, sc->stream));
         kernel_fib_scatter<<<sc->grid_e, 128, 0, sc->stream>>>(
-            t->d_entries, t->d_entry_slice, t->nentries, sc->plan,
+            t->d_entries, t->d_entry_slice, t->d_geom, t->nentries, sc->plan,
             t->nslices, sc->d_offsets + grid,
             sc->state ? sc->state->d_x : nullptr, sc->d_cursor,
             sc->d_updates, sc->updates_capacity);
@@ -1002,7 +1211,6 @@ struct cuda_engine : public gpu_engine {
             uint64_t want = uint64_t(total) + total / 4;
             if (want > UINT32_MAX)
                 want = UINT32_MAX;
-            cudaFree(sc->d_updates);
             sc->d_updates = nullptr;
             sc->updates_capacity = 0;
             if (!CUDA_ALLOC(cudaMalloc(&sc->d_updates,
@@ -1049,13 +1257,27 @@ struct cuda_engine : public gpu_engine {
     }
 };
 
-bool cuda_device_usable(int device)
+/* Creating the context is the first thing that needs device memory, and
+ * the one failure that is worth telling apart: other processes may give
+ * the memory back. A failed attempt leaves nothing behind -- the runtime
+ * tries again on the next call -- but it does forget the flags, which
+ * is why they are set every time. */
+bool cuda_device_usable(int device, bool * out_of_memory)
 {
+    auto ok = [&](cudaError_t e) {
+        if (e == cudaSuccess)
+            return true;
+        (void) cudaGetLastError();
+        if (e == cudaErrorMemoryAllocation)
+            *out_of_memory = true;
+        return false;
+    };
     int count = 0;
     CUDA_TRY(cudaGetDeviceCount(&count));
     if (device < 0 || device >= count)
         return false;
-    CUDA_TRY(cudaSetDevice(device));
+    if (!ok(cudaSetDevice(device)))
+        return false;
     /* By default a thread waiting on the device spins as long as there
      * are fewer active host threads than cores, which in las is always:
      * the pool has one thread per core, and the ones waiting on a pass
@@ -1067,15 +1289,18 @@ bool cuda_device_usable(int device)
     if (e != cudaSuccess && e != cudaErrorSetOnActiveProcess)
         return false;
     (void) cudaGetLastError();
-    CUDA_TRY(cudaFree(nullptr)); /* forces context creation */
-    return true;
+    return ok(cudaFree(nullptr)); /* forces context creation */
 }
 
 } // namespace
 
-gpu_engine * gpu_engine_cuda_create(int device)
+gpu_engine * gpu_engine_cuda_create(int device, bool * out_of_memory)
 {
-    if (!cuda_device_usable(device))
+    bool oom = false;
+    bool const usable = cuda_device_usable(device, &oom);
+    if (out_of_memory)
+        *out_of_memory = oom;
+    if (!usable)
         return nullptr;
     return new cuda_engine(device);
 }

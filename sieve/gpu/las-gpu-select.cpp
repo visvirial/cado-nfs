@@ -1,6 +1,8 @@
 #include "cado.h" // IWYU pragma: keep
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -12,20 +14,43 @@
 namespace las_gpu {
 
 namespace {
-std::unique_ptr<gpu_engine> the_engine;
+/* Written by select(), before any thread starts -- or, once, by
+ * suspended(), when a device that had no memory for las at first gets
+ * some: hence the atomic copy that everybody reads. */
+std::unique_ptr<gpu_engine> owned_engine;
+std::atomic<gpu_engine *> the_engine {nullptr};
+/* The CUDA device to open once it has memory to spare, or -1. */
+int pending_device = -1;
 std::atomic<unsigned> the_stages {STAGE_BUCKETS};
-std::atomic<bool> disabled {false};
+
+/* Offloading is suspended, not stopped, when the device fails us: the
+ * usual cause is memory that another process holds for a while. So it
+ * is retried after a while, which doubles with every failure in a row
+ * and goes back to the minimum once a pass gets through. Times are
+ * steady_clock ticks; 0 means not suspended. */
+using suspend_clock = std::chrono::steady_clock;
+constexpr suspend_clock::duration suspend_min = std::chrono::seconds(30);
+constexpr suspend_clock::duration suspend_max = std::chrono::minutes(30);
+std::atomic<suspend_clock::rep> suspended_until {0};
+std::atomic<suspend_clock::rep> suspend_length {suspend_min.count()};
+}
+
+static void set_engine(gpu_engine * e)
+{
+    owned_engine.reset(e);
+    the_engine = e;
 }
 
 void select(std::string const & spec)
 {
-    if (spec.empty() || spec == "none") {
-        the_engine.reset();
+    set_engine(nullptr);
+    pending_device = -1;
+
+    if (spec.empty() || spec == "none")
         return;
-    }
 
     if (spec == "cpu") {
-        the_engine.reset(gpu_engine_cpu_create());
+        set_engine(gpu_engine_cpu_create());
         return;
     }
 
@@ -55,9 +80,17 @@ void select(std::string const & spec)
     }
 
     if (want_cuda) {
-        gpu_engine * e = gpu_engine_cuda_create(device);
+        bool oom = false;
+        gpu_engine * e = gpu_engine_cuda_create(device, &oom);
         if (e) {
-            the_engine.reset(e);
+            set_engine(e);
+            return;
+        }
+        if (oom) {
+            /* Not for good: whoever holds the memory may give it back. */
+            pending_device = device;
+            suspend(fmt::format("CUDA device {} has no memory free for"
+                                " las", device).c_str());
             return;
         }
         if (!fallback) {
@@ -69,7 +102,6 @@ void select(std::string const & spec)
         }
         /* Not the cpu backend: it is a reference implementation, and
          * much slower than not offloading at all. */
-        the_engine.reset();
     }
 }
 
@@ -106,29 +138,86 @@ void select_stages(std::string const & spec)
     the_stages = s;
 }
 
-bool stage_enabled(stage s)
+static suspend_clock::rep now()
 {
-    return the_engine && !disabled.load(std::memory_order_relaxed) &&
+    return suspend_clock::now().time_since_epoch().count();
+}
+
+static bool suspended()
+{
+    suspend_clock::rep until = suspended_until.load(std::memory_order_relaxed);
+    if (!until)
+        return false;
+    if (now() < until)
+        return true;
+    /* Whoever ends the suspension is the one to open the device, if it
+     * has not been yet; the others go on without it meanwhile. */
+    if (!suspended_until.compare_exchange_strong(until, 0))
+        return false;
+    if (!the_engine.load() && pending_device >= 0) {
+        gpu_engine * e = gpu_engine_cuda_create(pending_device);
+        if (!e) {
+            suspend(fmt::format("CUDA device {} still has no memory free"
+                                " for las", pending_device).c_str());
+            return true;
+        }
+        set_engine(e);
+        fmt::print(stderr, "# las-gpu: offload backend: {}\n", e->name());
+    }
+    fmt::print(stderr, "# las-gpu: offloading resumes\n");
+    return false;
+}
+
+bool stage_selected(stage s)
+{
+    return (the_engine.load() || pending_device >= 0) &&
         (the_stages.load(std::memory_order_relaxed) & unsigned(s));
 }
 
-void disable(char const * why)
+bool stage_enabled(stage s)
 {
-    if (disabled.exchange(true))
-        return;
+    return stage_selected(s) && !suspended() && the_engine.load();
+}
+
+void suspend(char const * why)
+{
+    suspend_clock::rep const t = now();
+    suspend_clock::rep const length = suspend_length.load();
+    suspend_clock::rep until = suspended_until.load();
+    /* Several threads may fail at once over the same shortage: only
+     * the first one to get here starts a suspension. One that has
+     * run out, but that nobody has noticed yet, does not count. */
+    do {
+        if (until > t)
+            return;
+    } while (!suspended_until.compare_exchange_weak(until, t + length));
+    suspend_length = std::min(2 * length, suspend_max.count());
     fmt::print(stderr,
-            "# las-gpu: {}; offloading is disabled for the rest of this"
-            " run, and the sieving carries on on the CPU\n", why);
+            "# las-gpu: {}; offloading is suspended for {} s, and the"
+            " sieving carries on on the CPU meanwhile\n", why,
+            std::chrono::duration_cast<std::chrono::seconds>(
+                suspend_clock::duration(length)).count());
+}
+
+void pass_succeeded()
+{
+    if (suspend_length.load(std::memory_order_relaxed) != suspend_min.count())
+        suspend_length = suspend_min.count();
 }
 
 gpu_engine * engine()
 {
-    return the_engine.get();
+    return the_engine.load();
 }
 
 std::string describe()
 {
-    return the_engine ? the_engine->name() : "none";
+    if (gpu_engine * e = the_engine.load())
+        return e->name();
+    if (pending_device >= 0)
+        return fmt::format("cuda:{} (once it has memory free)",
+                           pending_device);
+    return "none";
 }
 
 } // namespace las_gpu

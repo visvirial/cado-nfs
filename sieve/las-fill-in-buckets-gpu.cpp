@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <map>
 #include <memory>
@@ -52,6 +53,27 @@ static_assert(std::is_same_v<decltype(fib_update_t::x), uint16_t>);
 
 /* {{{ the cache */
 
+/* Where every lattice's walk stopped, for chunked passes. Only one
+ * special-q per side is ever chunked at a time -- chunked passes are
+ * never prefetched -- so the images of a side share one, rather than
+ * each keeping a gigabyte of their own at c270 sizes. It fits any task
+ * with the same number of entries, which the slicings of a side have. */
+struct las_gpu_fib_walk {
+    gpu_engine * eng = nullptr;
+    gpu_fib_state * state = nullptr;
+    size_t nentries = 0;
+
+    las_gpu_fib_walk(gpu_engine * eng, size_t nentries)
+        : eng(eng), nentries(nentries) {}
+    las_gpu_fib_walk(las_gpu_fib_walk const &) = delete;
+    las_gpu_fib_walk & operator=(las_gpu_fib_walk const &) = delete;
+    ~las_gpu_fib_walk()
+    {
+        if (state)
+            eng->fib_state_destroy(state);
+    }
+};
+
 /* The flattened form of one factor base slicing, and its device copy. */
 struct las_gpu_fib_image {
     gpu_engine * eng = nullptr;
@@ -62,26 +84,26 @@ struct las_gpu_fib_image {
     std::vector<slice_index_t> slice_indices;
     std::vector<double> weights;
 
+    /* when get_image() last handed it out, for eviction */
+    uint64_t last_used = 0;
 
     las_gpu_fib_image() = default;
     las_gpu_fib_image(las_gpu_fib_image const &) = delete;
     las_gpu_fib_image & operator=(las_gpu_fib_image const &) = delete;
 
-    /* Walk state for chunked passes, created on first use. One special-q
-     * at a time uses it: chunked passes are never prefetched. */
-    gpu_fib_state * state = nullptr;
+    /* Walk state for chunked passes, created on first use; see
+     * las_gpu_fib_walk. Set by get_image(). */
+    std::shared_ptr<las_gpu_fib_walk> walk;
 
     gpu_fib_state * get_state()
     {
-        if (!state && task)
-            state = eng->fib_state_create(task);
-        return state;
+        if (!walk->state && task)
+            walk->state = eng->fib_state_create(task);
+        return walk->state;
     }
 
     ~las_gpu_fib_image()
     {
-        if (eng && state)
-            eng->fib_state_destroy(state);
         if (eng && task)
             eng->fib_task_destroy(task);
     }
@@ -105,9 +127,23 @@ struct las_gpu_fib_cache {
      * between a handful of them. They are cached by las_info and live
      * as long as it does, so their addresses are stable keys. Keeping
      * only the latest image here would rebuild and re-upload the
-     * factor base on most special-q's. */
+     * factor base on most special-q's.
+     *
+     * At c270 sizes an image is a gigabyte or so on the device, even
+     * with the engine sharing the entries between slicings, and the
+     * device may be shared with other processes. So they are kept only
+     * as long as there is room: upload() drops the least recently used
+     * ones. The passes that use an image hold it, so that one dropped
+     * from here lives on until they are done. */
     gpu_engine * eng = nullptr;
-    std::map<void const *, std::unique_ptr<las_gpu_fib_image>> images;
+    std::map<void const *, std::shared_ptr<las_gpu_fib_image>> images;
+
+    std::shared_ptr<las_gpu_fib_walk> walk;
+
+    /* The image that prepare_for_new_q() chose for the special-q being
+     * sieved, held from then on so that nothing evicts it before
+     * las_gpu_fib_start() launches its passes. */
+    std::shared_ptr<las_gpu_fib_image> current;
 };
 
 void las_gpu_fib_cache_deleter::operator()(las_gpu_fib_cache * p) const
@@ -118,10 +154,10 @@ void las_gpu_fib_cache_deleter::operator()(las_gpu_fib_cache * p) const
 /* }}} */
 /* {{{ building the flattened factor base */
 
-static std::unique_ptr<las_gpu_fib_image>
+static std::shared_ptr<las_gpu_fib_image>
 build_image(fb_factorbase::slicing const & fbs)
 {
-    auto I = std::make_unique<las_gpu_fib_image>();
+    auto I = std::make_shared<las_gpu_fib_image>();
     fb_factorbase::slicing::part const & P = fbs.get_part(1);
 
     P.foreach_slice([&](auto const & sl) {
@@ -147,10 +183,6 @@ build_image(fb_factorbase::slicing const & fbs)
     });
 
     I->eng = las_gpu::engine();
-    I->task = I->eng->fib_task_create(I->entries.data(),
-                                      uint32_t(I->entries.size()),
-                                      I->slices.data(),
-                                      uint32_t(I->slices.size()));
     return I;
 }
 
@@ -347,19 +379,32 @@ static constexpr double FIB_CHUNK_TARGET = double(UINT64_C(1) << 26);
 static constexpr uint32_t FIB_CHUNK_MIN = SMALL_SIEVE_START_POSITIONS_MAX_ADVANCE;
 
 /* Buckets per chunk, or 0 when the device path cannot take this area at
- * all. nb is a power of two, as las makes it. */
+ * all. nb is a power of two, as las makes it.
+ *
+ * The updates are spread evenly over the cells of the area, but the area
+ * is only the first J rows: with a small J, the buckets past it are
+ * empty, and the ones before it as full as ever. So a chunk is sized by
+ * the buckets of it that are in use, not by its share of nb -- which
+ * would underestimate it by nb over the buckets in use, nearly three
+ * times for a c270 special-q with J a third of the maximum. */
 static uint32_t chunk_buckets(double weight, int logI, uint32_t J,
                               uint32_t nb, size_t nslices)
 {
-    double const expected = weight * double(uint64_t(J) << logI);
+    int const logB = LOG_BUCKET_REGIONS[1];
+    double const per_bucket = weight * double(UINT64_C(1) << logB);
+    uint64_t const used = std::min<uint64_t>(nb,
+            iceildiv(uint64_t(J) << logI, UINT64_C(1) << logB));
+    auto expected = [&](uint32_t K) {
+        return per_bucket * double(std::min<uint64_t>(K, used));
+    };
     uint32_t K = nb;
     while (K > FIB_CHUNK_MIN && !(K & 1) &&
-            (expected * K / nb > FIB_CHUNK_TARGET ||
+            (expected(K) > FIB_CHUNK_TARGET ||
              uint64_t(K) * nslices >= (UINT64_C(1) << 24)))
         K /= 2;
     /* The limits leave a factor of two of margin on the expected count,
      * which the actual one fluctuates around by far less. */
-    if (expected * K / nb >= double(UINT64_C(1) << 31) ||
+    if (expected(K) >= double(UINT64_C(1) << 31) ||
             uint64_t(K) * nslices >= (UINT64_C(1) << 24))
         return 0;
     return K;
@@ -372,24 +417,112 @@ static double total_weight(las_gpu_fib_image const & I)
 
 /* }}} */
 
-double las_gpu_fib_weight(nfs_work const & ws, int side,
+/* {{{ the images on the device */
+
+/* What is left on the device beside the images, for the passes'
+ * scratch, which the engine grows on demand. */
+static constexpr size_t FIB_DEVICE_HEADROOM = size_t(1) << 30;
+
+/* The image of this slicing, built on the host if need be -- not
+ * necessarily on the device yet, see upload(). */
+static std::shared_ptr<las_gpu_fib_image> const &
+get_image(nfs_work::side_data & wss, fb_factorbase::slicing const * fbs)
+{
+    static std::atomic<uint64_t> stamp {0};
+    if (!wss.gpu_fib || wss.gpu_fib->eng != las_gpu::engine()) {
+        wss.gpu_fib.reset(new las_gpu_fib_cache);
+        wss.gpu_fib->eng = las_gpu::engine();
+    }
+    auto & slot = wss.gpu_fib->images[fbs];
+    if (!slot) {
+        slot = build_image(*fbs);
+        auto & walk(wss.gpu_fib->walk);
+        if (!walk || walk->nentries != slot->entries.size())
+            walk = std::make_shared<las_gpu_fib_walk>(
+                    slot->eng, slot->entries.size());
+        slot->walk = walk;
+    }
+    slot->last_used = ++stamp;
+    return slot;
+}
+
+/* Drop the least recently used image on the device, on either side,
+ * other than `keep`. Only images that nobody else holds go: not the
+ * ones that passes in flight or prefetched use, nor the current
+ * special-q's. False when there is none. */
+static bool evict_one(nfs_work & ws, las_gpu_fib_image const & keep)
+{
+    decltype(las_gpu_fib_cache::images) * where = nullptr;
+    decltype(las_gpu_fib_cache::images)::iterator victim;
+    for (auto & wss: ws.sides) {
+        if (!wss.gpu_fib)
+            continue;
+        auto & images(wss.gpu_fib->images);
+        for (auto it = images.begin(); it != images.end(); ++it) {
+            auto const & J(it->second);
+            if (J.get() == &keep || !J->task || J.use_count() > 1)
+                continue;
+            if (!where || J->last_used < victim->second->last_used) {
+                where = &images;
+                victim = it;
+            }
+        }
+    }
+    if (!where)
+        return false;
+    where->erase(victim);
+    return true;
+}
+
+/* Put the image on the device if it is not there yet, dropping others
+ * to make room as long as it does not fit, and then to leave room for
+ * the scratch. False when it does not fit even so.
+ *
+ * How much room an image takes is up to the engine, which shares what
+ * it can between the slicings of a factor base -- so we just try. */
+static bool upload(nfs_work & ws, las_gpu_fib_image & I)
+{
+    if (I.task || I.slices.empty())
+        return true;
+    for (;;) {
+        I.task = I.eng->fib_task_create(I.entries.data(),
+                                        uint32_t(I.entries.size()),
+                                        I.slices.data(),
+                                        uint32_t(I.slices.size()));
+        if (I.task)
+            break;
+        if (!evict_one(ws, I))
+            return false;
+    }
+    while (I.eng->available_memory() < FIB_DEVICE_HEADROOM &&
+            evict_one(ws, I))
+        ;
+    return true;
+}
+
+/* }}} */
+
+double las_gpu_fib_weight(nfs_work & ws, int side,
                           qlattice_basis const & Q)
 {
-    nfs_work::side_data const & wss(ws.sides[side]);
+    nfs_work::side_data & wss(ws.sides[side]);
+    if (wss.gpu_fib)
+        wss.gpu_fib->current.reset();
     if (wss.no_fb() || !las_gpu_fib_usable(ws, Q))
         return 0;
-    double w = 0;
-    size_t nslices = 0;
-    wss.fbs->get_part(1).foreach_slice([&](auto const & sl) {
-        using entry_t = typename std::decay_t<decltype(sl)>::entry_t;
-        if constexpr (las_gpu_fib_takes_slice<entry_t>()) {
-            w += sl.get_weight();
-            nslices++;
-        }
-    });
-    if (!chunk_buckets(w, ws.conf.logI, ws.J,
-                uint32_t(ws.nb_buckets[1]), nslices))
+    std::shared_ptr<las_gpu_fib_image> const I = get_image(wss, wss.fbs);
+    double const w = total_weight(*I);
+    if (I->slices.empty() ||
+            !chunk_buckets(w, ws.conf.logI, ws.J,
+                           uint32_t(ws.nb_buckets[1]), I->slices.size()))
         return 0;
+    /* Better found out now than once the bucket arrays are sized for
+     * the device: then the special-q would have to be done again. */
+    if (!upload(ws, *I)) {
+        las_gpu::suspend("the factor base does not fit on the device");
+        return 0;
+    }
+    wss.gpu_fib->current = I;
     return w;
 }
 
@@ -403,6 +536,7 @@ double las_gpu_fib_weight(nfs_work const & ws, int side,
  * while chunk c's bucket regions are processed; and chunk c is released
  * once they are done. */
 struct las_gpu_fib_inflight {
+    std::shared_ptr<las_gpu_fib_image> held;
     las_gpu_fib_image & I;
     gpu_fib_plan plan;          /* chunk_begin and chunk_count unset */
     void const * fbs;
@@ -424,9 +558,11 @@ struct las_gpu_fib_inflight {
     int current = -1;
     bucket_array_t<1, shorthint_t> * BA = nullptr;
 
-    las_gpu_fib_inflight(las_gpu_fib_image & I, gpu_fib_plan const & plan,
+    las_gpu_fib_inflight(std::shared_ptr<las_gpu_fib_image> held,
+                         gpu_fib_plan const & plan,
                          void const * fbs, int side, uint32_t K)
-        : I(I), plan(plan), fbs(fbs), side(side), K(K)
+        : held(std::move(held)), I(*this->held), plan(plan), fbs(fbs),
+          side(side), K(K)
     {
         int const logB = plan.log_bucket_region;
         /* the buckets past J << logI are empty, and never processed */
@@ -474,6 +610,7 @@ struct las_gpu_fib_inflight {
                 C.out = I.eng->fib_wait(C.pass);
             if (!C.out.ok)
                 return;
+            las_gpu::pass_succeeded();
             static bool const xcheck =
                 getenv("LAS_GPU_FIB_CROSSCHECK") != nullptr;
             if (xcheck)
@@ -506,13 +643,14 @@ struct las_gpu_fib_inflight {
  * share it -- or, in principle, a pass was too large for its 32-bit
  * offsets, which the backend checks. The bucket arrays have no room for
  * what the device was to do, so this special-q has to start over: with
- * offloading off, prepare_for_new_q() sizes them for the whole part.
+ * offloading suspended, prepare_for_new_q() sizes them for the whole
+ * part.
  * buckets_are_full is what makes las do that; at ratio 1 it grows the
  * multiplier by its 5% margin only. Relations already found are not
  * printed twice: las remembers them across attempts at a special-q. */
 static buckets_are_full device_failed(int side)
 {
-    las_gpu::disable("a device pass could not be completed (see above)");
+    las_gpu::suspend("a device pass could not be completed (see above)");
     return buckets_are_full(bkmult_specifier::getkey<fib_update_t>(), side,
                             0, 1, 1);
 }
@@ -605,19 +743,6 @@ void las_gpu_fib_check_failure(nfs_work const & ws)
     }
 }
 
-static las_gpu_fib_image & get_image(nfs_work::side_data & wss,
-                                     fb_factorbase::slicing const * fbs)
-{
-    if (!wss.gpu_fib || wss.gpu_fib->eng != las_gpu::engine()) {
-        wss.gpu_fib.reset(new las_gpu_fib_cache);
-        wss.gpu_fib->eng = las_gpu::engine();
-    }
-    auto & slot = wss.gpu_fib->images[fbs];
-    if (!slot)
-        slot = build_image(*fbs);
-    return *slot;
-}
-
 static gpu_fib_plan make_plan(int logI, uint32_t J, uint32_t nb,
                               qlattice_basis const & Q)
 {
@@ -667,9 +792,11 @@ double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
 {
     nfs_work::side_data & wss(ws.sides[side]);
 
-    las_gpu_fib_image & I(get_image(wss, wss.fbs));
+    /* las_gpu_fib_weight() put it on the device, and has held it since */
+    std::shared_ptr<las_gpu_fib_image> const held = get_image(wss, wss.fbs);
+    las_gpu_fib_image & I(*held);
 
-    /* Even when offloading has been disabled since prepare_for_new_q()
+    /* Even when offloading has been suspended since prepare_for_new_q()
      * decided on it, we go ahead: the bucket arrays were sized for it.
      * At worst the launch fails, and collect() has the special-q
      * redone. */
@@ -702,8 +829,8 @@ double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
         }
     }
     if (!F)
-        F = std::make_shared<las_gpu_fib_inflight>(I, plan, wss.fbs, side,
-                                                   K);
+        F = std::make_shared<las_gpu_fib_inflight>(held, plan, wss.fbs,
+                                                   side, K);
     wss.gpu_fib_pass = F;
 
     /* Cost 0, so that the pool gets to it last: by then the device has
@@ -750,7 +877,9 @@ void las_gpu_fib_prefetch(las_info & las, nfs_work & ws,
         wss.gpu_fib_prefetched.reset();
         if (!fbs[side])
             continue;
-        las_gpu_fib_image & I(get_image(wss, fbs[side]));
+        std::shared_ptr<las_gpu_fib_image> const held =
+            get_image(wss, fbs[side]);
+        las_gpu_fib_image & I(*held);
         if (I.slices.empty())
             continue;
         /* Only a pass over the whole area at once: the chunks of a
@@ -760,12 +889,15 @@ void las_gpu_fib_prefetch(las_info & las, nfs_work & ws,
         if (chunk_buckets(total_weight(I), conf.logI, J, nb,
                           I.slices.size()) != nb)
             continue;
-        auto P = std::make_shared<las_gpu_fib_inflight>(
-                I, make_plan(conf.logI, J, nb, Q), fbs[side], side, nb);
-        if (!P->chunks[0]->pass) {
-            las_gpu::disable("a device pass could not be completed (see above)");
+        /* No room is no harm here: nothing is sized for this pass yet,
+         * and prepare_for_new_q() tries again, with the device as it
+         * is by then, and decides. */
+        if (!upload(ws, I))
             return;
-        }
+        auto P = std::make_shared<las_gpu_fib_inflight>(
+                held, make_plan(conf.logI, J, nb, Q), fbs[side], side, nb);
+        if (!P->chunks[0]->pass)
+            return;
         wss.gpu_fib_prefetched = std::move(P);
     }
 }

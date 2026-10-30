@@ -295,6 +295,48 @@ int main(int argc, char const * argv[])
         }
         cuda->fib_state_destroy(st);
 
+        /* Other slicings of the same entries, while tg is alive, as las
+         * has them for the other lognorm scales: the device may share
+         * the entries with tg, and must then get each one's hints from
+         * its own slices. The second variant has hints that do not
+         * follow from the slices at all, so it cannot share. */
+        for (int variant = 0; variant < 2; variant++) {
+            std::vector<gpu_fib_entry> entries2(entries);
+            std::vector<gpu_fib_slice> slices2;
+            size_t const nslices2 = 2 + size_t(gmp_urandomm_ui(rs, 7));
+            for (size_t s = 0; s < nslices2; s++) {
+                gpu_fib_slice sl {};
+                sl.first = uint32_t((entries2.size() * s) / nslices2);
+                sl.count = uint32_t((entries2.size() * (s + 1)) / nslices2) -
+                           sl.first;
+                sl.slice_index = uint32_t(s);
+                for (uint32_t k = 0; k < sl.count; k++)
+                    entries2[sl.first + k].hint = variant == 0
+                        ? uint16_t(k)
+                        : uint16_t(gmp_urandomm_ui(rs, 65536));
+                slices2.push_back(sl);
+            }
+            gpu_fib_task * const tc2 = cpu->fib_task_create(
+                    entries2.data(), uint32_t(entries2.size()),
+                    slices2.data(), uint32_t(slices2.size()));
+            gpu_fib_task * const tg2 = cuda->fib_task_create(
+                    entries2.data(), uint32_t(entries2.size()),
+                    slices2.data(), uint32_t(slices2.size()));
+            run_output C, D;
+            collect(cpu, cpu->fib_launch(tc2, plan, nullptr), C);
+            collect(cuda, cuda->fib_launch(tg2, plan, nullptr), D);
+            if (!compare(C, D, uint32_t(nslices2), nupdates)) {
+                fprintf(stderr, "  logI=%d J=%" PRIu32 " nb=%" PRIu32
+                                " nentries=%zu, %s slicing of %zu\n",
+                        logI, J, nb, nentries,
+                        variant == 0 ? "another" : "an unshareable",
+                        nslices2);
+                exit(EXIT_FAILURE);
+            }
+            cuda->fib_task_destroy(tg2);
+            cpu->fib_task_destroy(tc2);
+        }
+
         cuda->fib_task_destroy(tg);
         cpu->fib_task_destroy(tc);
     }

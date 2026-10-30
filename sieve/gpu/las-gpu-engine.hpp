@@ -115,6 +115,13 @@ struct gpu_engine {
      * entries[] is the (entry, root) pairs of the bucket-sieved part,
      * flattened; slices[] cuts it into the runs that share a slice
      * index. Both are host memory and are copied.
+     *
+     * Tasks are meant to be created for several slicings of the same
+     * factor base at once. When the hints are what las makes them --
+     * the index of the entry within its slice, its roots one after the
+     * other -- a backend may share its copy of the entries between such
+     * tasks, so that another slicing costs little more than its slice
+     * boundaries.
      */
     virtual gpu_fib_task * fib_task_create(gpu_fib_entry const * entries,
                                            uint32_t nentries,
@@ -151,12 +158,26 @@ struct gpu_engine {
      * Required when the area is done in several chunks, which must
      * then be launched in increasing order, each one after fib_wait()
      * on the previous; may be nullptr for a pass over the whole area.
-     * One state serves one special-q at a time. nullptr when out of
-     * memory. */
+     * One state serves one special-q at a time, with any task that has
+     * as many entries as `task` -- the slicings of a factor base can
+     * share one. nullptr when out of memory. */
     virtual gpu_fib_state * fib_state_create(gpu_fib_task * task) = 0;
     virtual void fib_state_destroy(gpu_fib_state * state) = 0;
     virtual gpu_fib_output fib_wait(gpu_fib_pass * pass) = 0;
     virtual void fib_release(gpu_fib_pass * pass) = 0;
+
+    /* --- memory ---------------------------------------------------- */
+
+    /* Bytes that could still be allocated on the device right now, as
+     * far as the backend can tell -- other processes sharing it take
+     * their share too. SIZE_MAX when there is no such limit. */
+    virtual size_t available_memory() { return SIZE_MAX; }
+
+    /* Give back what the backend keeps pooled for later but is not
+     * using: scratch of passes that are not in flight. It is grown
+     * again on demand. The backend does this by itself, and retries,
+     * before reporting an allocation failure. */
+    virtual void trim() {}
 };
 
 /* Always available. */
@@ -164,8 +185,13 @@ gpu_engine * gpu_engine_cpu_create();
 
 /* Returns nullptr when cado-nfs was built without CUDA, when no device
  * is visible, or when `device` is out of range. Never throws.
+ *
+ * Also when the device is there but has no memory left for a context,
+ * which is something other processes may change: then *out_of_memory,
+ * if given, is set, and it is worth trying again later.
  */
-gpu_engine * gpu_engine_cuda_create(int device);
+gpu_engine * gpu_engine_cuda_create(int device,
+                                    bool * out_of_memory = nullptr);
 
 /* True when a CUDA backend was compiled in at all (it may still fail to
  * find a device at run time).

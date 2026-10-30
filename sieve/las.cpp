@@ -1246,7 +1246,7 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
         bool ahead_exhausted = false;
         bool const can_look_ahead =
 #ifndef SIQS_SIEVE
-            las_gpu::stage_enabled(las_gpu::STAGE_BUCKETS) &&
+            las_gpu::stage_selected(las_gpu::STAGE_BUCKETS) &&
             dynamic_cast<special_q_task_collection_simple *>(las.tree.get());
 #else
             false;

@@ -463,17 +463,20 @@ void nfs_work::prepare_for_new_q(las_info & las0, special_q_task * task, typenam
     bk_multiplier = las0.get_bk_multiplier();
     compute_toplevel_and_buckets();
 
+    /* The previous special-q is done with its device passes. Give them
+     * back now, and in particular before las_gpu_fib_advance() could
+     * mistake them for this one's -- and on every side before asking
+     * for room on the device, which they may be holding. */
     for(int side = 0 ; side < las.cpoly.nsides() ; side++) {
-        /* The previous special-q is done with its device passes. Give
-         * them back now, and in particular before
-         * las_gpu_fib_advance() could mistake them for this one's. */
         sides[side].gpu_fib_pass.reset();
         sides[side].gpu_fib_weight = 0;
-#ifndef SIQS_SIEVE
-        if constexpr (std::is_same_v<Algo, NFS>)
-            sides[side].gpu_fib_weight = las_gpu_fib_weight(*this, side, Q);
-#endif
     }
+#ifndef SIQS_SIEVE
+    if constexpr (std::is_same_v<Algo, NFS>) {
+        for(int side = 0 ; side < las.cpoly.nsides() ; side++)
+            sides[side].gpu_fib_weight = las_gpu_fib_weight(*this, side, Q);
+    }
+#endif
 
     jd = las0.get_j_divisibility_helper(J);
     us = las0.get_unsieve_data(conf);

@@ -885,6 +885,23 @@ struct cuda_engine : public gpu_engine {
         uint32_t const total = sc->h_offsets[grid];
         uint64_t const nhost = *sc->h_nhost;
 
+        /* The scan runs in 32 bits. The host side never asks for a pass
+         * that could get near that, but if one ever did, the offsets
+         * would wrap silently and the updates overwrite each other --
+         * losing relations without a word. The counts are here anyway,
+         * so check, and decline the pass rather than return garbage. */
+        {
+            uint64_t sum = 0;
+            for (size_t i = 0; i < grid; i++)
+                sum += sc->h_counts[i];
+            if (sum != total) {
+                fprintf(stderr, "# las-gpu: %llu bucket updates in one"
+                        " pass, more than it can index\n",
+                        (unsigned long long) sum);
+                return gpu_fib_output {};
+            }
+        }
+
         if (total > sc->updates_capacity) {
             /* Only on the first few special-q's: the high-water mark
              * drifts up, so grow generously. The counts are still

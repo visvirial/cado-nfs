@@ -309,6 +309,23 @@ bool las_gpu_fib_usable(nfs_work const & ws, qlattice_basis const & Q)
     return ws.toplevel == 1 && las_gpu_fib_usable_for(ws.conf, Q);
 }
 
+/* Whether one pass over the whole sieve area fits the device path.
+ *
+ * A pass handles every update of the part at once, and indexes them
+ * with 32-bit offsets, in a grid of one counter per (bucket, slice).
+ * Both grow with the sieve area: at I=17, as for a c270, one side alone
+ * produces about 5e9 updates -- 20GB, and more than 32 bits can count
+ * -- and the grid has 2e8 counters. Such a special-q is left to the
+ * CPU. The limits leave a factor of two of margin on the expected
+ * count, which the actual one fluctuates around by far less. */
+static bool fits_one_pass(double weight, int logI, uint32_t J,
+                          uint32_t nb, size_t nslices)
+{
+    double const expected = weight * double(uint64_t(J) << logI);
+    return expected < double(UINT64_C(1) << 31) &&
+        uint64_t(nb) * nslices < (UINT64_C(1) << 24);
+}
+
 double las_gpu_fib_weight(nfs_work const & ws, int side,
                           qlattice_basis const & Q)
 {
@@ -316,11 +333,17 @@ double las_gpu_fib_weight(nfs_work const & ws, int side,
     if (wss.no_fb() || !las_gpu_fib_usable(ws, Q))
         return 0;
     double w = 0;
+    size_t nslices = 0;
     wss.fbs->get_part(1).foreach_slice([&](auto const & sl) {
         using entry_t = typename std::decay_t<decltype(sl)>::entry_t;
-        if constexpr (las_gpu_fib_takes_slice<entry_t>())
+        if constexpr (las_gpu_fib_takes_slice<entry_t>()) {
             w += sl.get_weight();
+            nslices++;
+        }
     });
+    if (!fits_one_pass(w, ws.conf.logI, ws.J,
+                uint32_t(ws.nb_buckets[1]), nslices))
+        return 0;
     return w;
 }
 
@@ -381,12 +404,13 @@ static void collect(worker_thread * worker, int side, nfs_work & ws,
 
     if (!out.ok) {
         /* The device ran out of memory, most likely because other
-         * processes share it. The bucket arrays have no room for what
+         * processes share it -- or, in principle, a pass was too large
+         * for its 32-bit offsets, which the backend checks. The bucket arrays have no room for what
          * the device was to do, so this special-q has to start over:
          * with offloading off, prepare_for_new_q() sizes them for the
          * whole part. buckets_are_full is what makes las do that; at
          * ratio 1 it grows the multiplier by its 5% margin only. */
-        las_gpu::disable("the device ran out of memory");
+        las_gpu::disable("a device pass could not be completed (see above)");
         throw buckets_are_full(
                 bkmult_specifier::getkey<fib_update_t>(), side, 0, 1, 1);
     }
@@ -557,10 +581,14 @@ void las_gpu_fib_prefetch(las_info & las, nfs_work & ws,
         las_gpu_fib_image & I(get_image(wss, fbs[side]));
         if (I.slices.empty())
             continue;
+        if (!fits_one_pass(std::accumulate(I.weights.begin(),
+                                           I.weights.end(), 0.0),
+                           conf.logI, J, nb, I.slices.size()))
+            continue;
         auto P = std::make_shared<las_gpu_fib_inflight>(
                 I, make_plan(conf.logI, J, nb, Q), fbs[side], side);
         if (!P->pass) {
-            las_gpu::disable("the device ran out of memory");
+            las_gpu::disable("a device pass could not be completed (see above)");
             return;
         }
         wss.gpu_fib_prefetched = std::move(P);

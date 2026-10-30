@@ -7,6 +7,8 @@
 #include "las-where-am-i-proxy.hpp"
 
 class nfs_aux;
+struct las_info;
+struct siever_config;
 class nfs_work;
 class thread_pool;
 
@@ -41,6 +43,11 @@ constexpr bool las_gpu_fib_takes_slice()
  */
 bool las_gpu_fib_usable(nfs_work const & ws, qlattice_basis const & Q);
 
+/* The same, for a special-q that is not being sieved yet, as far as it
+ * can be told before prepare_for_new_q(). */
+bool las_gpu_fib_usable_for(siever_config const & conf,
+                            qlattice_basis const & Q);
+
 /* Launch the device pass over every slice that
  * las_gpu_fib_takes_slice() accepts, and queue the task that will hand
  * its output to the bucket arrays once it is back.
@@ -60,6 +67,22 @@ bool las_gpu_fib_usable(nfs_work const & ws, qlattice_basis const & Q);
 double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
                          qlattice_basis const & Q, int side,
                          thread_pool & pool);
+
+/* Launch, ahead of time, the pass for a special-q whose sieve area has
+ * been chosen but which is not being sieved yet -- typically the next
+ * one, while the current one's bucket regions are being processed. The
+ * device's share of bucket sieving then costs nothing on the critical
+ * path, which is what keeps it from being the bottleneck when every
+ * core is busy.
+ *
+ * Nothing about the current special-q is touched. The pass is kept in
+ * nfs_work::side_data, and las_gpu_fib_start() adopts it if it turns
+ * out to be the one it needs: same slicing, same plan. Otherwise it is
+ * ignored, and replaced by the next prefetch.
+ */
+void las_gpu_fib_prefetch(las_info & las, nfs_work & ws,
+                          siever_config const & conf,
+                          qlattice_basis const & Q, uint32_t J);
 
 /* Device-side state that outlives a special-q, hung off
  * nfs_work::side_data. Opaque here so that the sieve headers stay free

@@ -153,6 +153,10 @@ class nfs_work {
          * so that it goes first. */
         std::shared_ptr<void> gpu_fib_pass;
 
+        /* A pass launched ahead of time for a special-q that is not
+         * being sieved yet; see las_gpu_fib_prefetch(). */
+        std::shared_ptr<void> gpu_fib_prefetched;
+
         /* fbK depends on
          *      conf.logI
          *      conf.sides[side].lim

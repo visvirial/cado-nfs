@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
@@ -52,6 +53,7 @@
 #include "las-divide-primes.hpp"
 #include "las-dlog-base.hpp"
 #include "las-duplicate.hpp"
+#include "las-fill-in-buckets-gpu.hpp"
 #include "las-fill-in-buckets.hpp"
 #include "las-globals.hpp"
 #include "gpu/las-gpu-select.hpp"
@@ -743,7 +745,34 @@ static void per_special_q_banner(special_q const & doing)
  * downsort, apply-buckets, lognorm computation, small sieve computation,
  * and survivor search and detection, all from here.
  */
-static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofac> const & wc_p, std::shared_ptr<nfs_aux> const & aux_p, ALGO::special_q_data const & Q, thread_pool & pool)/*{{{*/
+/* {{{ looking one special-q ahead
+ *
+ * When bucket sieving is offloaded, the device's share of it can be
+ * done for the next special-q while this one's bucket regions are being
+ * processed, which takes it off the critical path. That requires
+ * knowing the next special-q, and its sieve area, before this one is
+ * done: so we pull it early, and choose its sieve area early. The
+ * choice is kept, and used when its turn comes, rather than made a
+ * second time.
+ *
+ * This is only done when the order in which special-q's are pulled
+ * does not depend on the outcome of the previous ones -- i.e., not in
+ * the descent -- and only when there is a pass to prefetch, so that
+ * the ordinary path is left exactly as it was.
+ */
+struct special_q_lookahead {
+    special_q_task * task = nullptr;
+    /* whether the fields below are set: they are not when the task was
+     * pulled in the ordinary way */
+    bool chosen = false;
+    bool ok = false;
+    siever_config conf;
+    ALGO::special_q_data Q;
+    uint32_t J = 0;
+};
+/* }}} */
+
+static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofac> const & wc_p, std::shared_ptr<nfs_aux> const & aux_p, ALGO::special_q_data const & Q, thread_pool & pool, std::function<void()> const & look_ahead)/*{{{*/
 {
     int const nsides = ws.sides.size();
 
@@ -857,6 +886,15 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
             throw buckets_are_full(*std::ranges::max_element(exc));
     }
 
+    /* The buckets of this special-q are full: get the next one started
+     * on the device, ahead of the bucket regions of this one in the
+     * queue. */
+    if (look_ahead) {
+        pool.add_task(thread_pool::QUEUE_GENERIC,
+                std::numeric_limits<double>::max(),
+                [&look_ahead](worker_thread *) { look_ahead(); });
+    }
+
     {
         CHILD_TIMER(timer_special_q, "process_bucket_region outer container");
         TIMER_CATEGORY(timer_special_q, sieving_mixed());
@@ -920,7 +958,9 @@ do_one_special_q(
         las_info & las,
         nfs_work & ws,
         std::shared_ptr<nfs_aux> const & aux_p,
-        thread_pool & pool)/*{{{*/
+        thread_pool & pool,
+        special_q_lookahead const & chosen,
+        std::function<void()> const & look_ahead)/*{{{*/
 {
     nfs_aux & aux(*aux_p);
 
@@ -940,8 +980,16 @@ do_one_special_q(
      *
      */
     ALGO::special_q_data Q;
-    if (!choose_sieve_area(las, pool, aux.doing, ws.conf, Q, ws.J))
+    if (chosen.chosen && chosen.task == &aux.doing) {
+        /* already done by the lookahead */
+        if (!chosen.ok)
+            return false;
+        ws.conf = chosen.conf;
+        Q = chosen.Q;
+        ws.J = chosen.J;
+    } else if (!choose_sieve_area(las, pool, aux.doing, ws.conf, Q, ws.J)) {
         return false;
+    }
     ws.doing = Q.doing;
 
     check_whether_q_above_large_prime_bound(ws.conf, aux.doing);
@@ -1013,7 +1061,7 @@ do_one_special_q(
                         "# Sublattice (i,j) == ({}, {}) mod {}\n",
                         Q.sublat.i0, Q.sublat.j0, Q.sublat.m);
             }
-            do_one_special_q_sublat(ws, wc_p, aux_p, Q, pool);
+            do_one_special_q_sublat(ws, wc_p, aux_p, Q, pool, look_ahead);
         }
     }
 
@@ -1171,6 +1219,39 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
         });
         nfs_work ws(las, ALGO{});
 
+        special_q_lookahead ahead;
+        bool ahead_exhausted = false;
+        bool const can_look_ahead =
+#ifndef SIQS_SIEVE
+            las_gpu::stage_enabled(las_gpu::STAGE_BUCKETS) &&
+            dynamic_cast<special_q_task_collection_simple *>(las.tree.get());
+#else
+            false;
+#endif
+        /* Run from a pool task, while this special-q's bucket regions
+         * are processed; see special_q_lookahead. Idempotent, since it
+         * is reached once per sublattice and again on retries. */
+        std::function<void()> look_ahead;
+        if (can_look_ahead) {
+            look_ahead = [&]() {
+                if (ahead.task || ahead_exhausted)
+                    return;
+                ahead.task = las.tree->pull();
+                if (!ahead.task) {
+                    ahead_exhausted = true;
+                    return;
+                }
+                ahead.ok = choose_sieve_area(las, *ahead.task,
+                        ahead.conf, ahead.Q, ahead.J);
+                ahead.chosen = true;
+#ifndef SIQS_SIEVE
+                if (ahead.ok)
+                    las_gpu_fib_prefetch(las, ws, ahead.conf, ahead.Q,
+                            ahead.J);
+#endif
+            };
+        }
+
         /* {{{ Doc on todo list handling
          * The function las_todo_feed behaves in different
          * ways depending on whether we're in q-range mode or in q-list mode.
@@ -1192,7 +1273,14 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
 
             main_output->fflush();
 
-            auto * task = las.tree->pull();
+            special_q_lookahead chosen;
+            if (ahead.task) {
+                chosen = std::move(ahead);
+                ahead = special_q_lookahead();
+            } else {
+                chosen.task = las.tree->pull();
+            }
+            auto * task = chosen.task;
 
             if (!task) break;
 
@@ -1247,7 +1335,8 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
 
                     prepare_timer_layout_for_multithreaded_tasks(timer_special_q, las.cpoly.nsides());
 
-                    bool const done = do_one_special_q(las, ws, aux_p, pool);
+                    bool const done = do_one_special_q(las, ws, aux_p, pool,
+                            chosen, look_ahead);
 
                     if (!done) {
                         /* Then we don't even keep track of the time, it's

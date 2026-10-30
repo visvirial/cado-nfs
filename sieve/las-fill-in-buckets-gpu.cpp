@@ -20,8 +20,11 @@
 #include "las-config.hpp"
 #include "las-fbroot-qlattice.hpp"
 #include "las-fill-in-buckets-gpu.hpp"
+#include "las-info.hpp"
+#include "las-norms.hpp"
 #include "las-plattice.hpp"
 #include "las-qlattice.hpp"
+#include "las-siever-config.hpp"
 #include "las-threads-work-data.hpp"
 #include "las-auxiliary-data.hpp"
 #include "las-where-am-i.hpp"
@@ -278,8 +281,8 @@ static void crosscheck(las_gpu_fib_image const & I, gpu_fib_plan const & plan,
 /* }}} */
 /* {{{ the pass */
 
-bool las_gpu_fib_usable(nfs_work const & ws MAYBE_UNUSED,
-                        qlattice_basis const & Q MAYBE_UNUSED)
+bool las_gpu_fib_usable_for(siever_config const & conf MAYBE_UNUSED,
+                            qlattice_basis const & Q MAYBE_UNUSED)
 {
 #if defined(TRACE_K) || defined(SIQS_SIEVE) || defined(SUPPORT_LARGE_Q)
     /* The device path covers the plain case only. It cannot report
@@ -290,9 +293,7 @@ bool las_gpu_fib_usable(nfs_work const & ws MAYBE_UNUSED,
 #else
     if (!las_gpu::stage_enabled(las_gpu::STAGE_BUCKETS))
         return false;
-    if (ws.toplevel != 1)
-        return false;
-    if (Q.sublat.m)
+    if (Q.sublat.m || conf.sublat_bound)
         return false;
     /* The kernel filters the primes dividing the special-q against a
      * small fixed-size list, like Q.is_coprime_to() does. A q with more
@@ -303,19 +304,26 @@ bool las_gpu_fib_usable(nfs_work const & ws MAYBE_UNUSED,
 #endif
 }
 
+bool las_gpu_fib_usable(nfs_work const & ws, qlattice_basis const & Q)
+{
+    return ws.toplevel == 1 && las_gpu_fib_usable_for(ws.conf, Q);
+}
+
 /* One device pass. It outlives the special-q's bucket filling: the
  * bucket arrays point into its output, so it is held by the side data
  * until the next special-q's pass replaces it. */
 struct las_gpu_fib_inflight {
     las_gpu_fib_image & I;
     gpu_fib_plan plan;
+    void const * fbs;
     gpu_fib_pass * pass;
     int side;
     gpu_fib_output out {};
 
     las_gpu_fib_inflight(las_gpu_fib_image & I, gpu_fib_plan const & plan,
-                         int side)
-        : I(I), plan(plan), pass(I.eng->fib_launch(I.task, plan)), side(side)
+                         void const * fbs, int side)
+        : I(I), plan(plan), fbs(fbs)
+        , pass(I.eng->fib_launch(I.task, plan)), side(side)
     {}
     las_gpu_fib_inflight(las_gpu_fib_inflight const &) = delete;
     las_gpu_fib_inflight & operator=(las_gpu_fib_inflight const &) = delete;
@@ -370,44 +378,35 @@ static void collect(worker_thread * worker, int side, nfs_work & ws,
     }
 }
 
-double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
-                         qlattice_basis const & Q, int side,
-                         thread_pool & pool)
+static las_gpu_fib_image & get_image(nfs_work::side_data & wss,
+                                     fb_factorbase::slicing const * fbs)
 {
-    nfs_work::side_data & wss(ws.sides[side]);
-
-    /* The previous special-q is done with it, and the bucket arrays
-     * that pointed into it have been reset. Give it back before taking
-     * a new one, so that a side never holds two. */
-    wss.gpu_fib_pass.reset();
-
     if (!wss.gpu_fib || wss.gpu_fib->eng != las_gpu::engine()) {
         wss.gpu_fib.reset(new las_gpu_fib_cache);
         wss.gpu_fib->eng = las_gpu::engine();
     }
-    auto & slot = wss.gpu_fib->images[wss.fbs];
+    auto & slot = wss.gpu_fib->images[fbs];
     if (!slot)
-        slot = build_image(*wss.fbs);
-    las_gpu_fib_image & I(*slot);
+        slot = build_image(*fbs);
+    return *slot;
+}
 
-    if (I.slices.empty())
-        return 0;
-
-    uint32_t const nb = uint32_t(ws.nb_buckets[1]);
-
+static gpu_fib_plan make_plan(int logI, uint32_t J, uint32_t nb,
+                              qlattice_basis const & Q)
+{
     /* The kernels index the per-bucket arrays by x >> log_bucket_region
      * for every x below J << logI, so the bucket arrays have to be at
      * least that wide. They always are -- las rounds the bucket count
      * up, and truncates J afterwards rather than before -- but an
      * overrun here would be a silent out-of-bounds atomic on the
      * device, so it is worth one comparison per special-q to be sure. */
-    ASSERT_ALWAYS((uint64_t(ws.J) << ws.conf.logI) <=
+    ASSERT_ALWAYS((uint64_t(J) << logI) <=
                   (uint64_t(nb) << LOG_BUCKET_REGIONS[1]));
 
     gpu_fib_plan plan {};
-    plan.logI = ws.conf.logI;
+    plan.logI = logI;
     plan.log_bucket_region = LOG_BUCKET_REGIONS[1];
-    plan.J = ws.J;
+    plan.J = J;
     plan.n_buckets = nb;
     plan.basis = gpu_qlattice {Q.a0, Q.b0, Q.a1, Q.b1};
 
@@ -418,8 +417,60 @@ double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
         if (f <= UINT32_MAX)
             plan.q_factors[plan.n_q_factors++] = uint32_t(f);
     }
+    return plan;
+}
 
-    auto F = std::make_shared<las_gpu_fib_inflight>(I, plan, side);
+static bool same_plan(gpu_fib_plan const & a, gpu_fib_plan const & b)
+{
+    if (a.logI != b.logI || a.log_bucket_region != b.log_bucket_region ||
+            a.J != b.J || a.n_buckets != b.n_buckets ||
+            a.basis.a0 != b.basis.a0 || a.basis.b0 != b.basis.b0 ||
+            a.basis.a1 != b.basis.a1 || a.basis.b1 != b.basis.b1 ||
+            a.n_q_factors != b.n_q_factors)
+        return false;
+    for (int i = 0; i < a.n_q_factors; i++)
+        if (a.q_factors[i] != b.q_factors[i])
+            return false;
+    return true;
+}
+
+double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
+                         qlattice_basis const & Q, int side,
+                         thread_pool & pool)
+{
+    nfs_work::side_data & wss(ws.sides[side]);
+
+    /* The previous special-q is done with it, and the bucket arrays
+     * that pointed into it have been reset. Give it back before taking
+     * a new one, so that a side never holds more than it needs. */
+    wss.gpu_fib_pass.reset();
+
+    las_gpu_fib_image & I(get_image(wss, wss.fbs));
+
+    if (I.slices.empty())
+        return 0;
+
+    gpu_fib_plan const plan = make_plan(ws.conf.logI, ws.J,
+            uint32_t(ws.nb_buckets[1]), Q);
+
+    /* Most of the time las_gpu_fib_prefetch() has already launched this
+     * very pass, while the previous special-q was being sieved. It was
+     * computed from a sieve area and a slicing chosen ahead of time, so
+     * we only take it if they turn out to be the ones we have now; the
+     * plan and the slicing are all the device ever saw. A prefetched
+     * pass that does not match is left alone rather than dropped: when
+     * a special-q is retried after buckets_are_full, the one in store
+     * is for the next special-q, not for this one. */
+    std::shared_ptr<las_gpu_fib_inflight> F;
+    if (auto P = std::static_pointer_cast<las_gpu_fib_inflight>(
+                wss.gpu_fib_prefetched)) {
+        if (P->fbs == wss.fbs && &P->I == &I && same_plan(P->plan, plan)) {
+            F = std::move(P);
+            wss.gpu_fib_prefetched.reset();
+        }
+    }
+    if (!F)
+        F = std::make_shared<las_gpu_fib_inflight>(I, plan, wss.fbs, side);
     wss.gpu_fib_pass = F;
 
     /* Cost 0, so that the pool gets to it last: by then the device has
@@ -428,6 +479,50 @@ double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
                   side, std::ref(ws), std::ref(aux), std::cref(Q), F);
 
     return std::accumulate(I.weights.begin(), I.weights.end(), 0.0);
+}
+
+void las_gpu_fib_prefetch(las_info & las, nfs_work & ws,
+                          siever_config const & conf,
+                          qlattice_basis const & Q, uint32_t J)
+{
+    if (!las_gpu_fib_usable_for(conf, Q))
+        return;
+
+    int const nsides = las.cpoly.nsides();
+
+    /* What prepare_for_new_q() and compute_toplevel_and_buckets() will
+     * decide once this special-q is actually sieved. Any divergence is
+     * caught by las_gpu_fib_start(), which then ignores the pass. */
+    std::vector<fb_factorbase::slicing const *> fbs(nsides, nullptr);
+    int toplevel = -1;
+    for (int side = 0; side < nsides; side++) {
+        if (las.no_fb(side))
+            continue;
+        lognorm_base const L(conf, las.cpoly, side, Q, conf.logI, J);
+        fb_factorbase::key_type fbK = conf.instantiate_thresholds(side);
+        fbK.scale = L.scale;
+        fbK.nb_threads = las.number_of_threads_per_subjob();
+        fbs[side] = las.get_factorbase_slicing(side, fbK);
+        toplevel = std::max(toplevel, fbs[side]->get_toplevel());
+    }
+    if (toplevel != 1)
+        return;
+    uint32_t const nb = uint32_t(iceildiv(UINT64_C(1) << conf.logA,
+                                          BUCKET_REGIONS[1]));
+    if (nb <= 1)
+        return;
+
+    for (int side = 0; side < nsides; side++) {
+        nfs_work::side_data & wss(ws.sides[side]);
+        wss.gpu_fib_prefetched.reset();
+        if (!fbs[side])
+            continue;
+        las_gpu_fib_image & I(get_image(wss, fbs[side]));
+        if (I.slices.empty())
+            continue;
+        wss.gpu_fib_prefetched = std::make_shared<las_gpu_fib_inflight>(
+                I, make_plan(conf.logI, J, nb, Q), fbs[side], side);
+    }
 }
 
 /* }}} */

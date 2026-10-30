@@ -174,6 +174,10 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
                 LEVEL, HINT::rtti[0], new_big_size * sizeof(update_t),
                 new_n_bucket, bs_even, sizeof(update_t));
         }
+        /* Nothing in the old array is kept, and holding on to it while we
+         * get the new one is what would set the peak of the whole process.
+         */
+        big_data.reset();
         big_data = memory.make_unique_physical_array<update_t>(new_big_size, true);
     }
 

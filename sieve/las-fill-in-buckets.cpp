@@ -396,7 +396,9 @@ static void fill_in_buckets_one_side(nfs_work & ws, nfs_aux & aux,
     bool gpu = false;
 #ifndef SIQS_SIEVE
     if constexpr (LEVEL == 1 && std::is_same_v<TARGET_HINT, shorthint_t>) {
-        if (las_gpu_fib_usable(ws, Q))
+        /* Decided once per special-q, by prepare_for_new_q(), which
+         * also sized the bucket arrays accordingly. */
+        if (wss.gpu_fib_weight > 0)
             gpu = las_gpu_fib_start(ws, aux, Q, side, pool) > 0;
     }
 #endif

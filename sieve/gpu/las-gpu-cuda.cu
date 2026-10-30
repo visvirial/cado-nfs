@@ -39,6 +39,29 @@
         }                                                                     \
     } while (0)
 
+/* For the allocations of the bucket-sieving path, which las can recover
+ * from: the device may well be shared with other las processes, and run
+ * out. Memory exhaustion is reported as a failure, which las answers by
+ * going back to the CPU; anything else is a bug and aborts as above.
+ * The error is cleared either way, or the next
+ * CUDA_CHECK(cudaGetLastError()) would trip over it. */
+#define CUDA_ALLOC(call) cuda_alloc_ok((call), #call, __FILE__, __LINE__)
+static bool cuda_alloc_ok(cudaError_t err, char const * what,
+                          char const * file, int line)
+{
+    if (err == cudaSuccess)
+        return true;
+    (void) cudaGetLastError();
+    if (err == cudaErrorMemoryAllocation) {
+        fprintf(stderr, "# las-gpu: %s failed: %s\n", what,
+                cudaGetErrorString(err));
+        return false;
+    }
+    fprintf(stderr, "%s:%d: CUDA error in %s: %s\n", file, line, what,
+            cudaGetErrorString(err));
+    abort();
+}
+
 #define CUDA_TRY(call)                                                        \
     do {                                                                      \
         cudaError_t const cado_cuda_err_ = (call);                            \
@@ -580,7 +603,7 @@ struct cuda_engine : public gpu_engine {
     };
     std::vector<host_buffer> fib_host_free;
 
-    void fib_host_take(cuda_fib_scratch * sc, uint32_t total)
+    bool fib_host_take(cuda_fib_scratch * sc, uint32_t total)
     {
         host_buffer hb {nullptr, 0};
         {
@@ -606,16 +629,20 @@ struct cuda_engine : public gpu_engine {
              * first few special-q's and allocating page-locked memory
              * is not cheap. */
             cudaFreeHost(hb.p);
+            hb = host_buffer {nullptr, 0};
             uint64_t want = uint64_t(total) + total / 4;
             if (want > UINT32_MAX)
                 want = UINT32_MAX;
-            CUDA_CHECK(cudaHostAlloc(&hb.p,
-                                     size_t(want) * sizeof(gpu_fib_update),
-                                     cudaHostAllocDefault));
+            if (!CUDA_ALLOC(cudaHostAlloc(&hb.p,
+                                          size_t(want) *
+                                              sizeof(gpu_fib_update),
+                                          cudaHostAllocDefault)))
+                return false;
             hb.capacity = uint32_t(want);
         }
         sc->h_updates = hb.p;
         sc->h_updates_capacity = hb.capacity;
+        return true;
     }
 
     void fib_host_give(cuda_fib_scratch * sc)
@@ -664,10 +691,18 @@ struct cuda_engine : public gpu_engine {
             }
         }
         auto * sc = new cuda_fib_scratch;
-        CUDA_CHECK(cudaStreamCreate(&sc->stream));
-        CUDA_CHECK(cudaMalloc(&sc->d_nhost, sizeof(unsigned long long)));
-        CUDA_CHECK(cudaHostAlloc(&sc->h_nhost, sizeof(unsigned long long),
-                                 cudaHostAllocDefault));
+        if (!CUDA_ALLOC(cudaStreamCreate(&sc->stream)) ||
+                !CUDA_ALLOC(cudaMalloc(&sc->d_nhost,
+                                       sizeof(unsigned long long))) ||
+                !CUDA_ALLOC(cudaHostAlloc(&sc->h_nhost,
+                                          sizeof(unsigned long long),
+                                          cudaHostAllocDefault))) {
+            cudaFree(sc->d_nhost);
+            if (sc->stream)
+                cudaStreamDestroy(sc->stream);
+            delete sc;
+            return nullptr;
+        }
         std::lock_guard<std::mutex> const lock(fib_mu);
         fib_all.push_back(sc);
         return sc;
@@ -691,11 +726,15 @@ struct cuda_engine : public gpu_engine {
                 es[slices[s].first + k] = s;
 
         size_t const ebytes = size_t(nentries) * sizeof(gpu_fib_entry);
-        CUDA_CHECK(cudaMalloc(&t->d_entries, ebytes));
+        if (!CUDA_ALLOC(cudaMalloc(&t->d_entries, ebytes)) ||
+                !CUDA_ALLOC(cudaMalloc(&t->d_entry_slice,
+                                       size_t(nentries) * sizeof(uint32_t)))) {
+            cudaFree(t->d_entries);
+            delete t;
+            return nullptr;
+        }
         CUDA_CHECK(cudaMemcpy(t->d_entries, entries, ebytes,
                               cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&t->d_entry_slice,
-                              size_t(nentries) * sizeof(uint32_t)));
         CUDA_CHECK(cudaMemcpy(t->d_entry_slice, es.data(),
                               size_t(nentries) * sizeof(uint32_t),
                               cudaMemcpyHostToDevice));
@@ -736,6 +775,8 @@ struct cuda_engine : public gpu_engine {
         auto * t = reinterpret_cast<cuda_fib_task *>(task);
         CUDA_CHECK(cudaSetDevice(device));
         cuda_fib_scratch * const sc = fib_scratch_take();
+        if (!sc)
+            return nullptr;
         cudaStream_t const stream = sc->stream;
         sc->task = t;
         sc->plan = plan;
@@ -749,29 +790,51 @@ struct cuda_engine : public gpu_engine {
             cudaFree(sc->d_scan_temp);
             cudaFreeHost(sc->h_counts);
             cudaFreeHost(sc->h_offsets);
+            sc->d_counts = sc->d_offsets = sc->d_cursor = nullptr;
+            sc->d_scan_temp = nullptr;
+            sc->h_counts = sc->h_offsets = nullptr;
+            sc->grid_capacity = 0;
             size_t const n = grid + 1;
-            CUDA_CHECK(cudaMalloc(&sc->d_counts, n * sizeof(uint32_t)));
-            CUDA_CHECK(cudaMalloc(&sc->d_offsets, n * sizeof(uint32_t)));
-            CUDA_CHECK(cudaMalloc(&sc->d_cursor, n * sizeof(uint32_t)));
-            CUDA_CHECK(cudaHostAlloc(&sc->h_counts, n * sizeof(uint32_t),
-                                     cudaHostAllocDefault));
-            CUDA_CHECK(cudaHostAlloc(&sc->h_offsets, n * sizeof(uint32_t),
-                                     cudaHostAllocDefault));
             sc->scan_temp_bytes = 0;
             CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
                 nullptr, sc->scan_temp_bytes, sc->d_counts, sc->d_offsets,
                 n));
-            CUDA_CHECK(cudaMalloc(&sc->d_scan_temp, sc->scan_temp_bytes));
+            if (!CUDA_ALLOC(cudaMalloc(&sc->d_counts, n * sizeof(uint32_t))) ||
+                    !CUDA_ALLOC(cudaMalloc(&sc->d_offsets,
+                                           n * sizeof(uint32_t))) ||
+                    !CUDA_ALLOC(cudaMalloc(&sc->d_cursor,
+                                           n * sizeof(uint32_t))) ||
+                    !CUDA_ALLOC(cudaHostAlloc(&sc->h_counts,
+                                              n * sizeof(uint32_t),
+                                              cudaHostAllocDefault)) ||
+                    !CUDA_ALLOC(cudaHostAlloc(&sc->h_offsets,
+                                              n * sizeof(uint32_t),
+                                              cudaHostAllocDefault)) ||
+                    !CUDA_ALLOC(cudaMalloc(&sc->d_scan_temp,
+                                           sc->scan_temp_bytes))) {
+                /* what did get allocated stays, with grid_capacity 0
+                 * so that the next launch starts over */
+                fib_release(reinterpret_cast<gpu_fib_pass *>(sc));
+                return nullptr;
+            }
             sc->grid_capacity = n;
         }
         if (t->nentries > sc->host_capacity) {
             cudaFree(sc->d_host_entries);
             cudaFreeHost(sc->h_host_entries);
-            CUDA_CHECK(cudaMalloc(&sc->d_host_entries,
-                                  size_t(t->nentries) * sizeof(uint32_t)));
-            CUDA_CHECK(cudaHostAlloc(&sc->h_host_entries,
-                                     size_t(t->nentries) * sizeof(uint32_t),
-                                     cudaHostAllocDefault));
+            sc->d_host_entries = nullptr;
+            sc->h_host_entries = nullptr;
+            sc->host_capacity = 0;
+            if (!CUDA_ALLOC(cudaMalloc(&sc->d_host_entries,
+                                       size_t(t->nentries) *
+                                           sizeof(uint32_t))) ||
+                    !CUDA_ALLOC(cudaHostAlloc(&sc->h_host_entries,
+                                              size_t(t->nentries) *
+                                                  sizeof(uint32_t),
+                                              cudaHostAllocDefault))) {
+                fib_release(reinterpret_cast<gpu_fib_pass *>(sc));
+                return nullptr;
+            }
             sc->host_capacity = t->nentries;
         }
 
@@ -830,12 +893,17 @@ struct cuda_engine : public gpu_engine {
             if (want > UINT32_MAX)
                 want = UINT32_MAX;
             cudaFree(sc->d_updates);
-            CUDA_CHECK(cudaMalloc(&sc->d_updates,
-                                  size_t(want) * sizeof(gpu_fib_update)));
+            sc->d_updates = nullptr;
+            sc->updates_capacity = 0;
+            if (!CUDA_ALLOC(cudaMalloc(&sc->d_updates,
+                                       size_t(want) *
+                                           sizeof(gpu_fib_update))))
+                return gpu_fib_output {};
             sc->updates_capacity = uint32_t(want);
             fib_enqueue_scatter(sc, grid);
         }
-        fib_host_take(sc, total);
+        if (!fib_host_take(sc, total))
+            return gpu_fib_output {};
 
         if (nhost)
             CUDA_CHECK(cudaMemcpyAsync(sc->h_host_entries, sc->d_host_entries,
@@ -847,7 +915,7 @@ struct cuda_engine : public gpu_engine {
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         return gpu_fib_output {
-            t->nslices, sc->plan.n_buckets,
+            true, t->nslices, sc->plan.n_buckets,
             sc->h_counts, sc->h_offsets, sc->h_updates,
             sc->h_host_entries, nhost,
         };

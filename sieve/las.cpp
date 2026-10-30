@@ -26,6 +26,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -150,7 +151,9 @@ static void declare_usage(cxx_param_list & pl)/*{{{*/
     pl.declare_usage("file-cofact", "provide file with strategies for the cofactorization step");
     pl.declare_usage("prepend-relation-time", "prefix all relation produced with time offset since beginning of special-q processing");
     pl.declare_usage("gpu", "backend for the offloaded sieve stages"
-            " (none, cpu, cuda, cuda:<n>, auto); see sieve/gpu");
+            " (auto, none, cpu, cuda, cuda:<n>). Defaults to auto: the"
+            " first CUDA device if there is a usable one, none otherwise;"
+            " see sieve/gpu");
     pl.declare_usage("gpu-stages", "which stages -gpu offloads"
             " (comma-separated: norms, survivors, buckets; or all, none)."
             " Defaults to buckets, the only one a device is reliably"
@@ -1585,16 +1588,23 @@ int main (int argc0, char const * argv0[])/*{{{*/
     pl.parse("-never-discard", never_discard);
 
     {
-        /* Throws if the spec names a backend we do not have, or a
+        /* Fails if the spec names a backend we do not have, or a
          * device we cannot open. Do it here, before any of the
          * expensive setup, so that a typo costs nothing. */
-        std::string gpu_backend = "none";
+        std::string gpu_backend = "auto";
         pl.parse("gpu", gpu_backend);
-        las_gpu::select(gpu_backend);
-
         std::string gpu_stages = "buckets";
         pl.parse("gpu-stages", gpu_stages);
-        las_gpu::select_stages(gpu_stages);
+        try {
+            las_gpu::select(gpu_backend);
+            las_gpu::select_stages(gpu_stages);
+        } catch (std::runtime_error const & e) {
+            fmt::print(stderr, "Error: {}\n", e.what());
+            exit(EXIT_FAILURE);
+        }
+
+        verbose_fmt_print(0, 1, "# las-gpu: offload backend: {}\n",
+                las_gpu::describe());
     }
 
     pl.parse("trialdiv-first-side", trialdiv_first_side);

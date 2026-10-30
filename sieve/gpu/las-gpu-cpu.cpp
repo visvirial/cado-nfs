@@ -231,7 +231,7 @@ struct cpu_engine : public gpu_engine {
     {
         auto & P = *reinterpret_cast<cpu_fib_pass *>(pass);
         return gpu_fib_output {
-            P.nslices, P.nb,
+            true, P.nslices, P.nb,
             P.counts.data(), P.offsets.data(), P.updates.data(),
             P.host_entries.data(), P.host_entries.size(),
         };

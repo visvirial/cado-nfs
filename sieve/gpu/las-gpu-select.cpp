@@ -1,5 +1,6 @@
 #include "cado.h" // IWYU pragma: keep
 
+#include <atomic>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -12,7 +13,8 @@ namespace las_gpu {
 
 namespace {
 std::unique_ptr<gpu_engine> the_engine;
-unsigned the_stages = STAGE_BUCKETS;
+std::atomic<unsigned> the_stages {STAGE_BUCKETS};
+std::atomic<bool> disabled {false};
 }
 
 void select(std::string const & spec)
@@ -65,7 +67,9 @@ void select(std::string const & spec)
                     ? "no such device, or driver unavailable"
                     : "cado-nfs was built without CUDA support"));
         }
-        the_engine.reset(gpu_engine_cpu_create());
+        /* Not the cpu backend: it is a reference implementation, and
+         * much slower than not offloading at all. */
+        the_engine.reset();
     }
 }
 
@@ -104,7 +108,17 @@ void select_stages(std::string const & spec)
 
 bool stage_enabled(stage s)
 {
-    return the_engine && (the_stages & unsigned(s));
+    return the_engine && !disabled.load(std::memory_order_relaxed) &&
+        (the_stages.load(std::memory_order_relaxed) & unsigned(s));
+}
+
+void disable(char const * why)
+{
+    if (disabled.exchange(true))
+        return;
+    fmt::print(stderr,
+            "# las-gpu: {}; offloading is disabled for the rest of this"
+            " run, and the sieving carries on on the CPU\n", why);
 }
 
 gpu_engine * engine()

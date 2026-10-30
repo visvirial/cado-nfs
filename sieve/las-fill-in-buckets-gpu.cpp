@@ -338,12 +338,17 @@ struct las_gpu_fib_inflight {
     las_gpu_fib_inflight(las_gpu_fib_image & I, gpu_fib_plan const & plan,
                          void const * fbs, int side)
         : I(I), plan(plan), fbs(fbs)
-        , pass(I.eng->fib_launch(I.task, plan)), side(side)
+        , pass(I.task ? I.eng->fib_launch(I.task, plan) : nullptr)
+        , side(side)
     {}
     las_gpu_fib_inflight(las_gpu_fib_inflight const &) = delete;
     las_gpu_fib_inflight & operator=(las_gpu_fib_inflight const &) = delete;
 
-    ~las_gpu_fib_inflight() { I.eng->fib_release(pass); }
+    ~las_gpu_fib_inflight()
+    {
+        if (pass)
+            I.eng->fib_release(pass);
+    }
 };
 
 /* Wait for the device, then hand its output to a bucket array -- any
@@ -370,8 +375,21 @@ static void collect(worker_thread * worker, int side, nfs_work & ws,
     WHERE_AM_I_UPDATE(w, N, 0);
 
     las_gpu_fib_image const & I(F->I);
-    F->out = I.eng->fib_wait(F->pass);
+    if (F->pass)
+        F->out = I.eng->fib_wait(F->pass);
     gpu_fib_output const & out(F->out);
+
+    if (!out.ok) {
+        /* The device ran out of memory, most likely because other
+         * processes share it. The bucket arrays have no room for what
+         * the device was to do, so this special-q has to start over:
+         * with offloading off, prepare_for_new_q() sizes them for the
+         * whole part. buckets_are_full is what makes las do that; at
+         * ratio 1 it grows the multiplier by its 5% margin only. */
+        las_gpu::disable("the device ran out of memory");
+        throw buckets_are_full(
+                bkmult_specifier::getkey<fib_update_t>(), side, 0, 1, 1);
+    }
 
     static bool const xcheck = getenv("LAS_GPU_FIB_CROSSCHECK") != nullptr;
     if (xcheck)
@@ -462,6 +480,10 @@ double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
 
     las_gpu_fib_image & I(get_image(wss, wss.fbs));
 
+    /* Even when offloading has been disabled since prepare_for_new_q()
+     * decided on it, we go ahead: the bucket arrays were sized for it.
+     * At worst the launch fails, and collect() has the special-q
+     * redone. */
     if (I.slices.empty())
         return 0;
 
@@ -535,8 +557,13 @@ void las_gpu_fib_prefetch(las_info & las, nfs_work & ws,
         las_gpu_fib_image & I(get_image(wss, fbs[side]));
         if (I.slices.empty())
             continue;
-        wss.gpu_fib_prefetched = std::make_shared<las_gpu_fib_inflight>(
+        auto P = std::make_shared<las_gpu_fib_inflight>(
                 I, make_plan(conf.logI, J, nb, Q), fbs[side], side);
+        if (!P->pass) {
+            las_gpu::disable("the device ran out of memory");
+            return;
+        }
+        wss.gpu_fib_prefetched = std::move(P);
     }
 }
 

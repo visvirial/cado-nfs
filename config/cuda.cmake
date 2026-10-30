@@ -5,7 +5,11 @@
 #
 #       ENABLE_CUDA=1 make
 #
-# or -DENABLE_CUDA=1 on the cmake command line. CUDA_ARCH, if set, is
+# or -DENABLE_CUDA=1 on the cmake command line. A las built this way
+# offloads bucket sieving to the first usable CUDA device by default
+# (-gpu auto), and sieves on the CPU alone when there is none, or when
+# the device runs out of memory; pass -gpu none to keep it off the
+# device altogether. CUDA_ARCH, if set, is
 # passed on as CMAKE_CUDA_ARCHITECTURES ("native" by default, which
 # requires a visible device at configure time; set it explicitly, e.g.
 # CUDA_ARCH=80, when cross-building for a machine you do not have).

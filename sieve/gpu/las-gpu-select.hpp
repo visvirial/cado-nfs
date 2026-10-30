@@ -13,12 +13,14 @@
 namespace las_gpu {
 
 /* Accepted specs:
- *   "none"      offloading disabled (the default)
- *   "cpu"       the portable host backend -- same arithmetic, no device
+ *   "auto"      "cuda" if that works, "none" otherwise (las's default)
+ *   "none"      offloading disabled
+ *   "cpu"       the portable host backend -- same arithmetic, no device.
+ *               A reference for testing, much slower than "none".
  *   "cuda"      first usable CUDA device
  *   "cuda:<n>"  CUDA device number n
- *   "auto"      "cuda" if that works, "cpu" otherwise
- * Throws std::runtime_error on an unknown spec or an unusable device.
+ * Throws std::runtime_error on an unknown spec, or when "cuda" or
+ * "cuda:<n>" names a device that cannot be used.
  */
 void select(std::string const & spec);
 
@@ -47,6 +49,12 @@ enum stage : unsigned {
 
 void select_stages(std::string const & spec);
 bool stage_enabled(stage s);
+
+/* Stop offloading for good, e.g. because the device ran out of memory;
+ * stage_enabled() returns false from then on. The engine itself stays,
+ * so that passes already in flight can complete. Prints `why` once.
+ * Thread-safe. */
+void disable(char const * why);
 
 /* Human-readable name of the active backend, "none" if there is none. */
 std::string describe();

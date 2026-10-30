@@ -36,6 +36,10 @@ struct gpu_fib_pass;
  * arrays without moving anything twice.
  */
 struct gpu_fib_output {
+    /* false when the backend ran out of memory, in which case nothing
+     * else in here is meaningful */
+    bool ok;
+
     uint32_t nslices;
     uint32_t n_buckets;
 
@@ -114,6 +118,12 @@ struct gpu_engine {
     virtual void fib_task_destroy(gpu_fib_task * task) = 0;
 
     /* Sieve the whole part for one special-q.
+     *
+     * fib_task_create() and fib_launch() return nullptr, and
+     * fib_wait() an output with ok == false, when the backend runs out
+     * of memory: the device may be shared with other processes, and las
+     * then carries on without it. fib_release() must still be called on
+     * a pass whose wait failed.
      *
      * fib_launch() queues the pass and returns at once when the backend
      * is asynchronous, so that the caller can get on with whatever does

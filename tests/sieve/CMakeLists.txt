@@ -189,6 +189,19 @@ cado_divert_test(F9 sieve
             REFERENCE_REVISION=2c5ac2cff
         )
 
+# On a CUDA build, las offloads bucket sieving by default (-gpu auto),
+# so the run above may well go through the device. This one pins the
+# CPU path, so that it stays covered there too.
+if(HAVE_CUDA)
+    cado_divert_test(F9 sieve_nogpu
+            APPEND_ENVIRONMENT
+                REL_COUNT=432
+                REFERENCE_SHA1=ffe3f2036e7b80b2a7a56bc397f665506430f386
+                REFERENCE_REVISION=2c5ac2cff
+            APPEND_ARGUMENTS -gpu none
+            )
+endif()
+
 # The same sieve, with the stages that -gpu can offload actually
 # offloaded. Both must produce the very same relations -- that is the
 # contract of the whole gpu/ directory -- and, because they share

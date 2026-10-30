@@ -618,6 +618,14 @@ search_survivors_in_line(unsigned char * const SS[2],
                 }
                 return;
             }
+            /* The other fragments of the line, when logI >
+             * LOG_BUCKET_REGION: nothing there is coprime, and the
+             * unsieving below does nothing for jj == 0. Only without
+             * sublattices, where the cell above is the right one. */
+            if (sublat.m == 1) {
+                memset(SS[0], 255, i1 - i0);
+                return;
+            }
         }
 
         unsieve_not_coprime_line(Sf, j, i0, i1, td_max + 1, us, sublat);
@@ -648,6 +656,11 @@ search_survivors_in_line(unsigned char * const SS[2],
                     Sf[1 - i0] = s;
                     survivors.push_back(1 - i0);
                 }
+                return;
+            }
+            /* see above */
+            if (sublat.m == 1) {
+                memset(Sf, 255, i1 - i0);
                 return;
             }
         }

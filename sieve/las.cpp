@@ -903,7 +903,22 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
         TIMER_CATEGORY(timer_special_q, sieving_mixed());
         if (ws.toplevel == 1) {
             /* Process bucket regions in parallel */
+#ifndef SIQS_SIEVE
+            /* When the device fills the buckets of a large area, it
+             * does so in chunks, which have to be moved along. */
+            bool const gpu = std::ranges::any_of(ws.sides,
+                    [](auto const & wss) { return wss.gpu_fib_weight > 0; });
+            std::function<bool(int)> advance;
+            if (gpu) {
+                advance = [&ws, &pool](int region) {
+                    return las_gpu_fib_advance(ws, pool, region);
+                };
+            }
+            process_many_bucket_regions(ws, wc_p, aux_p, Q, pool, 0, w,
+                    advance);
+#else
             process_many_bucket_regions(ws, wc_p, aux_p, Q, pool, 0, w);
+#endif
         } else {
             // Prepare plattices at internal levels
 
@@ -953,6 +968,11 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
     } else {
         pool.drain_queue(thread_pool::QUEUE_GENERIC);
     }
+
+#ifndef SIQS_SIEVE
+    /* if the device failed half-way through, start over on the CPU */
+    las_gpu_fib_check_failure(ws);
+#endif
 }/*}}}*/
 
 /* This returns false if the special-q was discarded */

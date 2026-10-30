@@ -21,6 +21,7 @@ struct gpu_survivor_task;
 struct gpu_fib_task;
 
 struct gpu_fib_pass;
+struct gpu_fib_state;
 
 /* What a bucket-sieving pass hands back. Every pointer is owned by the
  * pass and stays valid until fib_release().
@@ -43,14 +44,18 @@ struct gpu_fib_output {
     uint32_t nslices;
     uint32_t n_buckets;
 
-    /* n_buckets * nslices values */
+    /* n_buckets is the number of buckets of the pass, i.e. the
+     * plan's chunk_count; bucket b here is chunk_begin + b in the
+     * sieve area. n_buckets * nslices values: */
     uint32_t const * counts;
     /* exclusive prefix sums of counts[], plus the total at the end */
     uint32_t const * offsets;
     gpu_fib_update const * updates;
 
     /* Lattices the kernel declined to handle (see GPU_FIB_HOST), as
-     * indices into the entry array, in no particular order. */
+     * indices into the entry array, in no particular order. Reported
+     * by the first chunk only (chunk_begin == 0): the host replays
+     * them over the whole area. */
     uint32_t const * host_entries;
     uint64_t nhost;
 };
@@ -138,7 +143,18 @@ struct gpu_engine {
      * position, and resieving looks at every update of a bucket region.
      */
     virtual gpu_fib_pass * fib_launch(gpu_fib_task * task,
-                                      gpu_fib_plan const & plan) = 0;
+                                      gpu_fib_plan const & plan,
+                                      gpu_fib_state * state) = 0;
+
+    /* Where each lattice's walk stopped, so that the next chunk of the
+     * same special-q resumes from there instead of starting over.
+     * Required when the area is done in several chunks, which must
+     * then be launched in increasing order, each one after fib_wait()
+     * on the previous; may be nullptr for a pass over the whole area.
+     * One state serves one special-q at a time. nullptr when out of
+     * memory. */
+    virtual gpu_fib_state * fib_state_create(gpu_fib_task * task) = 0;
+    virtual void fib_state_destroy(gpu_fib_state * state) = 0;
     virtual gpu_fib_output fib_wait(gpu_fib_pass * pass) = 0;
     virtual void fib_release(gpu_fib_pass * pass) = 0;
 };

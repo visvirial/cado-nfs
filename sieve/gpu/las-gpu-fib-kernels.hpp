@@ -480,6 +480,37 @@ CADO_GPU_FN void gpu_fib_walk(gpu_ple ple, int kind, gpu_fib_fence const & F,
     }
 }
 
+/* The same, restricted to the positions below x_end, starting from
+ * wherever ple is. Returns the position to resume from: the first one
+ * at or past x_end, or UINT64_MAX when there is nothing left. Since the
+ * enumeration is in increasing x, walking up to successive bounds,
+ * resuming each time where the previous one stopped, yields exactly
+ * what gpu_fib_walk() does in one go; that is what lets a large sieve
+ * area be done in chunks.
+ */
+template <typename EMIT>
+CADO_GPU_FN uint64_t gpu_fib_walk_until(gpu_ple ple, int kind,
+                                        gpu_fib_fence const & F,
+                                        uint64_t x_end, EMIT emit)
+{
+    uint64_t const end = x_end < F.end ? x_end : F.end;
+    if (kind == GPU_FIB_GENERIC) {
+        while (ple.x < end) {
+            if (ple.probably_coprime(F))
+                emit(ple.x);
+            ple.next(F);
+        }
+        return ple.x;
+    } else if (kind == GPU_FIB_VERTICAL) {
+        if (ple.x < end) {
+            emit(ple.x);
+            return UINT64_MAX;
+        }
+        return ple.x;
+    }
+    return UINT64_MAX;
+}
+
 /* }}} */
 
 #endif /* CADO_LAS_GPU_FIB_KERNELS_HPP */

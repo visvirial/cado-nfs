@@ -57,8 +57,9 @@ bool las_gpu_fib_usable_for(siever_config const & conf,
                             qlattice_basis const & Q);
 
 /* Launch the device pass over every slice that
- * las_gpu_fib_takes_slice() accepts, and queue the task that will hand
- * its output to the bucket arrays once it is back.
+ * las_gpu_fib_takes_slice() accepts -- its first chunk, for a large
+ * sieve area -- and queue the task that will hand its output to the
+ * bucket arrays once it is back.
  *
  * The launch does not wait for the device, so whatever the caller
  * queues next -- the ordinary tasks for the other slices, the other
@@ -75,6 +76,21 @@ bool las_gpu_fib_usable_for(siever_config const & conf,
 double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
                          qlattice_basis const & Q, int side,
                          thread_pool & pool);
+
+/* A large sieve area is done by the device in chunks of buckets, one
+ * after the other (see las-fill-in-buckets-gpu.cpp). las_gpu_fib_start()
+ * hands only the first to the bucket arrays; this moves them on to the
+ * chunk that holds bucket region `region`, and gets the one after that
+ * coming back from the device in the background. Called from the main
+ * thread before each batch of bucket regions, with the previous batch
+ * done. Returns false when the device failed, in which case the caller
+ * must stop processing bucket regions and, once the pool is drained,
+ * call las_gpu_fib_check_failure() to have the special-q redone. */
+bool las_gpu_fib_advance(nfs_work & ws, thread_pool & pool, int region);
+
+/* Throws buckets_are_full, at ratio 1, if las_gpu_fib_advance() reported
+ * a device failure for the current special-q. */
+void las_gpu_fib_check_failure(nfs_work const & ws);
 
 /* Launch, ahead of time, the pass for a special-q whose sieve area has
  * been chosen but which is not being sieved yet -- typically the next

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include <algorithm>
 #include <mutex>
 #include <vector>
 
@@ -132,16 +133,30 @@ __global__ void kernel_survivor_flags(unsigned char * __restrict__ S0,
  * cheaper than storing every position and sorting it.
  */
 
+/* Where a lattice's walk starts in this pass: from scratch in the
+ * first chunk, from where the previous chunk left it otherwise. */
+static __device__ __forceinline__ void
+fib_resume(gpu_ple & ple, gpu_fib_plan const & plan,
+           uint64_t const * __restrict__ state, uint32_t k)
+{
+    if (state && plan.chunk_begin)
+        ple.x = state[k];
+}
+
 __global__ void kernel_fib_count(gpu_fib_entry const * __restrict__ entries,
                                  uint32_t const * __restrict__ entry_slice,
                                  uint32_t nentries, gpu_fib_plan plan,
                                  uint32_t nslices,
+                                 uint64_t const * __restrict__ state,
                                  uint32_t * __restrict__ counts,
                                  uint32_t * __restrict__ host_entries,
+                                 uint32_t host_capacity,
                                  unsigned long long * __restrict__ nhost)
 {
     gpu_fib_fence const F = gpu_fib_fence_for(plan.logI, plan.J);
     int const logB = plan.log_bucket_region;
+    uint64_t const x_end = uint64_t(plan.chunk_begin + plan.chunk_count)
+                           << logB;
     uint32_t const stride = blockDim.x * gridDim.x;
 
     for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < nentries;
@@ -153,34 +168,46 @@ __global__ void kernel_fib_count(gpu_fib_entry const * __restrict__ entries,
         gpu_ple ple {};
         int const kind = gpu_fib_prepare(&ple, e, plan.basis, F, plan.logI);
         if (kind == GPU_FIB_HOST) {
-            /* sized for every entry, so this cannot overflow */
-            unsigned long long const slot = atomicAdd(nhost, 1ULL);
-            host_entries[slot] = k;
+            if (plan.chunk_begin == 0) {
+                unsigned long long const slot = atomicAdd(nhost, 1ULL);
+                if (slot < host_capacity)
+                    host_entries[slot] = k;
+            }
             continue;
         }
+        fib_resume(ple, plan, state, k);
 
         uint32_t * const col = counts + entry_slice[k];
-        gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
-            atomicAdd(&col[size_t(x >> logB) * nslices], 1u);
+        gpu_fib_walk_until(ple, kind, F, x_end, [&](uint64_t x) {
+            atomicAdd(&col[size_t((x >> logB) - plan.chunk_begin) * nslices],
+                      1u);
         });
     }
 }
 
-/* cursor[] starts out as the exclusive prefix sums of counts[]. Updates
- * past `capacity` are counted but not written; the host notices that
- * the total exceeds the capacity, grows the buffer and runs this kernel
- * again. */
+/* cursor[] starts out as the exclusive prefix sums of counts[], and
+ * offsets[grid] is the total. When that exceeds `capacity` the kernel
+ * does nothing at all -- in particular it leaves the walk state alone
+ * -- and the host grows the buffer and runs it again. */
 __global__ void kernel_fib_scatter(gpu_fib_entry const * __restrict__ entries,
                                    uint32_t const * __restrict__ entry_slice,
                                    uint32_t nentries, gpu_fib_plan plan,
                                    uint32_t nslices,
+                                   uint32_t const * __restrict__ total,
+                                   uint64_t * __restrict__ state,
                                    uint32_t * __restrict__ cursor,
                                    gpu_fib_update * __restrict__ updates,
                                    uint32_t capacity)
 {
+    if (*total > capacity)
+        return;
+
     gpu_fib_fence const F = gpu_fib_fence_for(plan.logI, plan.J);
     int const logB = plan.log_bucket_region;
     uint32_t const bmask = (UINT32_C(1) << logB) - 1;
+    uint64_t const x_end = uint64_t(plan.chunk_begin + plan.chunk_count)
+                           << logB;
+    bool const last = plan.chunk_begin + plan.chunk_count >= plan.n_buckets;
     uint32_t const stride = blockDim.x * gridDim.x;
 
     for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < nentries;
@@ -193,15 +220,19 @@ __global__ void kernel_fib_scatter(gpu_fib_entry const * __restrict__ entries,
         int const kind = gpu_fib_prepare(&ple, e, plan.basis, F, plan.logI);
         if (kind == GPU_FIB_HOST)
             continue;
+        fib_resume(ple, plan, state, k);
 
         uint32_t * const col = cursor + entry_slice[k];
         uint16_t const hint = e.hint;
-        gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
-            uint32_t const slot =
-                atomicAdd(&col[size_t(x >> logB) * nslices], 1u);
-            if (slot < capacity)
-                updates[slot] = gpu_fib_update {hint, uint16_t(x & bmask)};
+        uint64_t const resume = gpu_fib_walk_until(ple, kind, F, x_end,
+                [&](uint64_t x) {
+            uint32_t const slot = atomicAdd(
+                    &col[size_t((x >> logB) - plan.chunk_begin) * nslices],
+                    1u);
+            updates[slot] = gpu_fib_update {hint, uint16_t(x & bmask)};
         });
+        if (state && !last)
+            state[k] = resume;
     }
 }
 
@@ -237,6 +268,9 @@ struct cuda_norm_task {
  */
 #define CUDA_SURVIVOR_PREFETCH 4096
 
+/* see fib_launch */
+static constexpr uint32_t CUDA_FIB_HOST_MAX = UINT32_C(1) << 20;
+
 struct cuda_fib_task {
     /* uploaded once, reused for every special-q: the factor base does
      * not depend on q */
@@ -244,6 +278,14 @@ struct cuda_fib_task {
     uint32_t * d_entry_slice = nullptr;
     uint32_t nentries = 0;
     uint32_t nslices = 0;
+};
+
+/* Where every lattice's walk stopped, for the next chunk. The chunks
+ * of a special-q go through different streams, so the event orders
+ * each one's count after the previous one's scatter. */
+struct cuda_fib_state {
+    uint64_t * d_x = nullptr;
+    cudaEvent_t done = nullptr;
 };
 
 /* Scratch for one in-flight bucket-sieving pass, which is also what a
@@ -297,6 +339,7 @@ struct cuda_fib_scratch {
 
     /* the pass in flight */
     cuda_fib_task const * task = nullptr;
+    cuda_fib_state * state = nullptr;
     gpu_fib_plan plan;
     int grid_e = 0;
 };
@@ -760,8 +803,39 @@ struct cuda_engine : public gpu_engine {
                                    cudaMemcpyDeviceToDevice, sc->stream));
         kernel_fib_scatter<<<sc->grid_e, 128, 0, sc->stream>>>(
             t->d_entries, t->d_entry_slice, t->nentries, sc->plan,
-            t->nslices, sc->d_cursor, sc->d_updates, sc->updates_capacity);
+            t->nslices, sc->d_offsets + grid,
+            sc->state ? sc->state->d_x : nullptr, sc->d_cursor,
+            sc->d_updates, sc->updates_capacity);
         CUDA_CHECK(cudaGetLastError());
+        /* the next chunk's count must see this scatter's walk state */
+        if (sc->state)
+            CUDA_CHECK(cudaEventRecord(sc->state->done, sc->stream));
+    }
+
+    gpu_fib_state * fib_state_create(gpu_fib_task * task) override
+    {
+        auto * t = reinterpret_cast<cuda_fib_task *>(task);
+        CUDA_CHECK(cudaSetDevice(device));
+        auto * st = new cuda_fib_state;
+        if (!CUDA_ALLOC(cudaMalloc(&st->d_x,
+                                   size_t(t->nentries) * sizeof(uint64_t)))) {
+            delete st;
+            return nullptr;
+        }
+        CUDA_CHECK(cudaEventCreateWithFlags(&st->done,
+                                            cudaEventDisableTiming));
+        return reinterpret_cast<gpu_fib_state *>(st);
+    }
+
+    void fib_state_destroy(gpu_fib_state * state) override
+    {
+        auto * st = reinterpret_cast<cuda_fib_state *>(state);
+        if (!st)
+            return;
+        cudaSetDevice(device);
+        cudaFree(st->d_x);
+        cudaEventDestroy(st->done);
+        delete st;
     }
 
     /* Everything up to and including the scatter goes into the stream
@@ -770,7 +844,8 @@ struct cuda_engine : public gpu_engine {
      * wait for fib_wait(), because their number is not known until the
      * count is done. */
     gpu_fib_pass * fib_launch(gpu_fib_task * task,
-                              gpu_fib_plan const & plan) override
+                              gpu_fib_plan const & plan,
+                              gpu_fib_state * state) override
     {
         auto * t = reinterpret_cast<cuda_fib_task *>(task);
         CUDA_CHECK(cudaSetDevice(device));
@@ -779,9 +854,10 @@ struct cuda_engine : public gpu_engine {
             return nullptr;
         cudaStream_t const stream = sc->stream;
         sc->task = t;
+        sc->state = reinterpret_cast<cuda_fib_state *>(state);
         sc->plan = plan;
 
-        size_t const grid = size_t(t->nslices) * plan.n_buckets;
+        size_t const grid = size_t(t->nslices) * plan.chunk_count;
 
         if (grid + 1 > sc->grid_capacity) {
             cudaFree(sc->d_counts);
@@ -819,23 +895,28 @@ struct cuda_engine : public gpu_engine {
             }
             sc->grid_capacity = n;
         }
-        if (t->nentries > sc->host_capacity) {
+        /* Lattices handed back to the host are rare -- projective-like
+         * ones, a handful per special-q -- so a fixed buffer does; one
+         * sized by the factor base would be gigabytes at c270 sizes. A
+         * pass that has more is declined in fib_wait. */
+        uint32_t const host_want = std::min(t->nentries, CUDA_FIB_HOST_MAX);
+        if (host_want > sc->host_capacity) {
             cudaFree(sc->d_host_entries);
             cudaFreeHost(sc->h_host_entries);
             sc->d_host_entries = nullptr;
             sc->h_host_entries = nullptr;
             sc->host_capacity = 0;
             if (!CUDA_ALLOC(cudaMalloc(&sc->d_host_entries,
-                                       size_t(t->nentries) *
+                                       size_t(host_want) *
                                            sizeof(uint32_t))) ||
                     !CUDA_ALLOC(cudaHostAlloc(&sc->h_host_entries,
-                                              size_t(t->nentries) *
+                                              size_t(host_want) *
                                                   sizeof(uint32_t),
                                               cudaHostAllocDefault))) {
                 fib_release(reinterpret_cast<gpu_fib_pass *>(sc));
                 return nullptr;
             }
-            sc->host_capacity = t->nentries;
+            sc->host_capacity = host_want;
         }
 
         CUDA_CHECK(cudaMemsetAsync(sc->d_counts, 0,
@@ -849,9 +930,14 @@ struct cuda_engine : public gpu_engine {
         if (sc->grid_e == 0)
             sc->grid_e = 1;
 
+        if (sc->state && plan.chunk_begin)
+            CUDA_CHECK(cudaStreamWaitEvent(stream, sc->state->done, 0));
+
         kernel_fib_count<<<sc->grid_e, 128, 0, stream>>>(
             t->d_entries, t->d_entry_slice, t->nentries, plan, t->nslices,
-            sc->d_counts, sc->d_host_entries, sc->d_nhost);
+            sc->state ? sc->state->d_x : nullptr,
+            sc->d_counts, sc->d_host_entries, sc->host_capacity,
+            sc->d_nhost);
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
@@ -879,11 +965,18 @@ struct cuda_engine : public gpu_engine {
         cuda_fib_task const * const t = sc->task;
         CUDA_CHECK(cudaSetDevice(device));
         cudaStream_t const stream = sc->stream;
-        size_t const grid = size_t(t->nslices) * sc->plan.n_buckets;
+        size_t const grid = size_t(t->nslices) * sc->plan.chunk_count;
 
         CUDA_CHECK(cudaStreamSynchronize(stream));
         uint32_t const total = sc->h_offsets[grid];
         uint64_t const nhost = *sc->h_nhost;
+
+        if (nhost > sc->host_capacity) {
+            fprintf(stderr, "# las-gpu: %llu lattices handed back to the"
+                    " host, more than the %u expected\n",
+                    (unsigned long long) nhost, sc->host_capacity);
+            return gpu_fib_output {};
+        }
 
         /* The scan runs in 32 bits. The host side never asks for a pass
          * that could get near that, but if one ever did, the offsets
@@ -932,7 +1025,7 @@ struct cuda_engine : public gpu_engine {
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         return gpu_fib_output {
-            true, t->nslices, sc->plan.n_buckets,
+            true, t->nslices, sc->plan.chunk_count,
             sc->h_counts, sc->h_offsets, sc->h_updates,
             sc->h_host_entries, nhost,
         };
@@ -941,7 +1034,15 @@ struct cuda_engine : public gpu_engine {
     void fib_release(gpu_fib_pass * pass) override
     {
         auto * sc = reinterpret_cast<cuda_fib_scratch *>(pass);
+        /* A pass may be given back without having been waited for --
+         * the last chunks of a special-q whose J turned out small, or
+         * one prefetched for nothing. Its kernels may still be running,
+         * writing to buffers that the next user of the scratch, or of
+         * the walk state, is about to touch. */
+        cudaSetDevice(device);
+        CUDA_CHECK(cudaStreamSynchronize(sc->stream));
         sc->task = nullptr;
+        sc->state = nullptr;
         fib_host_give(sc);
         std::lock_guard<std::mutex> const lock(fib_mu);
         fib_free.push_back(sc);

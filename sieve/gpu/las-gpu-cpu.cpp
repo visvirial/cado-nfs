@@ -150,22 +150,40 @@ struct cpu_engine : public gpu_engine {
         delete reinterpret_cast<cpu_fib_task *>(task);
     }
 
+    /* The reference walks every lattice from the start and keeps what
+     * falls in the chunk. That is wasteful with many chunks, but it is
+     * independent of the device's way of resuming from a saved state,
+     * which is the point of a reference; it needs no state either. */
+    gpu_fib_state * fib_state_create(gpu_fib_task *) override
+    {
+        static char dummy;
+        return reinterpret_cast<gpu_fib_state *>(&dummy);
+    }
+    void fib_state_destroy(gpu_fib_state *) override {}
+
     gpu_fib_pass * fib_launch(gpu_fib_task * task,
-                              gpu_fib_plan const & plan) override
+                              gpu_fib_plan const & plan,
+                              gpu_fib_state *) override
     {
         auto & t = *reinterpret_cast<cpu_fib_task *>(task);
         auto * P = new cpu_fib_pass;
 
-        uint32_t const nb = plan.n_buckets;
+        uint32_t const nb = plan.chunk_count;
         uint32_t const nslices = uint32_t(t.slices.size());
         int const logB = plan.log_bucket_region;
         uint32_t const bmask = (UINT32_C(1) << logB) - 1;
+        uint64_t const x_lo = uint64_t(plan.chunk_begin) << logB;
+        uint64_t const x_hi = uint64_t(plan.chunk_begin + nb) << logB;
         P->nslices = nslices;
         P->nb = nb;
 
         gpu_fib_fence const F = gpu_fib_fence_for(plan.logI, plan.J);
 
         P->counts.assign(size_t(nb) * nslices, 0);
+
+        auto bucket = [&](uint64_t x) {
+            return size_t((x >> logB) - plan.chunk_begin);
+        };
 
         /* Pass 1: how many updates each (bucket, slice) pair gets. The
          * device does the same thing, and for the same reason: the
@@ -182,11 +200,13 @@ struct cpu_engine : public gpu_engine {
                 int const kind = gpu_fib_prepare(&ple, e, plan.basis, F,
                                                  plan.logI);
                 if (kind == GPU_FIB_HOST) {
-                    P->host_entries.push_back(sl.first + k);
+                    if (plan.chunk_begin == 0)
+                        P->host_entries.push_back(sl.first + k);
                     continue;
                 }
                 gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
-                    P->counts[size_t(x >> logB) * nslices + s]++;
+                    if (x >= x_lo && x < x_hi)
+                        P->counts[bucket(x) * nslices + s]++;
                 });
             }
         }
@@ -218,8 +238,9 @@ struct cpu_engine : public gpu_engine {
                     continue;
                 uint16_t const hint = e.hint;
                 gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
-                    P->updates[cur[size_t(x >> logB) * nslices + s]++] =
-                        gpu_fib_update {hint, uint16_t(x & bmask)};
+                    if (x >= x_lo && x < x_hi)
+                        P->updates[cur[bucket(x) * nslices + s]++] =
+                            gpu_fib_update {hint, uint16_t(x & bmask)};
                 });
             }
         }

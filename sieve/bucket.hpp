@@ -416,13 +416,20 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
         uint32_t const * offsets;
         size_t stride;
         size_t s;
+        /* the buckets it has updates for; offsets[] is relative to
+         * b_lo, and every other bucket is empty */
+        size_t b_lo, b_hi;
         update_t const * begin(size_t b) const
         {
-            return base + offsets[b * stride + s];
+            if (b < b_lo || b >= b_hi)
+                return base;
+            return base + offsets[(b - b_lo) * stride + s];
         }
         update_t const * end(size_t b) const
         {
-            return base + offsets[b * stride + s + 1];
+            if (b < b_lo || b >= b_hi)
+                return base;
+            return base + offsets[(b - b_lo) * stride + s + 1];
         }
     };
     std::vector<external_slice> external;
@@ -561,20 +568,27 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
      * buffer must outlive them, i.e. stay valid until the next
      * reset_pointers().
      *
-     * The buffer is laid out bucket-major: the updates that slice s
-     * put in bucket b are base[offsets[b * stride + s]] up to
-     * base[offsets[b * stride + s + 1]]. Slice s gets slice index
-     * indices[s]. These updates take no room in the array, and do not
-     * count towards nb_of_updates() and friends.
+     * The buffer covers buckets [b_lo, b_hi), and is laid out
+     * bucket-major: the updates that slice s put in bucket b are
+     * base[offsets[(b - b_lo) * stride + s]] up to
+     * base[offsets[(b - b_lo) * stride + s + 1]]. Slice s gets slice
+     * index indices[s]. These updates take no room in the array, and do
+     * not count towards nb_of_updates() and friends.
+     *
+     * A large sieve area comes in several such buffers, one range of
+     * buckets after the other; clear_external_slices() drops the
+     * current one once its bucket regions are done.
      */
     void add_external_slices(slice_index_t const * indices, size_t s0,
                              size_t s1, update_t const * base,
-                             uint32_t const * offsets, size_t stride)
+                             uint32_t const * offsets, size_t stride,
+                             size_t b_lo, size_t b_hi)
     {
         for (size_t s = s0; s < s1; s++)
             external.push_back(external_slice {
-                    indices[s], base, offsets, stride, s});
+                    indices[s], base, offsets, stride, s, b_lo, b_hi});
     }
+    void clear_external_slices() { external.clear(); }
     /* }}} */
     double max_full(unsigned int * fullest_index = nullptr) const;
     double average_full() const;

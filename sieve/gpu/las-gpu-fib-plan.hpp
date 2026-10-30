@@ -49,6 +49,15 @@ struct gpu_fib_plan {
     uint32_t J;
     uint32_t n_buckets;
 
+    /* The buckets this pass covers: [chunk_begin, chunk_begin +
+     * chunk_count). A pass over the whole area has chunk_begin == 0 and
+     * chunk_count == n_buckets; large sieve areas are done in several,
+     * in increasing order, because all of their updates at once would
+     * not fit anywhere. Bucket numbers in a pass's output are relative
+     * to chunk_begin. */
+    uint32_t chunk_begin;
+    uint32_t chunk_count;
+
     gpu_qlattice basis;
 
     /* The prime factors of the special-q, which the ordinary code skips

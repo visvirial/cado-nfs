@@ -228,6 +228,8 @@ int main(int argc, char const * argv[])
         plan.log_bucket_region = logB;
         plan.J = J;
         plan.n_buckets = nb;
+        plan.chunk_begin = 0;
+        plan.chunk_count = nb;
         plan.basis = basis;
         /* a special-q with one prime factor, the usual case; the
          * kernel has to skip any entry that matches it */
@@ -248,17 +250,14 @@ int main(int argc, char const * argv[])
         plan2.basis = gpu_qlattice {pick(rs, 31), pick(rs, 31),
                                     pick(rs, 31), pick(rs, 31)};
 
-        gpu_fib_pass * const p1 = cuda->fib_launch(tg, plan);
-        gpu_fib_pass * const p2 = cuda->fib_launch(tg, plan2);
+        gpu_fib_pass * const p1 = cuda->fib_launch(tg, plan, nullptr);
+        gpu_fib_pass * const p2 = cuda->fib_launch(tg, plan2, nullptr);
 
         run_output A, B, A2, B2;
-        collect(cpu, cpu->fib_launch(tc, plan), A);
-        collect(cpu, cpu->fib_launch(tc, plan2), A2);
+        collect(cpu, cpu->fib_launch(tc, plan, nullptr), A);
+        collect(cpu, cpu->fib_launch(tc, plan2, nullptr), A2);
         collect(cuda, p2, B2);
         collect(cuda, p1, B);
-
-        cuda->fib_task_destroy(tg);
-        cpu->fib_task_destroy(tc);
 
         nhost_total += (unsigned long) (A.host_entries.size() +
                                         A2.host_entries.size());
@@ -269,13 +268,43 @@ int main(int argc, char const * argv[])
                     logI, J, nb, nentries, nslices);
             exit(EXIT_FAILURE);
         }
+
+        /* The same area in chunks, as las does it for large ones. The
+         * device resumes each walk where the previous chunk left it;
+         * the host reference starts over every time and keeps what
+         * falls in the chunk, so the two get there independently. The
+         * last chunk may be short. */
+        uint32_t const K = std::max<uint32_t>(1,
+                nb / (2 + uint32_t(gmp_urandomm_ui(rs, 4))));
+        gpu_fib_state * const st = cuda->fib_state_create(tg);
+        for (uint32_t c0 = 0; c0 < nb; c0 += K) {
+            gpu_fib_plan pc = plan;
+            pc.chunk_begin = c0;
+            pc.chunk_count = std::min(K, nb - c0);
+            run_output C, D;
+            collect(cuda, cuda->fib_launch(tg, pc, st), D);
+            collect(cpu, cpu->fib_launch(tc, pc, nullptr), C);
+            if (!compare(C, D, uint32_t(nslices), nupdates)) {
+                fprintf(stderr, "  logI=%d J=%" PRIu32 " nb=%" PRIu32
+                                " nentries=%zu nslices=%zu,"
+                                " chunk [%" PRIu32 ", +%" PRIu32 ")\n",
+                        logI, J, nb, nentries, nslices, c0,
+                        pc.chunk_count);
+                exit(EXIT_FAILURE);
+            }
+        }
+        cuda->fib_state_destroy(st);
+
+        cuda->fib_task_destroy(tg);
+        cpu->fib_task_destroy(tc);
     }
 
     delete cuda;
     delete cpu;
     tests_common_clear();
 
-    printf("%lu passes agree, %lu updates compared, %lu handed back\n",
-           2 * iter, nupdates, nhost_total);
+    printf("%lu runs agree, whole and chunked, %lu updates compared,"
+           " %lu handed back\n",
+           iter, nupdates, nhost_total);
     return EXIT_SUCCESS;
 }

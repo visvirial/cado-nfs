@@ -1042,7 +1042,8 @@ void process_many_bucket_regions(
         ALGO::special_q_data const & Q,
         thread_pool & pool,
         int first_region0_index,
-        where_am_I & w)/*{{{*/
+        where_am_I & w,
+        std::function<bool(int)> const & before_batch)/*{{{*/
 {
     /* first_region0_index is always 0 when toplevel == 1, but the
      * present function is also called from within downsort_tree when
@@ -1061,6 +1062,10 @@ void process_many_bucket_regions(
     size_t const small_sieve_regions_ready = std::min(SMALL_SIEVE_START_POSITIONS_MAX_ADVANCE, ws.nb_buckets[1]);
 
     for(int done = 0, ready = small_sieve_regions_ready ; done < ws.nb_buckets[1] ; ) {
+
+        if (before_batch && first_region0_index + done < first_skipped_br &&
+                !before_batch(first_region0_index + done))
+            return;
 
         for(int i = 0 ; i < ready ; i++) {
             if (first_region0_index + done + i >= first_skipped_br) {

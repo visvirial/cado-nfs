@@ -21,7 +21,9 @@ std::unique_ptr<gpu_engine> owned_engine;
 std::atomic<gpu_engine *> the_engine {nullptr};
 /* The CUDA device to open once it has memory to spare, or -1. */
 int pending_device = -1;
-std::atomic<unsigned> the_stages {STAGE_BUCKETS};
+/* The CUDA device behind the_engine, or -1. */
+std::atomic<int> opened_device {-1};
+std::atomic<unsigned> the_stages {STAGE_BUCKETS | STAGE_ECM};
 
 /* Offloading is suspended, not stopped, when the device fails us: the
  * usual cause is memory that another process holds for a while. So it
@@ -45,6 +47,7 @@ void select(std::string const & spec)
 {
     set_engine(nullptr);
     pending_device = -1;
+    opened_device = -1;
 
     if (spec.empty() || spec == "none")
         return;
@@ -84,6 +87,7 @@ void select(std::string const & spec)
         gpu_engine * e = gpu_engine_cuda_create(device, &oom);
         if (e) {
             set_engine(e);
+            opened_device = device;
             return;
         }
         if (oom) {
@@ -112,7 +116,7 @@ void select_stages(std::string const & spec)
         return;
     }
     if (spec == "all") {
-        the_stages = STAGE_NORMS | STAGE_SURVIVORS | STAGE_BUCKETS;
+        the_stages = STAGE_NORMS | STAGE_SURVIVORS | STAGE_BUCKETS | STAGE_ECM;
         return;
     }
 
@@ -126,10 +130,12 @@ void select_stages(std::string const & spec)
             s |= STAGE_SURVIVORS;
         else if (name == "buckets")
             s |= STAGE_BUCKETS;
+        else if (name == "ecm")
+            s |= STAGE_ECM;
         else
             throw std::runtime_error(fmt::format(
                 "las-gpu: unknown stage \"{}\""
-                " (expected norms, survivors, buckets, all or none)",
+                " (expected norms, survivors, buckets, ecm, all or none)",
                 name));
         if (j == std::string::npos)
             break;
@@ -162,6 +168,7 @@ static bool suspended()
             return true;
         }
         set_engine(e);
+        opened_device = pending_device;
         fmt::print(stderr, "# las-gpu: offload backend: {}\n", e->name());
     }
     fmt::print(stderr, "# las-gpu: offloading resumes\n");
@@ -203,6 +210,11 @@ void pass_succeeded()
 {
     if (suspend_length.load(std::memory_order_relaxed) != suspend_min.count())
         suspend_length = suspend_min.count();
+}
+
+int cuda_device()
+{
+    return opened_device;
 }
 
 gpu_engine * engine()

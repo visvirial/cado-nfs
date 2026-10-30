@@ -105,6 +105,15 @@ if(HAVE_CUDA)
     # diagnosed at link time in whoever consumes las_gpu. Hand the device
     # objects down through the interface instead.
     target_sources(las_gpu INTERFACE $<TARGET_OBJECTS:las_gpu_cuda>)
+
+    # ECM on the device, see gpu/las-gpu-ecm.hpp. On its own, since its
+    # test has nothing to do with the sieve's engine.
+    add_library(las_gpu_ecm_cuda OBJECT gpu/las-gpu-ecm-cuda.cu)
+    target_include_directories(las_gpu_ecm_cuda PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/gpu ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/ecm)
+    target_link_libraries(las_gpu_ecm_cuda PUBLIC CUDA::cudart)
+    target_sources(las_gpu INTERFACE $<TARGET_OBJECTS:las_gpu_ecm_cuda>)
 endif()
 # }}}
 
@@ -123,6 +132,7 @@ set(las_multi_a_sources
         siqs-smallsieve.cpp
         las-cofac-standalone.cpp
         las-detached-cofac.cpp
+        las-gpu-cofac.cpp
         las-process-bucket-region.cpp
         las-output.cpp
         las-multiobj-globals.cpp

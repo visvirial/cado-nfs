@@ -395,6 +395,8 @@ class nfs_work {
 };
 
 /* Should it be made a shared pointer too ? Probably. */
+class las_gpu_cofac;
+
 class nfs_work_cofac {
     public:
     las_info const & las;
@@ -402,6 +404,10 @@ class nfs_work_cofac {
     special_q doing;
 
     facul_strategies const * strategies;
+
+    /* When the device has a part in the cofactorization, the survivors
+     * of this attempt at the special-q wait here; see las-gpu-cofac.hpp */
+    std::shared_ptr<las_gpu_cofac> gpu_cofac;
 
     /* yes, the ctor takes a non-const reference, but this->las is const.
      * This is because the ctor wants to access the cache in the las

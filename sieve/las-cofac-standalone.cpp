@@ -164,6 +164,11 @@ int cofac_standalone::factor_leftover_norms(nfs_work_cofac & wc) {/*{{{*/
             *wc.strategies);
 }/*}}}*/
 
+int cofac_standalone::conclude_leftover_norms(std::vector<facul_result> & fac)
+{
+    return ::factor_leftover_norms_conclude(norm, lps, fac);
+}
+
 std::ostream& operator<<(std::ostream& os, cofac_standalone const & cur)
 {
 #ifdef SUPPORT_LARGE_Q

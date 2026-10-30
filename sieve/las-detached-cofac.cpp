@@ -27,10 +27,12 @@
 
 /* asynchronous cofactorization */
 
-static relation detached_cofac_inner(worker_thread * worker,
+relation detached_cofac_conclude(worker_thread * worker,
         nfs_work_cofac & wc,
         nfs_aux & aux,
-        cofac_standalone && cur)
+        cofac_standalone & cur,
+        int const pass,
+        std::vector<int> const & cof_bitsize)
 {
     /* Import some contextual stuff. */
     int const id = worker->rank();
@@ -41,17 +43,6 @@ static relation detached_cofac_inner(worker_thread * worker,
 
     nfs_aux::rel_hash_t& rel_hash(aux.get_rel_hash());
 
-    auto tt = worker->trace(chronograms::ECM());
-
-    int const nsides = las.cpoly.nsides();
-
-    std::vector<int> cof_bitsize(nsides, 0);
-    las.cofac_stats.call(cur.norm, cof_bitsize);
-
-    SIBLING_TIMER(timer, "cofactoring"); // aka factor_leftover_norms
-    TIMER_CATEGORY(timer, cofactoring_mixed());
-
-    int const pass = cur.factor_leftover_norms(wc);
     rep.survivors.cofactored += (pass != 0);
 
     if (cur.trace_on_spot() && pass == 0) {
@@ -149,6 +140,29 @@ static relation detached_cofac_inner(worker_thread * worker,
     // rep.mark_report(cur.S);
 
     return {};
+}
+
+static relation detached_cofac_inner(worker_thread * worker,
+        nfs_work_cofac & wc,
+        nfs_aux & aux,
+        cofac_standalone && cur)
+{
+    las_info const & las(wc.las);
+    timetree_t & timer(aux.get_timer(worker));
+
+    auto tt = worker->trace(chronograms::ECM());
+
+    int const nsides = las.cpoly.nsides();
+
+    std::vector<int> cof_bitsize(nsides, 0);
+    las.cofac_stats.call(cur.norm, cof_bitsize);
+
+    SIBLING_TIMER(timer, "cofactoring"); // aka factor_leftover_norms
+    TIMER_CATEGORY(timer, cofactoring_mixed());
+
+    int const pass = cur.factor_leftover_norms(wc);
+
+    return detached_cofac_conclude(worker, wc, aux, cur, pass, cof_bitsize);
 }
 
 relation detached_cofac(worker_thread * worker,

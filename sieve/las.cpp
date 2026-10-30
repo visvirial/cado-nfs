@@ -56,6 +56,7 @@
 #include "las-fill-in-buckets-gpu.hpp"
 #include "las-fill-in-buckets.hpp"
 #include "las-globals.hpp"
+#include "las-gpu-cofac.hpp"
 #include "gpu/las-gpu-select.hpp"
 #include "las-info.hpp"
 #include "las-multiobj-globals.hpp"
@@ -155,8 +156,8 @@ static void declare_usage(cxx_param_list & pl)/*{{{*/
             " first CUDA device if there is a usable one, none otherwise;"
             " see sieve/gpu");
     pl.declare_usage("gpu-stages", "which stages -gpu offloads"
-            " (comma-separated: norms, survivors, buckets; or all, none)."
-            " Defaults to buckets, the only one a device is reliably"
+            " (comma-separated: norms, survivors, buckets, ecm; or all, none)."
+            " Defaults to buckets,ecm, the ones a device is reliably"
             " faster at");
     pl.declare_usage("sync", "synchronize all threads at each special-q");
     pl.declare_usage("sync-thread-pool", "synchronize the thread pool (implies -t 1 !!)");
@@ -927,16 +928,19 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
     /* This ensures proper serialization of stuff that is in queue 0.
      * Maybe we could be looser about this.
      */
-    if (sync_at_special_q) {
-        pool.drain_all_queues();
-    } else {
-        pool.drain_queue(thread_pool::QUEUE_GENERIC);
-    }
+    pool.drain_queue(thread_pool::QUEUE_GENERIC);
 
 #ifndef SIQS_SIEVE
     /* if the device failed half-way through, start over on the CPU */
     las_gpu_fib_check_failure(ws);
 #endif
+
+    /* The survivors are all known by now, if the device is to have them. */
+    if (wc_p->gpu_cofac)
+        wc_p->gpu_cofac->flush(wc_p, aux_p, pool);
+
+    if (sync_at_special_q)
+        pool.drain_all_queues();
 }/*}}}*/
 
 /* This returns false if the special-q was discarded */
@@ -1010,6 +1014,8 @@ do_one_special_q(
     {
         auto tt = pool.trace_on_leader(chronograms::INIT());
         wc_p = std::make_shared<nfs_work_cofac>(las, ws);
+        if (!dlp_descent && !exit_after_rel_found)
+            wc_p->gpu_cofac = las_gpu_cofac::create();
 
         rep.total_logI += ws.conf.logI;
         rep.total_J += ws.J;
@@ -1569,7 +1575,7 @@ static int las_main (int argc0, char const * argv0[])/*{{{*/
          * expensive setup, so that a typo costs nothing. */
         std::string gpu_backend = "auto";
         pl.parse("gpu", gpu_backend);
-        std::string gpu_stages = "buckets";
+        std::string gpu_stages = "buckets,ecm";
         pl.parse("gpu-stages", gpu_stages);
         try {
             las_gpu::select(gpu_backend);

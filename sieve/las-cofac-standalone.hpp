@@ -12,6 +12,7 @@
 
 #include "cxx_mpz.hpp"
 #include "ecm/batch.hpp"
+#include "ecm/facul.hpp"
 #include "las-divide-primes.hpp"
 #include "relation.hpp"
 
@@ -58,6 +59,8 @@ struct cofac_standalone {
     relation get_relation(special_q const & doing) const;
     void transfer_to_cofac_list(lock_guarded_container<std::list<cofac_candidate>> & L);
     int factor_leftover_norms(nfs_work_cofac & wc);
+    /* the same, with facul_all() having been done some other way */
+    int conclude_leftover_norms(std::vector<facul_result> & fac);
     friend std::ostream& operator<<(
             std::ostream& os,
             cofac_standalone const & cur);

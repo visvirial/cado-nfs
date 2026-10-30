@@ -232,6 +232,14 @@ facul_status factor_leftover_norms(
 
     /* call the facul library */
     auto fac = facul_all(n, strat);
+    return factor_leftover_norms_conclude(n, factors, fac);
+}
+
+facul_status factor_leftover_norms_conclude(
+        std::vector<cxx_mpz> const & n MAYBE_UNUSED,
+        std::vector<std::vector<cxx_mpz>> & factors,
+        std::vector<facul_result> & fac)
+{
     for(auto const & f : fac) {
         if (f.status == FACUL_NOT_SMOOTH)
             return FACUL_NOT_SMOOTH;

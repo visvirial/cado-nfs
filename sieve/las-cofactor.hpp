@@ -58,6 +58,12 @@ public:
 
 int check_leftover_norm (cxx_mpz const & n, siever_side_config const & sc);
 
+/* What factor_leftover_norms makes of the outcome of facul_all(). */
+facul_status factor_leftover_norms_conclude(
+        std::vector<cxx_mpz> const & n,
+        std::vector<std::vector<cxx_mpz>> & factors,
+        std::vector<facul_result> & fac);
+
 facul_status factor_leftover_norms(
         std::vector<cxx_mpz> const & norms,
         std::vector<std::vector<cxx_mpz>> &,

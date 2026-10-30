@@ -207,7 +207,7 @@ endif()
 # contract of the whole gpu/ directory -- and, because they share
 # CHECKSUM_FILE with the run above, the very same sieve regions too.
 #
-# The default stage set is "buckets"; the second diversion adds norm
+# The default stage set is "buckets,ecm"; the second diversion adds norm
 # initialisation and the survivor search, which are slower on a device
 # but have to stay correct. Both run multi-threaded, which is where a
 # device-side object shared between workers would show up.
@@ -894,6 +894,17 @@ if(HAVE_CUDA)
     cado_divert_test(test_survivors_gpu cuda ARGUMENTS -gpu cuda)
     cado_divert_test(test_survivors_gpu_B13 cuda APPEND_ARGUMENTS -gpu cuda)
     cado_divert_test(test_survivors_gpu_B14 cuda APPEND_ARGUMENTS -gpu cuda)
+endif()
+
+# ECM on the device, against ecm<layer>() on the host
+if(HAVE_CUDA)
+    cado_define_test(test_ecm_gpu.cpp
+        LIBRARIES facul utils tests
+        TIMEOUT 300)
+    target_include_directories(test_ecm_gpu PRIVATE
+        ${PROJECT_SOURCE_DIR}/sieve ${PROJECT_SOURCE_DIR}/sieve/ecm)
+    target_link_libraries(test_ecm_gpu PRIVATE
+        $<TARGET_OBJECTS:las_gpu_ecm_cuda> CUDA::cudart)
 endif()
 # }}}
 

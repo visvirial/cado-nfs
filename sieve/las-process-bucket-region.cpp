@@ -27,6 +27,7 @@
 #include "fmt/ranges.h"
 
 #include "gmp_aux.h"
+#include "las-gpu-cofac.hpp"
 #include "las-process-bucket-region.hpp"
 #include "gpu/las-gpu-engine.hpp"
 #include "gpu/las-gpu-plan.hpp"
@@ -949,6 +950,11 @@ void process_bucket_region_run::cofactoring_sync (survivors_t & survivors)/*{{{*
              * and extend the lifetime of the corresponding objects to
              * until when the detached cofactorization completes.
              */
+            if (wc_p->gpu_cofac) {
+                wc_p->gpu_cofac->add(std::move(cur));
+                continue;
+            }
+
             worker->get_pool().add_task(thread_pool::QUEUE_ECM,
                     [wc_p = wc_p,
                      aux_p = aux_p,

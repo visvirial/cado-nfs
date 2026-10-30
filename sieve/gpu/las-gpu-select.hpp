@@ -39,16 +39,19 @@ gpu_engine * engine();
  * percent between them, and the host code for both is very good --
  * lognorm_smart emits runs rather than cells, the survivor search is
  * vectorised -- so a device loses to it on everything but the very
- * largest sieve areas. Hence the default: buckets only.
+ * largest sieve areas. The ECM curves of the cofactorization, on the
+ * other hand, are a good half of what is left, and suit a device very
+ * well. Hence the default: buckets and ecm.
  *
  * Accepted specs: a comma-separated list of "norms", "survivors",
- * "buckets", or "all", or "none".
+ * "buckets", "ecm", or "all", or "none".
  * Throws std::runtime_error on an unknown stage name.
  */
 enum stage : unsigned {
     STAGE_NORMS = 1u,
     STAGE_SURVIVORS = 2u,
     STAGE_BUCKETS = 4u,
+    STAGE_ECM = 8u,
 };
 
 void select_stages(std::string const & spec);
@@ -72,6 +75,10 @@ void suspend(char const * why);
 /* A device pass went through: the next suspension, if any, is a short
  * one again. Thread-safe, and cheap. */
 void pass_succeeded();
+
+/* The number of the CUDA device in use, or -1 if the backend is anything
+ * else, or none yet. */
+int cuda_device();
 
 /* Human-readable name of the active backend, "none" if there is none. */
 std::string describe();

@@ -257,6 +257,23 @@ template <int LEVEL> struct bare_bucket_update_t {
     void set_x(br_index_t xx) { x = xx; }
 };
 
+/* Above level 1, the position is a 32-bit field. With a short hint, keeping
+ * it aligned would waste 2 of the 8 bytes of an update, and these updates
+ * are what most of the memory goes to when sieving with a large I.
+ */
+template <int LEVEL>
+    requires (LEVEL >= 2)
+struct __attribute__((packed)) bare_bucket_update_t<LEVEL> {
+    using br_index_t = typename bucket_update_size_per_level<LEVEL>::type;
+    br_index_t x = 0;
+    bare_bucket_update_t() = default;
+    explicit bare_bucket_update_t(uint64_t const x)
+        : x(limit_cast<br_index_t>(x))
+    {
+    }
+    void set_x(br_index_t xx) { x = xx; }
+};
+
 template <int LEVEL, hint_type_general HINT> struct bu_alignment;
 
 template <int LEVEL, hint_type_general HINT>
@@ -290,9 +307,56 @@ FORCE_BU_ALIGNMENT(1, emptyhint_t, 2);
 static_assert(sizeof(bucket_update_t<1, emptyhint_t>) == 2, "wrong size");
 
 #if MAX_TOPLEVEL >= 2
-FORCE_BU_ALIGNMENT(2, shorthint_t, 8);
+/* A position in a level-2 bucket region is 24 bits (LOG_BUCKET_REGION is
+ * at most 16), which is all we store in these updates. There can be
+ * billions of them, and they are only ever copied and read by downsort.
+ */
+class packed_uint24_t
+{
+    uint8_t b[3] = { 0, 0, 0 };
+
+  public:
+    packed_uint24_t() = default;
+    // NOLINTNEXTLINE(hicpp-explicit-conversions)
+    packed_uint24_t(uint32_t const x)
+        : b { uint8_t(x), uint8_t(x >> 8), uint8_t(x >> 16) }
+    {
+        ASSERT_EXPENSIVE(x < (UINT32_C(1) << 24));
+    }
+    // NOLINTNEXTLINE(hicpp-explicit-conversions)
+    operator uint32_t() const
+    {
+        return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16);
+    }
+    packed_uint24_t & operator+=(uint32_t const x)
+    {
+        return *this = uint32_t(*this) + x;
+    }
+};
+
+template <> struct __attribute__((packed)) bucket_update_t<2, shorthint_t> {
+    using br_index_t = uint32_t;
+    using hint_t = shorthint_t;
+    static constexpr int level = 2;
+    static constexpr char const * rtti = shorthint_t::rtti;
+    slice_offset_t hint = 0;
+    packed_uint24_t x;
+    bucket_update_t() = default;
+    bucket_update_t(const uint64_t x, shorthint_t const & h)
+        : hint(h.hint)
+        , x(limit_cast<br_index_t>(x))
+    { }
+    bucket_update_t(const uint64_t x, const fbprime_t,
+            const slice_offset_t slice_offset,
+            const slice_index_t)
+        : hint(slice_offset)
+        , x(limit_cast<br_index_t>(x))
+    { }
+    slice_offset_t hint_for_where_am_i() const { return hint; }
+    void set_x(br_index_t xx) { x = xx; }
+};
 FORCE_BU_ALIGNMENT(2, emptyhint_t, 4);
-static_assert(sizeof(bucket_update_t<2, shorthint_t>) == 8, "wrong size");
+static_assert(sizeof(bucket_update_t<2, shorthint_t>) == 5, "wrong size");
 static_assert(sizeof(bucket_update_t<2, emptyhint_t>) == 4, "wrong size");
 
 /* 4-byte slice index, 2-byte slice offset, and then 2 bytes of position
@@ -305,11 +369,11 @@ static_assert(sizeof(bucket_update_t<1, logphint_t>) == 4, "wrong size");
 #endif
 
 #if MAX_TOPLEVEL >= 3
-FORCE_BU_ALIGNMENT(3, shorthint_t, 8);
+FORCE_BU_ALIGNMENT(3, shorthint_t, 2);
 FORCE_BU_ALIGNMENT(3, emptyhint_t, 4);
 FORCE_BU_ALIGNMENT(2, longhint_t, 16);
 FORCE_BU_ALIGNMENT(2, logphint_t, 8);
-static_assert(sizeof(bucket_update_t<3, shorthint_t>) == 8, "wrong size");
+static_assert(sizeof(bucket_update_t<3, shorthint_t>) == 6, "wrong size");
 static_assert(sizeof(bucket_update_t<3, emptyhint_t>) == 4, "wrong size");
 static_assert(sizeof(bucket_update_t<2, longhint_t>) == 16, "wrong size");
 static_assert(sizeof(bucket_update_t<2, logphint_t>) == 8, "wrong size");

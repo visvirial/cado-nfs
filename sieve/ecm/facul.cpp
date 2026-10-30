@@ -13,6 +13,7 @@
 #include "facul_strategies.hpp"
 #include "cxx_mpz.hpp"
 #include "facul.hpp"
+#include "facul_stepper.hpp"
 #include "modset.hpp" // for FaculModulusBase
 #include "macros.h"
 
@@ -71,16 +72,12 @@ static facul_status facul_aux(
     return todo.empty() ? FACUL_SMOOTH : FACUL_MAYBE;
 }
 
-/* This function tries to factor all the cofactors in the vector N with
- * strategies. The returned facul_result objects (one for each input number)
- * will have the prime factors.
- *
- * If we find composites, but not to the point of obtaining a complete
- * factorization, then they're not returned.
- */
-
-std::vector<facul_result>
-facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
+facul_stepper::facul_stepper(std::vector<cxx_mpz> const & N,
+        facul_strategies const & strategies)
+    : strategies(strategies)
+    , res(N.size(), FACUL_NOT_SMOOTH)
+    , composites(N.size())
+    , last_i(N.size(), 0)
 {
     const size_t nsides = N.size();
 
@@ -88,11 +85,7 @@ facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
     std::transform(N.cbegin(), N.cend(), sizes.begin(),
                    [] (cxx_mpz const & n) { return n.bits(); });
 
-    auto const & methods = strategies(sizes);
-
-    std::vector<facul_result> res(nsides, FACUL_NOT_SMOOTH);
-
-    std::vector<std::vector<std::unique_ptr<FaculModulusBase>>> composites(nsides);
+    methods = &strategies(sizes);
 
 #ifdef PARI
     fmt::print(stderr, join(N, " "));
@@ -141,7 +134,8 @@ facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
         if (!n) {
             /* This one is out of bounds, too bad. Abort. */
             res[side].status = FACUL_NOT_SMOOTH;
-            return res;
+            done = true;
+            return;
         }
         composites[side].emplace_back(std::move(n));
     }
@@ -152,18 +146,87 @@ facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
      * with an empty method list (why?), and yet we'd like to see factors
      * in the cases that can be detected easily.
      */
-    if (methods.empty())
-        return res;
+    if (methods->empty())
+        done = true;
+}
 
-#ifdef ENABLE_UNSAFE_FACUL_STATS
-    int stats_nb_side = 0, stats_index_transition = 0;
-#endif             /* ENABLE_UNSAFE_FACUL_STATS */
+/* The outcome of method number i, however it was obtained. */
+void facul_stepper::conclude_method(
+        std::vector<std::unique_ptr<FaculModulusBase>> & more_composites)
+{
+    auto const & meth = (*methods)[i];
+    int const side = meth.side;
 
-    /* last_i[s] is the index of last method tried on side s */
-    std::vector<size_t> last_i(nsides, 0);
+    pending = false;
+    i++;
 
-    for (size_t i = 0 ; i < methods.size() ; i++) {
-        auto const & meth = methods[i];
+    switch(res[side].status) {
+        case FACUL_NOT_SMOOTH:
+            /* The cofactor is not smooth. Abort. */
+            done = true;
+            return;
+        case FACUL_MAYBE:
+            if (more_composites.empty()) {
+                /* No factor found. If it was the last method for this
+                 * side, then one stops the cofactorization. Otherwise, one
+                 * tries with an other method.
+                 */
+                if (meth.is_last) {
+                    res[side].status = FACUL_NOT_SMOOTH;
+                    // res[side].composites.emplace_back(N[side]);
+                    done = true;
+                }
+            } else {
+                /* a composite split! */
+                std::swap(composites[side], more_composites);
+            }
+            return;
+        case FACUL_SMOOTH:
+            return;
+    }
+}
+
+void facul_stepper::run_pending()
+{
+    ASSERT_ALWAYS(pending);
+    auto const & meth = (*methods)[i];
+    int const side = meth.side;
+
+    std::vector<std::unique_ptr<FaculModulusBase>> more_composites;
+
+    res[side].status = composites[side].front()->facul_doit_onefm(
+        res[side].primes, *meth.method, more_composites,
+        strategies.lpb[side], strategies.BB[side], strategies.BBB[side]);
+
+    conclude_method(more_composites);
+}
+
+void facul_stepper::supply(cxx_mpz const & f)
+{
+    ASSERT_ALWAYS(pending);
+    auto const & meth = (*methods)[i];
+    int const side = meth.side;
+
+    std::vector<std::unique_ptr<FaculModulusBase>> more_composites;
+
+    res[side].status = composites[side].front()->facul_doit_finish(
+        res[side].primes, f, more_composites,
+        strategies.lpb[side], strategies.BB[side], strategies.BBB[side]);
+
+    conclude_method(more_composites);
+}
+
+bool facul_stepper::advance(want_t want)
+{
+    ASSERT_ALWAYS(!pending);
+
+    if (done)
+        return false;
+
+    const size_t nsides = res.size();
+
+    for ( ; i < methods->size() ; ) {
+        auto const & meth = (*methods)[i];
 
 #ifdef ENABLE_UNSAFE_FACUL_STATS
         stats_current_index = i - stats_nb_side * stats_index_transition;
@@ -178,6 +241,7 @@ facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
             /* We just achieved a split on this side. We'll proceed with
              * facul_aux unless the other cofactor is identified as
              * non-smooth before that. */
+            i++;
             continue;
         }
 
@@ -192,11 +256,15 @@ facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
                                       [](facul_result const & r) {
                                           return r.status == FACUL_SMOOTH;
                                       });
-        if (all_smooth)
-            return res;
+        if (all_smooth) {
+            done = true;
+            return false;
+        }
 
-        if (res[side].status == FACUL_SMOOTH)
+        if (res[side].status == FACUL_SMOOTH) {
+            i++;
             continue;
+        }
 
 #ifdef ENABLE_UNSAFE_FACUL_STATS
         if (stats_current_index < STATS_LEN)
@@ -205,35 +273,13 @@ facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
 
         last_i[side] = i;
 
-        std::vector<std::unique_ptr<FaculModulusBase>> more_composites;
+        pending = true;
+        if (want && want(*meth.method, *composites[side].front()))
+            return true;
 
-        res[side].status = composites[side].front()->facul_doit_onefm(
-            res[side].primes, *meth.method, more_composites,
-            strategies.lpb[side], strategies.BB[side], strategies.BBB[side]);
-
-        switch(res[side].status) {
-            case FACUL_NOT_SMOOTH:
-                /* The cofactor is not smooth. Abort. */
-                return res;
-            case FACUL_MAYBE:
-                if (more_composites.empty()) {
-                    /* No factor found. If it was the last method for this
-                     * side, then one stops the cofactorization. Otherwise, one
-                     * tries with an other method.
-                     */
-                    if (meth.is_last) {
-                        res[side].status = FACUL_NOT_SMOOTH;
-                        // res[side].composites.emplace_back(N[side]);
-                        return res;
-                    }
-                } else {
-                    /* a composite split! */
-                    std::swap(composites[side], more_composites);
-                }
-                continue;
-            case FACUL_SMOOTH:
-                continue;
-        }
+        run_pending();
+        if (done)
+            return false;
     }
 
     for(size_t side = 0 ; side < nsides ; side++) {
@@ -241,17 +287,48 @@ facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
             continue;
 
         res[side].status = facul_aux(res[side].primes, composites[side],
-                strategies, methods, last_i[side] + 1, side);
+                strategies, *methods, last_i[side] + 1, side);
 
-        if (res[side].status == FACUL_NOT_SMOOTH)
-            return res;
+        if (res[side].status == FACUL_NOT_SMOOTH) {
+            done = true;
+            return false;
+        }
     }
 
     for (size_t side = 0; side < nsides; side++) {
         std::ranges::sort(res[side].primes);
     }
 
-    return res;
+    done = true;
+    return false;
+}
+
+facul_method const & facul_stepper::pending_method() const
+{
+    ASSERT_ALWAYS(pending);
+    return *(*methods)[i].method;
+}
+
+FaculModulusBase const & facul_stepper::pending_modulus() const
+{
+    ASSERT_ALWAYS(pending);
+    return *composites[(*methods)[i].side].front();
+}
+
+/* This function tries to factor all the cofactors in the vector N with
+ * strategies. The returned facul_result objects (one for each input number)
+ * will have the prime factors.
+ *
+ * If we find composites, but not to the point of obtaining a complete
+ * factorization, then they're not returned.
+ */
+
+std::vector<facul_result>
+facul_all(std::vector<cxx_mpz> const & N, facul_strategies const & strategies)
+{
+    facul_stepper S(N, strategies);
+    S.advance();
+    return std::move(S.result());
 }
 
 facul_result facul(cxx_mpz const & N, facul_strategy_oneside const & strategy)

@@ -56,6 +56,17 @@ facul_status FaculModulus<layer>::facul_doit_onefm(
     return ::facul_doit_onefm<layer>(factors, m, method, composites, lpb, BB, BBB);
 }
 
+template<typename layer>
+facul_status FaculModulus<layer>::facul_doit_finish(
+        std::vector<cxx_mpz> & factors,
+        cxx_mpz const & f,
+        std::vector<std::unique_ptr<FaculModulusBase>> & composites,
+        unsigned long const lpb, double const BB, double const BBB) const
+{
+    return ::facul_doit_finish<layer>(factors, m,
+            typename layer::Integer(f), composites, lpb, BB, BBB);
+}
+
 template class FaculModulus<arithxx_modredc64>;
 template class FaculModulus<arithxx_modredc96>;
 template class FaculModulus<arithxx_modredc126>;

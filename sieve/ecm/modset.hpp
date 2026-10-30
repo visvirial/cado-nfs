@@ -31,6 +31,15 @@ class FaculModulusBase
             std::vector<std::unique_ptr<FaculModulusBase>> & composites,
             unsigned long lpb,
             double BB, double BBB) const = 0;
+
+    /* What facul_doit_onefm does once its method has yielded f, which is
+     * 1 if it found nothing -- for a method that was run somewhere else. */
+    virtual facul_status facul_doit_finish(
+            std::vector<cxx_mpz> & factors,
+            cxx_mpz const & f,
+            std::vector<std::unique_ptr<FaculModulusBase>> & composites,
+            unsigned long lpb,
+            double BB, double BBB) const = 0;
     virtual int isprime() const = 0;
 };
 
@@ -47,6 +56,10 @@ class FaculModulus : public FaculModulusBase
     int isprime() const override;
     facul_status facul_doit_onefm(std::vector<cxx_mpz> &,
             facul_method const &,
+            std::vector<std::unique_ptr<FaculModulusBase>> &,
+            unsigned long, double, double) const override;
+    facul_status facul_doit_finish(std::vector<cxx_mpz> &,
+            cxx_mpz const &,
             std::vector<std::unique_ptr<FaculModulusBase>> &,
             unsigned long, double, double) const override;
 };

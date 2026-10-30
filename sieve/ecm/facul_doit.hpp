@@ -29,6 +29,15 @@ facul_status facul_doit_onefm(std::vector<cxx_mpz> & factors,
         std::vector<std::unique_ptr<FaculModulusBase>> & composites,
         unsigned long lpb, double BB, double BBB);
 
+/* What facul_doit_onefm does once its method has yielded f, which is 1
+ * if it found nothing: so a method can be run somewhere else. */
+template<typename layer>
+facul_status facul_doit_finish(std::vector<cxx_mpz> & factors,
+        typename layer::Modulus const & m,
+        typename layer::Integer const & f,
+        std::vector<std::unique_ptr<FaculModulusBase>> & composites,
+        unsigned long lpb, double BB, double BBB);
+
 /* The same, for a number n given as an mpz (with the arithxx layer that
  * suits its size). */
 facul_status facul_doit_onefm(std::vector<cxx_mpz> & factors,

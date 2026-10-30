@@ -81,22 +81,21 @@ facul_status facul_doit_onefm(std::vector<cxx_mpz> & factors,
 
     ASSERT_ALWAYS(composites.empty());
 
-    Integer n = m.getmod();
+    Integer const n = m.getmod();
     Integer f;
-    int bt = 0;
 
     switch(method.method) {
         case PM1_METHOD:
-            bt = pm1<layer>(f, m, *(pm1_plan_t const *) (method.plan));
+            pm1<layer>(f, m, *(pm1_plan_t const *) (method.plan));
             break;
         case PP1_27_METHOD:
-            bt = pp1_27<layer>(f, m, *(pp1_plan_t const *) (method.plan));
+            pp1_27<layer>(f, m, *(pp1_plan_t const *) (method.plan));
             break;
         case PP1_65_METHOD:
-            bt = pp1_65<layer>(f, m, *(pp1_plan_t const *) (method.plan));
+            pp1_65<layer>(f, m, *(pp1_plan_t const *) (method.plan));
             break;
         case EC_METHOD:
-            bt = ecm<layer>(f, m, *(ecm_plan_t const *) (method.plan));
+            ecm<layer>(f, m, *(ecm_plan_t const *) (method.plan));
             break;
         case MPQS_METHOD:
             {
@@ -110,31 +109,39 @@ facul_status facul_doit_onefm(std::vector<cxx_mpz> & factors,
             ASSERT_ALWAYS(0);
     }
 
-    if (f == uint64_t(1)) {
-        if (bt == 0)
-            /* No factor found, no backtracking... this was a simple miss. */
-            return FACUL_MAYBE;
-        else
-            /* Backtracking was used, so there was a point where all
-             * factors had been found simultaneously, but backing up to
-             * the previous checkpoint resulted in no factors being
-             * found. We could try to do some more clever backtracking to
-             * discover the factors yet. TODO. For now, just continue to
-             * the next method. */
-            return FACUL_MAYBE;
-    } else if (f == n) {
+    return facul_doit_finish<layer>(factors, m, f, composites, lpb, BB, BBB);
+}
+
+template<typename layer>
+facul_status facul_doit_finish(std::vector<cxx_mpz> & factors,
+        typename layer::Modulus const & m,
+        typename layer::Integer const & f,
+        std::vector<std::unique_ptr<FaculModulusBase>> & composites,
+        unsigned long const lpb, double const BB, double const BBB)
+{
+    using Integer = typename layer::Integer;
+
+    ASSERT_ALWAYS(composites.empty());
+
+    Integer n = m.getmod();
+
+    /* A miss, with or without backtracking. With it, there was a point
+     * where all factors had been found simultaneously, but backing up
+     * to the previous checkpoint resulted in no factors being found. We
+     * could try to do some more clever backtracking to discover the
+     * factors yet. TODO. For now, just continue to the next method. */
+    if (f == uint64_t(1))
+        return FACUL_MAYBE;
+
+    if (f == n) {
 #ifdef ENABLE_UNSAFE_FACUL_STATS
         if (stats_current_index < STATS_LEN)
             stats_found_n[stats_current_index]++;
 #endif  /* ENABLE_UNSAFE_FACUL_STATS */
-        if (bt == 0)
-            /* Input number was found without any backtracking happening?
-             * Find out when this can occur and how to get a chance of
-             * finding the factors yet. TODO. */
-            return FACUL_MAYBE;
-        else
-            /* see above */
-            return FACUL_MAYBE;
+        /* All factors at once, see above. Find out when this can occur
+         * without backtracking, and how to get a chance of finding the
+         * factors yet. TODO. */
+        return FACUL_MAYBE;
     }
 
     /* So we found a non-trivial factor. See if it is prime, if the
@@ -220,6 +227,10 @@ facul_status facul_doit_onefm(std::vector<cxx_mpz> & factors,
 #define FACUL_DOIT_INSTANTIATE(layer)                                   \
 template facul_status facul_doit_onefm<layer>(std::vector<cxx_mpz> &,   \
         layer::Modulus const &, facul_method const &,                   \
+        std::vector<std::unique_ptr<FaculModulusBase>> &,               \
+        unsigned long, double, double);                                 \
+template facul_status facul_doit_finish<layer>(std::vector<cxx_mpz> &,  \
+        layer::Modulus const &, layer::Integer const &,                 \
         std::vector<std::unique_ptr<FaculModulusBase>> &,               \
         unsigned long, double, double);
 

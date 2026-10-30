@@ -20,24 +20,34 @@ struct gpu_norm_task;
 struct gpu_survivor_task;
 struct gpu_fib_task;
 
-/* What a bucket-sieving pass has to tell the caller beyond the updates
- * themselves.
- */
-struct gpu_fib_result {
-    /* Set when some bucket needed more room than it was given. The
-     * updates are then meaningless and the caller must retry with a
-     * larger allocation, which is what buckets_are_full does.
-     */
-    bool overflow;
-    uint32_t overflow_bucket;
-    uint64_t overflow_needed;
-    uint64_t overflow_room;
+struct gpu_fib_pass;
 
-    /* Number of entries written to host_entries[], i.e. lattices that
-     * the kernel declined to handle (see GPU_FIB_HOST). Larger than
-     * host_capacity means the buffer was too small and the caller must
-     * retry; the kernel never silently drops one.
-     */
+/* What a bucket-sieving pass hands back. Every pointer is owned by the
+ * pass and stays valid until fib_release().
+ *
+ * Everything is laid out bucket-major: entry b * nslices + s is about
+ * the updates that slice s put in bucket b. That is the order the
+ * updates themselves sit in, back to back, so the updates of slices
+ * [s0, s1) in bucket b are the contiguous range
+ *
+ *      updates[offsets[b * nslices + s0] .. offsets[b * nslices + s1])
+ *
+ * which is what lets the caller spread the slices over several bucket
+ * arrays without moving anything twice.
+ */
+struct gpu_fib_output {
+    uint32_t nslices;
+    uint32_t n_buckets;
+
+    /* n_buckets * nslices values */
+    uint32_t const * counts;
+    /* exclusive prefix sums of counts[], plus the total at the end */
+    uint32_t const * offsets;
+    gpu_fib_update const * updates;
+
+    /* Lattices the kernel declined to handle (see GPU_FIB_HOST), as
+     * indices into the entry array, in no particular order. */
+    uint32_t const * host_entries;
     uint64_t nhost;
 };
 
@@ -105,29 +115,22 @@ struct gpu_engine {
 
     /* Sieve the whole part for one special-q.
      *
-     * out[] is the bucket array's own storage, so the updates need no
-     * second move once they are back from the device.
-     * bucket_begin[b] says where in it bucket b's new updates go, and
-     * bucket_room[b] how many still fit there; both have plan.n_buckets
-     * entries. Only the ranges actually written are touched, which is
-     * what lets the device share an array with the ordinary per-slice
-     * tasks.
+     * fib_launch() queues the pass and returns at once when the backend
+     * is asynchronous, so that the caller can get on with whatever does
+     * not depend on the updates. fib_wait() blocks until they are in
+     * host memory; it must be called exactly once per pass, and the
+     * output it returns stays valid until fib_release(). Several passes
+     * may be in flight at the same time, from different threads.
      *
-     * counts[] receives nslices * n_buckets values: how many updates
-     * slice s put in bucket b. The caller turns those into the
-     * per-slice pointers that apply_one_bucket walks.
-     *
-     * Updates within one (slice, bucket) pair come out in increasing x,
-     * exactly as the ordinary code produces them.
+     * Updates within one (bucket, slice) pair come in no particular
+     * order: the device scatters with atomics. Nothing downstream
+     * depends on that order -- apply_one_bucket adds logp at each
+     * position, and resieving looks at every update of a bucket region.
      */
-    virtual gpu_fib_result fib_run(gpu_fib_task * task,
-                                   gpu_fib_plan const & plan,
-                                   uint64_t const * bucket_begin,
-                                   uint64_t const * bucket_room,
-                                   gpu_fib_update * out,
-                                   uint32_t * counts,
-                                   uint32_t * host_entries,
-                                   uint64_t host_capacity) = 0;
+    virtual gpu_fib_pass * fib_launch(gpu_fib_task * task,
+                                      gpu_fib_plan const & plan) = 0;
+    virtual gpu_fib_output fib_wait(gpu_fib_pass * pass) = 0;
+    virtual void fib_release(gpu_fib_pass * pass) = 0;
 };
 
 /* Always available. */

@@ -389,15 +389,16 @@ static void fill_in_buckets_one_side(nfs_work & ws, nfs_aux & aux,
     }
 
     /* The device, when there is one, takes the slices of simple
-     * entries -- the overwhelming majority -- in a single pass. The
-     * loop below then only has the others left to push. The two sets
-     * are disjoint by construction, so the part is still covered
-     * exactly once. */
+     * entries -- the overwhelming majority -- in a single pass. It is
+     * launched first, so that it works while the pool goes through the
+     * others. The two sets are disjoint by construction, so the part is
+     * still covered exactly once. */
     bool gpu = false;
-    double gpu_weight = 0;
 #ifndef SIQS_SIEVE
-    if constexpr (LEVEL == 1 && std::is_same_v<TARGET_HINT, shorthint_t>)
-        gpu = las_gpu_fib_usable(ws, Q);
+    if constexpr (LEVEL == 1 && std::is_same_v<TARGET_HINT, shorthint_t>) {
+        if (las_gpu_fib_usable(ws, Q))
+            gpu = las_gpu_fib_start(ws, aux, Q, side, pool) > 0;
+    }
 #endif
 
     size_t pushed = 0;
@@ -409,7 +410,6 @@ static void fill_in_buckets_one_side(nfs_work & ws, nfs_aux & aux,
         using entry_t = std::decay_t<decltype(s)>::entry_t;
 
         if (gpu && las_gpu_fib_takes_slice<entry_t>()) {
-            gpu_weight += s.get_weight();
             pushed++;
             return;
         }
@@ -421,15 +421,6 @@ static void fill_in_buckets_one_side(nfs_work & ws, nfs_aux & aux,
         pushed++;
     });
 
-#ifndef SIQS_SIEVE
-    if constexpr (LEVEL == 1 && std::is_same_v<TARGET_HINT, shorthint_t>) {
-        if (gpu && gpu_weight) {
-            pool.add_task(thread_pool::QUEUE_GENERIC, gpu_weight,
-                    las_gpu_fib_run, side, std::ref(ws), std::ref(aux),
-                    std::ref(Q), std::make_shared<where_am_I>(w));
-        }
-    }
-#endif
 }
 
 /* This is a compile-time loop over the possible values from 1 to level,

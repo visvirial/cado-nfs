@@ -8,7 +8,7 @@
 
 class nfs_aux;
 class nfs_work;
-class worker_thread;
+class thread_pool;
 
 /* Toplevel bucket sieving on the backend that -gpu selected.
  *
@@ -41,14 +41,25 @@ constexpr bool las_gpu_fib_takes_slice()
  */
 bool las_gpu_fib_usable(nfs_work const & ws, qlattice_basis const & Q);
 
-/* Sieve every slice that las_gpu_fib_takes_slice() accepts, into one
- * bucket array. Throws buckets_are_full exactly as the ordinary path
- * does, and with the same information, so that the caller's retry loop
- * does not need to know where the updates came from.
+/* Launch the device pass over every slice that
+ * las_gpu_fib_takes_slice() accepts, and queue the task that will hand
+ * its output to the bucket arrays once it is back.
+ *
+ * The launch does not wait for the device, so whatever the caller
+ * queues next -- the ordinary tasks for the other slices, the other
+ * side -- runs while the device works. The collecting task has cost 0,
+ * so the pool takes it last.
+ *
+ * The bucket arrays do not get a copy of the updates: they point into
+ * the pass's own buffer, which nfs_work::side_data keeps until the next
+ * special-q. The device's updates therefore take no room in the arrays
+ * and can never make them overflow.
+ *
+ * Returns the total weight of the slices the device took, 0 if none.
  */
-void las_gpu_fib_run(worker_thread * worker, int side, nfs_work & ws,
-                     nfs_aux & aux, qlattice_basis const & Q,
-                     std::shared_ptr<where_am_I> w);
+double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
+                         qlattice_basis const & Q, int side,
+                         thread_pool & pool);
 
 /* Device-side state that outlives a special-q, hung off
  * nfs_work::side_data. Opaque here so that the sieve headers stay free

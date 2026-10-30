@@ -146,6 +146,13 @@ class nfs_work {
          */
         las_gpu_fib_cache_ptr gpu_fib;
 
+        /* The device pass of the current special-q. The bucket arrays
+         * point into its output rather than holding a copy, so it is
+         * kept until the next one replaces it, by which time the arrays
+         * have been reset. Declared after gpu_fib, which it refers to,
+         * so that it goes first. */
+        std::shared_ptr<void> gpu_fib_pass;
+
         /* fbK depends on
          *      conf.logI
          *      conf.sides[side].lim

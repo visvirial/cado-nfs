@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include <algorithm>
+#include <stdexcept>
 #include <vector>
 
 #include "las-gpu-engine.hpp"
@@ -39,9 +40,17 @@ struct cpu_survivor_task {
 struct cpu_fib_task {
     std::vector<gpu_fib_entry> entries;
     std::vector<gpu_fib_slice> slices;
-    /* write cursors, one per (slice, bucket); kept here so that a pass
-     * does not have to allocate */
-    std::vector<uint64_t> cursor;
+};
+
+/* This backend is a reference, not a fast path, so a pass simply owns
+ * its output and is computed in full by fib_launch(). */
+struct cpu_fib_pass {
+    std::vector<uint32_t> counts;
+    std::vector<uint32_t> offsets;
+    std::vector<gpu_fib_update> updates;
+    std::vector<uint32_t> host_entries;
+    uint32_t nslices = 0;
+    uint32_t nb = 0;
 };
 
 struct cpu_engine : public gpu_engine {
@@ -141,33 +150,30 @@ struct cpu_engine : public gpu_engine {
         delete reinterpret_cast<cpu_fib_task *>(task);
     }
 
-    gpu_fib_result fib_run(gpu_fib_task * task, gpu_fib_plan const & plan,
-                           uint64_t const * bucket_begin,
-                           uint64_t const * bucket_room,
-                           gpu_fib_update * out, uint32_t * counts,
-                           uint32_t * host_entries,
-                           uint64_t host_capacity) override
+    gpu_fib_pass * fib_launch(gpu_fib_task * task,
+                              gpu_fib_plan const & plan) override
     {
         auto & t = *reinterpret_cast<cpu_fib_task *>(task);
+        auto * P = new cpu_fib_pass;
 
         uint32_t const nb = plan.n_buckets;
-        size_t const nslices = t.slices.size();
+        uint32_t const nslices = uint32_t(t.slices.size());
         int const logB = plan.log_bucket_region;
         uint32_t const bmask = (UINT32_C(1) << logB) - 1;
+        P->nslices = nslices;
+        P->nb = nb;
 
         gpu_fib_fence const F = gpu_fib_fence_for(plan.logI, plan.J);
 
-        gpu_fib_result res {};
-        std::fill_n(counts, nslices * nb, uint32_t(0));
+        P->counts.assign(size_t(nb) * nslices, 0);
 
-        /* Pass 1: how many updates each (slice, bucket) pair gets. The
+        /* Pass 1: how many updates each (bucket, slice) pair gets. The
          * device does the same thing, and for the same reason: the
          * per-slice boundaries have to be known before anything can be
          * written, and re-walking is cheaper than remembering every
          * position. */
-        for (size_t s = 0; s < nslices; s++) {
+        for (uint32_t s = 0; s < nslices; s++) {
             auto const & sl = t.slices[s];
-            uint32_t * const row = counts + s * nb;
             for (uint32_t k = 0; k < sl.count; k++) {
                 gpu_fib_entry const & e = t.entries[sl.first + k];
                 if (!gpu_fib_entry_is_sieved(plan, e.p))
@@ -176,40 +182,31 @@ struct cpu_engine : public gpu_engine {
                 int const kind = gpu_fib_prepare(&ple, e, plan.basis, F,
                                                  plan.logI);
                 if (kind == GPU_FIB_HOST) {
-                    if (res.nhost < host_capacity)
-                        host_entries[res.nhost] = sl.first + k;
-                    res.nhost++;
+                    P->host_entries.push_back(sl.first + k);
                     continue;
                 }
                 gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
-                    row[x >> logB]++;
+                    P->counts[size_t(x >> logB) * nslices + s]++;
                 });
             }
         }
 
-        /* Lay the slices out inside each bucket, in slice order, and
-         * check that they fit. */
-        t.cursor.assign(nslices * nb, 0);
-        for (uint32_t b = 0; b < nb; b++) {
-            uint64_t used = 0;
-            for (size_t s = 0; s < nslices; s++) {
-                t.cursor[s * nb + b] = bucket_begin[b] + used;
-                used += counts[s * nb + b];
-            }
-            if (used > bucket_room[b] && !res.overflow) {
-                res.overflow = true;
-                res.overflow_bucket = b;
-                res.overflow_needed = used;
-                res.overflow_room = bucket_room[b];
-            }
+        P->offsets.resize(P->counts.size() + 1);
+        uint64_t total = 0;
+        for (size_t i = 0; i < P->counts.size(); i++) {
+            P->offsets[i] = uint32_t(total);
+            total += P->counts[i];
         }
-        if (res.overflow || res.nhost > host_capacity)
-            return res;
+        if (total > UINT32_MAX)
+            throw std::runtime_error("las-gpu: too many bucket updates"
+                                     " for one pass");
+        P->offsets.back() = uint32_t(total);
+        P->updates.resize(size_t(total));
 
         /* Pass 2: write them. */
-        for (size_t s = 0; s < nslices; s++) {
+        std::vector<uint32_t> cur(P->offsets.begin(), P->offsets.end() - 1);
+        for (uint32_t s = 0; s < nslices; s++) {
             auto const & sl = t.slices[s];
-            uint64_t * const cur = t.cursor.data() + s * nb;
             for (uint32_t k = 0; k < sl.count; k++) {
                 gpu_fib_entry const & e = t.entries[sl.first + k];
                 if (!gpu_fib_entry_is_sieved(plan, e.p))
@@ -221,13 +218,28 @@ struct cpu_engine : public gpu_engine {
                     continue;
                 uint16_t const hint = e.hint;
                 gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
-                    out[cur[x >> logB]++] =
+                    P->updates[cur[size_t(x >> logB) * nslices + s]++] =
                         gpu_fib_update {hint, uint16_t(x & bmask)};
                 });
             }
         }
 
-        return res;
+        return reinterpret_cast<gpu_fib_pass *>(P);
+    }
+
+    gpu_fib_output fib_wait(gpu_fib_pass * pass) override
+    {
+        auto & P = *reinterpret_cast<cpu_fib_pass *>(pass);
+        return gpu_fib_output {
+            P.nslices, P.nb,
+            P.counts.data(), P.offsets.data(), P.updates.data(),
+            P.host_entries.data(), P.host_entries.size(),
+        };
+    }
+
+    void fib_release(gpu_fib_pass * pass) override
+    {
+        delete reinterpret_cast<cpu_fib_pass *>(pass);
     }
 };
 

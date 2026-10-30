@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <vector>
 
 #include "bucket.hpp"
@@ -54,6 +55,8 @@ struct las_gpu_fib_image {
     std::vector<gpu_fib_entry> entries;
     std::vector<gpu_fib_slice> slices;
     std::vector<slice_index_t> slice_indices;
+    std::vector<double> weights;
+
 
     las_gpu_fib_image() = default;
     las_gpu_fib_image(las_gpu_fib_image const &) = delete;
@@ -87,13 +90,6 @@ struct las_gpu_fib_cache {
      * factor base on most special-q's. */
     gpu_engine * eng = nullptr;
     std::map<void const *, std::unique_ptr<las_gpu_fib_image>> images;
-
-    /* scratch, kept across special-q's so that a pass allocates
-     * nothing */
-    std::vector<uint32_t> counts;
-    std::vector<uint32_t> host_entries;
-    std::vector<uint64_t> bucket_begin;
-    std::vector<uint64_t> bucket_room;
 };
 
 void las_gpu_fib_cache_deleter::operator()(las_gpu_fib_cache * p) const
@@ -128,6 +124,7 @@ build_image(fb_factorbase::slicing const & fbs)
             gs.count = uint32_t(I->entries.size()) - gs.first;
             I->slices.push_back(gs);
             I->slice_indices.push_back(sl.get_index());
+            I->weights.push_back(sl.get_weight());
         }
     });
 
@@ -196,19 +193,14 @@ static void replay_one(bucket_array_t<1, shorthint_t> & BA,
    bucket geometry, rather than on the synthetic input of
    tests/sieve/test_fib_engine.
 
-   Updates are compared per (slice, bucket) as multisets: the device
+   Updates are compared per (bucket, slice) as multisets: the device
    scatters with atomics, so it does not reproduce the order the host
    walks in, and nothing downstream depends on that order.
  */
 
-static void crosscheck(las_gpu_fib_cache & C, las_gpu_fib_image const & I,
-                       gpu_fib_plan const & plan,
-                       gpu_fib_result const & res,
-                       gpu_fib_update const * out, size_t storage, int side)
+static void crosscheck(las_gpu_fib_image const & I, gpu_fib_plan const & plan,
+                       gpu_fib_output const & out, int side)
 {
-    size_t const nb = plan.n_buckets;
-    size_t const nslices = I.slices.size();
-
     /* one reference task per image, never freed: this is a debugging
      * aid, and the images themselves live until las exits */
     static gpu_engine * ref = gpu_engine_cpu_create();
@@ -226,69 +218,61 @@ static void crosscheck(las_gpu_fib_cache & C, las_gpu_fib_image const & I,
         reftask = t;
     }
 
-    std::vector<gpu_fib_update> mine(storage);
-    std::vector<uint32_t> rcounts(nslices * nb);
-    std::vector<uint32_t> rhost(std::max<size_t>(res.nhost, 1) + 16);
-    gpu_fib_result const r = ref->fib_run(reftask, plan, C.bucket_begin.data(),
-                                          C.bucket_room.data(), mine.data(),
-                                          rcounts.data(), rhost.data(),
-                                          rhost.size());
+    gpu_fib_pass * const rp = ref->fib_launch(reftask, plan);
+    gpu_fib_output const r = ref->fib_wait(rp);
 
     auto fail = [&](char const * what) {
         fprintf(stderr, "las-gpu crosscheck: side %d: %s\n", side, what);
         abort();
     };
 
-    if (r.overflow != res.overflow)
-        fail("overflow disagreement");
-    if (r.nhost != res.nhost)
+    if (r.nslices != out.nslices || r.n_buckets != out.n_buckets)
+        fail("different geometry");
+    if (r.nhost != out.nhost)
         fail("different number of entries handed back");
     {
-        std::vector<uint32_t> a(C.host_entries.begin(),
-                C.host_entries.begin() + ptrdiff_t(res.nhost));
-        std::vector<uint32_t> b(rhost.begin(),
-                rhost.begin() + ptrdiff_t(r.nhost));
+        std::vector<uint32_t> a(out.host_entries, out.host_entries + out.nhost);
+        std::vector<uint32_t> b(r.host_entries, r.host_entries + r.nhost);
         std::ranges::sort(a);
         std::ranges::sort(b);
         if (a != b)
             fail("different entries handed back");
     }
-    if (r.overflow)
-        return;
 
-    for (size_t s = 0; s < nslices; s++)
-        for (size_t b = 0; b < nb; b++)
-            if (C.counts[s * nb + b] != rcounts[s * nb + b]) {
-                fprintf(stderr,
-                        "las-gpu crosscheck: side %d slice %zu bucket %zu:"
-                        " device %u, reference %u\n",
-                        side, s, b, C.counts[s * nb + b], rcounts[s * nb + b]);
-                abort();
-            }
+    size_t const grid = size_t(out.nslices) * out.n_buckets;
+    for (size_t i = 0; i < grid; i++)
+        if (out.counts[i] != r.counts[i] || out.offsets[i] != r.offsets[i]) {
+            fprintf(stderr,
+                    "las-gpu crosscheck: side %d bucket %zu slice %zu:"
+                    " device %u@%u, reference %u@%u\n",
+                    side, i / out.nslices, i % out.nslices,
+                    out.counts[i], out.offsets[i], r.counts[i], r.offsets[i]);
+            abort();
+        }
 
     auto key = [](gpu_fib_update const & u) {
         return (uint32_t(u.x) << 16) | u.hint;
     };
-    for (size_t b = 0; b < nb; b++) {
-        uint64_t off = C.bucket_begin[b];
-        for (size_t s = 0; s < nslices; s++) {
-            uint32_t const n = C.counts[s * nb + b];
-            std::vector<uint32_t> va(n), vb(n);
-            for (uint32_t k = 0; k < n; k++) {
-                va[k] = key(out[off + k]);
-                vb[k] = key(mine[off + k]);
-            }
-            std::ranges::sort(va);
-            std::ranges::sort(vb);
-            if (va != vb) {
-                fprintf(stderr,
-                        "las-gpu crosscheck: side %d slice %zu bucket %zu:"
-                        " %u updates differ\n", side, s, b, n);
-                abort();
-            }
-            off += n;
+    for (size_t i = 0; i < grid; i++) {
+        uint32_t const o = out.offsets[i];
+        uint32_t const n = out.counts[i];
+        std::vector<uint32_t> va(n), vb(n);
+        for (uint32_t k = 0; k < n; k++) {
+            va[k] = key(out.updates[o + k]);
+            vb[k] = key(r.updates[o + k]);
+        }
+        std::ranges::sort(va);
+        std::ranges::sort(vb);
+        if (va != vb) {
+            fprintf(stderr,
+                    "las-gpu crosscheck: side %d bucket %zu slice %zu:"
+                    " %u updates differ\n",
+                    side, i / out.nslices, i % out.nslices, n);
+            abort();
         }
     }
+
+    ref->fib_release(rp);
 }
 
 /* }}} */
@@ -319,13 +303,36 @@ bool las_gpu_fib_usable(nfs_work const & ws MAYBE_UNUSED,
 #endif
 }
 
-void las_gpu_fib_run(worker_thread * worker, int side, nfs_work & ws,
-                     nfs_aux & aux, qlattice_basis const & Q,
-                     std::shared_ptr<where_am_I> /* unused, see below */)
+/* One device pass. It outlives the special-q's bucket filling: the
+ * bucket arrays point into its output, so it is held by the side data
+ * until the next special-q's pass replaces it. */
+struct las_gpu_fib_inflight {
+    las_gpu_fib_image & I;
+    gpu_fib_plan plan;
+    gpu_fib_pass * pass;
+    int side;
+    gpu_fib_output out {};
+
+    las_gpu_fib_inflight(las_gpu_fib_image & I, gpu_fib_plan const & plan,
+                         int side)
+        : I(I), plan(plan), pass(I.eng->fib_launch(I.task, plan)), side(side)
+    {}
+    las_gpu_fib_inflight(las_gpu_fib_inflight const &) = delete;
+    las_gpu_fib_inflight & operator=(las_gpu_fib_inflight const &) = delete;
+
+    ~las_gpu_fib_inflight() { I.eng->fib_release(pass); }
+};
+
+/* Wait for the device, then hand its output to a bucket array -- any
+ * one: apply_one_bucket and the purge walk every array of the side, and
+ * the device's updates take no room in them. The lattices that the
+ * device handed back are replayed into the same array. */
+static void collect(worker_thread * worker, int side, nfs_work & ws,
+                    nfs_aux & aux, qlattice_basis const & Q,
+                    std::shared_ptr<las_gpu_fib_inflight> const & F)
 {
     /* The where_am_I we work with is the worker's own, exactly as in
-     * fill_in_buckets_toplevel_wrapper; the copy in the task's
-     * arguments is only there because the ordinary tasks take one. */
+     * fill_in_buckets_toplevel_wrapper. */
     int const id = worker->rank();
     nfs_aux::thread_data & taux(aux.th[id]);
     timetree_t & timer(aux.get_timer(worker));
@@ -339,31 +346,61 @@ void las_gpu_fib_run(worker_thread * worker, int side, nfs_work & ws,
     WHERE_AM_I_UPDATE(w, side, side);
     WHERE_AM_I_UPDATE(w, N, 0);
 
+    las_gpu_fib_image const & I(F->I);
+    F->out = I.eng->fib_wait(F->pass);
+    gpu_fib_output const & out(F->out);
+
+    static bool const xcheck = getenv("LAS_GPU_FIB_CROSSCHECK") != nullptr;
+    if (xcheck)
+        crosscheck(I, F->plan, out, side);
+
+    auto acquired = wss.reserve_BA<1, shorthint_t>();
+    auto & BA = acquired.access();
+    ASSERT_ALWAYS(BA.n_bucket == out.n_buckets);
+
+    BA.add_external_slices(I.slice_indices.data(), 0, out.nslices,
+            reinterpret_cast<fib_update_t const *>(out.updates),
+            out.offsets, out.nslices);
+
+    for (uint64_t k = 0; k < out.nhost; k++) {
+        uint32_t const idx = out.host_entries[k];
+        size_t const s = I.slice_of(idx);
+        replay_one(BA, I.entries[idx], I.slices[s].slice_index, Q,
+                   ws.conf.logI, ws.J, w);
+    }
+}
+
+double las_gpu_fib_start(nfs_work & ws, nfs_aux & aux,
+                         qlattice_basis const & Q, int side,
+                         thread_pool & pool)
+{
+    nfs_work::side_data & wss(ws.sides[side]);
+
+    /* The previous special-q is done with it, and the bucket arrays
+     * that pointed into it have been reset. Give it back before taking
+     * a new one, so that a side never holds two. */
+    wss.gpu_fib_pass.reset();
+
     if (!wss.gpu_fib || wss.gpu_fib->eng != las_gpu::engine()) {
         wss.gpu_fib.reset(new las_gpu_fib_cache);
         wss.gpu_fib->eng = las_gpu::engine();
     }
-    las_gpu_fib_cache & C(*wss.gpu_fib);
-    auto & slot = C.images[wss.fbs];
+    auto & slot = wss.gpu_fib->images[wss.fbs];
     if (!slot)
         slot = build_image(*wss.fbs);
     las_gpu_fib_image & I(*slot);
 
     if (I.slices.empty())
-        return;
+        return 0;
 
-    auto acquired = wss.reserve_BA<1, shorthint_t>();
-    auto & BA = acquired.access();
-
-    size_t const nb = BA.n_bucket;
-    size_t const nslices = I.slices.size();
+    uint32_t const nb = uint32_t(ws.nb_buckets[1]);
 
     /* The kernels index the per-bucket arrays by x >> log_bucket_region
-     * for every x below J << logI, so the bucket array has to be at
-     * least that wide. It always is -- las rounds the bucket count up,
-     * and truncates J afterwards rather than before -- but an overrun
-     * here would be a silent out-of-bounds atomic on the device, so it
-     * is worth one comparison per special-q to be sure. */
+     * for every x below J << logI, so the bucket arrays have to be at
+     * least that wide. They always are -- las rounds the bucket count
+     * up, and truncates J afterwards rather than before -- but an
+     * overrun here would be a silent out-of-bounds atomic on the
+     * device, so it is worth one comparison per special-q to be sure. */
     ASSERT_ALWAYS((uint64_t(ws.J) << ws.conf.logI) <=
                   (uint64_t(nb) << LOG_BUCKET_REGIONS[1]));
 
@@ -371,7 +408,7 @@ void las_gpu_fib_run(worker_thread * worker, int side, nfs_work & ws,
     plan.logI = ws.conf.logI;
     plan.log_bucket_region = LOG_BUCKET_REGIONS[1];
     plan.J = ws.J;
-    plan.n_buckets = uint32_t(nb);
+    plan.n_buckets = nb;
     plan.basis = gpu_qlattice {Q.a0, Q.b0, Q.a1, Q.b1};
 
     /* Mirror of Q.is_coprime_to(): only the factors that a factor base
@@ -382,54 +419,15 @@ void las_gpu_fib_run(worker_thread * worker, int side, nfs_work & ws,
             plan.q_factors[plan.n_q_factors++] = uint32_t(f);
     }
 
-    C.counts.resize(nslices * nb);
-    C.bucket_begin.resize(nb);
-    C.bucket_room.resize(nb);
-    for (size_t b = 0; b < nb; b++) {
-        C.bucket_begin[b] = BA.gpu_bucket_begin(b);
-        C.bucket_room[b] = BA.gpu_bucket_room(b);
-    }
-    if (C.host_entries.empty())
-        C.host_entries.resize(256);
+    auto F = std::make_shared<las_gpu_fib_inflight>(I, plan, side);
+    wss.gpu_fib_pass = F;
 
-    auto * const out = reinterpret_cast<gpu_fib_update *>(BA.gpu_storage());
+    /* Cost 0, so that the pool gets to it last: by then the device has
+     * had all the time the ordinary tasks took. */
+    pool.add_task(thread_pool::QUEUE_GENERIC, 0, collect,
+                  side, std::ref(ws), std::ref(aux), std::cref(Q), F);
 
-    gpu_fib_result res {};
-    for (;;) {
-        res = I.eng->fib_run(I.task, plan, C.bucket_begin.data(),
-                             C.bucket_room.data(), out, C.counts.data(),
-                             C.host_entries.data(), C.host_entries.size());
-        if (res.nhost > C.host_entries.size()) {
-            /* The kernel never drops one silently, it just tells us the
-             * buffer was too small. Only ever seen on the first q. */
-            C.host_entries.resize(size_t(res.nhost));
-            continue;
-        }
-        break;
-    }
-
-    if (res.overflow) {
-        throw buckets_are_full(
-                bkmult_specifier::getkey<fib_update_t>(), side,
-                int(res.overflow_bucket), int(res.overflow_needed),
-                int(res.overflow_room));
-    }
-
-    static bool const xcheck = getenv("LAS_GPU_FIB_CROSSCHECK") != nullptr;
-    if (xcheck)
-        crosscheck(C, I, plan, res, out,
-                   size_t(BA.gpu_bucket_begin(nb - 1) +
-                          BA.gpu_bucket_room(nb - 1)),
-                   side);
-
-    BA.gpu_commit(I.slice_indices.data(), nslices, C.counts.data());
-
-    for (uint64_t k = 0; k < res.nhost; k++) {
-        uint32_t const idx = C.host_entries[size_t(k)];
-        size_t const s = I.slice_of(idx);
-        replay_one(BA, I.entries[idx], I.slices[s].slice_index, Q,
-                   ws.conf.logI, ws.J, w);
-    }
+    return std::accumulate(I.weights.begin(), I.weights.end(), 0.0);
 }
 
 /* }}} */

@@ -112,9 +112,9 @@ __global__ void kernel_survivor_flags(unsigned char * __restrict__ S0,
 __global__ void kernel_fib_count(gpu_fib_entry const * __restrict__ entries,
                                  uint32_t const * __restrict__ entry_slice,
                                  uint32_t nentries, gpu_fib_plan plan,
-                                 uint32_t * __restrict__ counts, uint32_t nb,
+                                 uint32_t nslices,
+                                 uint32_t * __restrict__ counts,
                                  uint32_t * __restrict__ host_entries,
-                                 uint64_t host_capacity,
                                  unsigned long long * __restrict__ nhost)
 {
     gpu_fib_fence const F = gpu_fib_fence_for(plan.logI, plan.J);
@@ -130,24 +130,30 @@ __global__ void kernel_fib_count(gpu_fib_entry const * __restrict__ entries,
         gpu_ple ple {};
         int const kind = gpu_fib_prepare(&ple, e, plan.basis, F, plan.logI);
         if (kind == GPU_FIB_HOST) {
+            /* sized for every entry, so this cannot overflow */
             unsigned long long const slot = atomicAdd(nhost, 1ULL);
-            if (slot < host_capacity)
-                host_entries[slot] = k;
+            host_entries[slot] = k;
             continue;
         }
 
-        uint32_t * const row = counts + size_t(entry_slice[k]) * nb;
+        uint32_t * const col = counts + entry_slice[k];
         gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
-            atomicAdd(&row[x >> logB], 1u);
+            atomicAdd(&col[size_t(x >> logB) * nslices], 1u);
         });
     }
 }
 
+/* cursor[] starts out as the exclusive prefix sums of counts[]. Updates
+ * past `capacity` are counted but not written; the host notices that
+ * the total exceeds the capacity, grows the buffer and runs this kernel
+ * again. */
 __global__ void kernel_fib_scatter(gpu_fib_entry const * __restrict__ entries,
                                    uint32_t const * __restrict__ entry_slice,
                                    uint32_t nentries, gpu_fib_plan plan,
-                                   uint64_t * __restrict__ cursor, uint32_t nb,
-                                   gpu_fib_update * __restrict__ updates)
+                                   uint32_t nslices,
+                                   uint32_t * __restrict__ cursor,
+                                   gpu_fib_update * __restrict__ updates,
+                                   uint32_t capacity)
 {
     gpu_fib_fence const F = gpu_fib_fence_for(plan.logI, plan.J);
     int const logB = plan.log_bucket_region;
@@ -165,12 +171,13 @@ __global__ void kernel_fib_scatter(gpu_fib_entry const * __restrict__ entries,
         if (kind == GPU_FIB_HOST)
             continue;
 
-        uint64_t * const row = cursor + size_t(entry_slice[k]) * nb;
+        uint32_t * const col = cursor + entry_slice[k];
         uint16_t const hint = e.hint;
         gpu_fib_walk(ple, kind, F, [&](uint64_t x) {
-            uint64_t const slot = atomicAdd(
-                reinterpret_cast<unsigned long long *>(&row[x >> logB]), 1ULL);
-            updates[slot] = gpu_fib_update {hint, uint16_t(x & bmask)};
+            uint32_t const slot =
+                atomicAdd(&col[size_t(x >> logB) * nslices], 1u);
+            if (slot < capacity)
+                updates[slot] = gpu_fib_update {hint, uint16_t(x & bmask)};
         });
     }
 }
@@ -216,7 +223,8 @@ struct cuda_fib_task {
     uint32_t nslices = 0;
 };
 
-/* Scratch for one in-flight bucket-sieving pass.
+/* Scratch for one in-flight bucket-sieving pass, which is also what a
+ * gpu_fib_pass points to.
  *
  * This is kept apart from cuda_fib_task because there is one task per
  * factor base slicing, and las uses several of those per side -- the
@@ -224,43 +232,44 @@ struct cuda_fib_task {
  * special-q. The scratch, on the other hand, is sized by the sieve
  * area and is mostly page-locked memory, which costs milliseconds to
  * allocate. Pooling it in the engine means the first few special-q's
- * pay for it and nobody else does. A slot is taken for the duration of
- * a pass; the pool grows to the number of passes ever in flight at
- * once, which is two when both sides are sieved concurrently.
+ * pay for it and nobody else does. A slot is taken by fib_launch and
+ * given back by fib_release; the pool grows to the number of passes
+ * ever in flight at once.
  */
 struct cuda_fib_scratch {
-    /* resized as the sieve area and the bucket allocation grow */
-    gpu_fib_update * d_updates = nullptr;
-    /* Page-locked landing zone for them. The bucket array itself is
-     * ordinary memory, and a device-to-pageable copy is staged by the
-     * driver anyway; doing the staging ourselves turns the one copy
-     * per bucket -- hundreds of them -- into a single transfer plus a
-     * host-side scatter, which is both faster and free of any question
-     * about how pageable asynchronous copies interleave when the two
-     * sides are sieving at the same time. */
-    gpu_fib_update * h_updates = nullptr;
-    uint64_t updates_capacity = 0;
-
+    /* Device side. counts[] has one extra, always zero, element so that
+     * the scan writes the total at offsets[grid]. */
     uint32_t * d_counts = nullptr;
-    uint64_t * d_cursor = nullptr;
+    uint32_t * d_offsets = nullptr;
+    uint32_t * d_cursor = nullptr;
     size_t grid_capacity = 0;       /* in nslices*nb units */
+    void * d_scan_temp = nullptr;
+    size_t scan_temp_bytes = 0;
+
+    gpu_fib_update * d_updates = nullptr;
+    uint32_t updates_capacity = 0;
 
     uint32_t * d_host_entries = nullptr;
-    uint64_t host_capacity = 0;
     unsigned long long * d_nhost = nullptr;
+    uint32_t host_capacity = 0;
+
+    /* Page-locked mirrors, so that every copy can be queued. The
+     * bucket arrays point straight into h_updates rather than getting
+     * a copy, which is why a pass keeps its scratch until it is
+     * released. */
+    uint32_t * h_counts = nullptr;
+    uint32_t * h_offsets = nullptr;
+    gpu_fib_update * h_updates = nullptr;
+    uint32_t h_updates_capacity = 0;
+    uint32_t * h_host_entries = nullptr;
     unsigned long long * h_nhost = nullptr;
 
-    /* Page-locked staging for the two small arrays that cross the bus
-     * on every pass, so that the copies can be queued rather than
-     * blocking. */
-    uint32_t * h_counts = nullptr;
-    uint64_t * h_cursor = nullptr;
-
-    /* where each bucket's updates sit in d_updates */
-    std::vector<uint64_t> compact;
-    std::vector<uint64_t> used;
-
     cudaStream_t stream = nullptr;
+
+    /* the pass in flight */
+    cuda_fib_task const * task = nullptr;
+    gpu_fib_plan plan;
+    int grid_e = 0;
 };
 
 struct cuda_survivor_task {
@@ -562,15 +571,18 @@ struct cuda_engine : public gpu_engine {
     {
         cudaSetDevice(device);
         for (auto * sc: fib_all) {
-            cudaFree(sc->d_updates);
-            cudaFreeHost(sc->h_updates);
             cudaFree(sc->d_counts);
+            cudaFree(sc->d_offsets);
             cudaFree(sc->d_cursor);
+            cudaFree(sc->d_scan_temp);
+            cudaFree(sc->d_updates);
             cudaFree(sc->d_host_entries);
             cudaFree(sc->d_nhost);
-            cudaFreeHost(sc->h_nhost);
             cudaFreeHost(sc->h_counts);
-            cudaFreeHost(sc->h_cursor);
+            cudaFreeHost(sc->h_offsets);
+            cudaFreeHost(sc->h_updates);
+            cudaFreeHost(sc->h_host_entries);
+            cudaFreeHost(sc->h_nhost);
             if (sc->stream)
                 cudaStreamDestroy(sc->stream);
             delete sc;
@@ -595,12 +607,6 @@ struct cuda_engine : public gpu_engine {
         std::lock_guard<std::mutex> const lock(fib_mu);
         fib_all.push_back(sc);
         return sc;
-    }
-
-    void fib_scratch_give(cuda_fib_scratch * sc)
-    {
-        std::lock_guard<std::mutex> const lock(fib_mu);
-        fib_free.push_back(sc);
     }
 
     gpu_fib_task * fib_task_create(gpu_fib_entry const * entries,
@@ -643,160 +649,159 @@ struct cuda_engine : public gpu_engine {
         delete t;
     }
 
-    gpu_fib_result fib_run(gpu_fib_task * task, gpu_fib_plan const & plan,
-                           uint64_t const * bucket_begin,
-                           uint64_t const * bucket_room,
-                           gpu_fib_update * out, uint32_t * counts,
-                           uint32_t * host_entries,
-                           uint64_t host_capacity) override
+    static void fib_enqueue_scatter(cuda_fib_scratch * sc, size_t grid)
+    {
+        cuda_fib_task const * const t = sc->task;
+        CUDA_CHECK(cudaMemcpyAsync(sc->d_cursor, sc->d_offsets,
+                                   grid * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice, sc->stream));
+        kernel_fib_scatter<<<sc->grid_e, 128, 0, sc->stream>>>(
+            t->d_entries, t->d_entry_slice, t->nentries, sc->plan,
+            t->nslices, sc->d_cursor, sc->d_updates, sc->updates_capacity);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    /* Everything up to and including the scatter goes into the stream
+     * here, with no synchronisation: the device needs nothing from the
+     * host once it has the plan. Only copying the updates back has to
+     * wait for fib_wait(), because their number is not known until the
+     * count is done. */
+    gpu_fib_pass * fib_launch(gpu_fib_task * task,
+                              gpu_fib_plan const & plan) override
     {
         auto * t = reinterpret_cast<cuda_fib_task *>(task);
         CUDA_CHECK(cudaSetDevice(device));
         cuda_fib_scratch * const sc = fib_scratch_take();
-        gpu_fib_result const res = fib_run(t, sc, plan, bucket_begin,
-                                           bucket_room, out, counts,
-                                           host_entries, host_capacity);
-        fib_scratch_give(sc);
-        return res;
-    }
-
-    static gpu_fib_result fib_run(cuda_fib_task * t, cuda_fib_scratch * sc,
-                                  gpu_fib_plan const & plan,
-                                  uint64_t const * bucket_begin,
-                                  uint64_t const * bucket_room,
-                                  gpu_fib_update * out, uint32_t * counts,
-                                  uint32_t * host_entries,
-                                  uint64_t host_capacity)
-    {
         cudaStream_t const stream = sc->stream;
+        sc->task = t;
+        sc->plan = plan;
 
-        uint32_t const nb = plan.n_buckets;
-        size_t const grid = size_t(t->nslices) * nb;
+        size_t const grid = size_t(t->nslices) * plan.n_buckets;
 
-        sc->compact.resize(size_t(nb) + 1);
-        sc->used.resize(nb);
-        if (grid > sc->grid_capacity) {
+        if (grid + 1 > sc->grid_capacity) {
             cudaFree(sc->d_counts);
+            cudaFree(sc->d_offsets);
             cudaFree(sc->d_cursor);
+            cudaFree(sc->d_scan_temp);
             cudaFreeHost(sc->h_counts);
-            cudaFreeHost(sc->h_cursor);
-            CUDA_CHECK(cudaMalloc(&sc->d_counts, grid * sizeof(uint32_t)));
-            CUDA_CHECK(cudaMalloc(&sc->d_cursor, grid * sizeof(uint64_t)));
-            CUDA_CHECK(cudaHostAlloc(&sc->h_counts, grid * sizeof(uint32_t),
+            cudaFreeHost(sc->h_offsets);
+            size_t const n = grid + 1;
+            CUDA_CHECK(cudaMalloc(&sc->d_counts, n * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&sc->d_offsets, n * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&sc->d_cursor, n * sizeof(uint32_t)));
+            CUDA_CHECK(cudaHostAlloc(&sc->h_counts, n * sizeof(uint32_t),
                                      cudaHostAllocDefault));
-            CUDA_CHECK(cudaHostAlloc(&sc->h_cursor, grid * sizeof(uint64_t),
+            CUDA_CHECK(cudaHostAlloc(&sc->h_offsets, n * sizeof(uint32_t),
                                      cudaHostAllocDefault));
-            sc->grid_capacity = grid;
+            sc->scan_temp_bytes = 0;
+            CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+                nullptr, sc->scan_temp_bytes, sc->d_counts, sc->d_offsets,
+                n));
+            CUDA_CHECK(cudaMalloc(&sc->d_scan_temp, sc->scan_temp_bytes));
+            sc->grid_capacity = n;
         }
-        if (host_capacity > sc->host_capacity) {
+        if (t->nentries > sc->host_capacity) {
             cudaFree(sc->d_host_entries);
+            cudaFreeHost(sc->h_host_entries);
             CUDA_CHECK(cudaMalloc(&sc->d_host_entries,
-                                  size_t(host_capacity) * sizeof(uint32_t)));
-            sc->host_capacity = host_capacity;
+                                  size_t(t->nentries) * sizeof(uint32_t)));
+            CUDA_CHECK(cudaHostAlloc(&sc->h_host_entries,
+                                     size_t(t->nentries) * sizeof(uint32_t),
+                                     cudaHostAllocDefault));
+            sc->host_capacity = t->nentries;
         }
 
-        CUDA_CHECK(cudaMemsetAsync(sc->d_counts, 0, grid * sizeof(uint32_t),
-                                   stream));
+        CUDA_CHECK(cudaMemsetAsync(sc->d_counts, 0,
+                                   (grid + 1) * sizeof(uint32_t), stream));
         CUDA_CHECK(cudaMemsetAsync(sc->d_nhost, 0, sizeof(unsigned long long),
                                    stream));
 
-        int const block = 128;
-        int grid_e = int((t->nentries + block - 1) / block);
-        if (grid_e > 65535)
-            grid_e = 65535;
+        sc->grid_e = int((t->nentries + 127) / 128);
+        if (sc->grid_e > 65535)
+            sc->grid_e = 65535;
+        if (sc->grid_e == 0)
+            sc->grid_e = 1;
 
-        kernel_fib_count<<<grid_e, block, 0, stream>>>(
-            t->d_entries, t->d_entry_slice, t->nentries, plan, sc->d_counts,
-            nb, sc->d_host_entries, host_capacity, sc->d_nhost);
+        kernel_fib_count<<<sc->grid_e, 128, 0, stream>>>(
+            t->d_entries, t->d_entry_slice, t->nentries, plan, t->nslices,
+            sc->d_counts, sc->d_host_entries, sc->d_nhost);
         CUDA_CHECK(cudaGetLastError());
+
+        CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+            sc->d_scan_temp, sc->scan_temp_bytes, sc->d_counts, sc->d_offsets,
+            grid + 1, stream));
 
         CUDA_CHECK(cudaMemcpyAsync(sc->h_counts, sc->d_counts,
                                    grid * sizeof(uint32_t),
                                    cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(sc->h_offsets, sc->d_offsets,
+                                   (grid + 1) * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(sc->h_nhost, sc->d_nhost,
                                    sizeof(unsigned long long),
                                    cudaMemcpyDeviceToHost, stream));
+
+        fib_enqueue_scatter(sc, grid);
+
+        return reinterpret_cast<gpu_fib_pass *>(sc);
+    }
+
+    gpu_fib_output fib_wait(gpu_fib_pass * pass) override
+    {
+        auto * sc = reinterpret_cast<cuda_fib_scratch *>(pass);
+        cuda_fib_task const * const t = sc->task;
+        CUDA_CHECK(cudaSetDevice(device));
+        cudaStream_t const stream = sc->stream;
+        size_t const grid = size_t(t->nslices) * sc->plan.n_buckets;
+
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        unsigned long long const nhost = *sc->h_nhost;
+        uint32_t const total = sc->h_offsets[grid];
+        uint64_t const nhost = *sc->h_nhost;
 
-        gpu_fib_result res {};
-        res.nhost = nhost;
-
-        /* The layout is a few thousand additions over a 100kB array, so
-         * the host does it: a kernel for it would cost more in
-         * synchronisation than it saves. The device side of it is
-         * compact -- bucket b's updates sit back to back in d_updates,
-         * with nothing in between -- because we copy each bucket back
-         * into its own place in out[], and the gaps in out[] may hold
-         * updates that an ordinary CPU task put there. */
-        memcpy(counts, sc->h_counts, grid * sizeof(uint32_t));
-        uint64_t off = 0;
-        for (uint32_t b = 0; b < nb; b++) {
-            sc->compact[b] = off;
-            uint64_t u = 0;
-            for (uint32_t s = 0; s < t->nslices; s++) {
-                sc->h_cursor[size_t(s) * nb + b] = off + u;
-                u += counts[size_t(s) * nb + b];
-            }
-            sc->used[b] = u;
-            if (u > bucket_room[b] && !res.overflow) {
-                res.overflow = true;
-                res.overflow_bucket = b;
-                res.overflow_needed = u;
-                res.overflow_room = bucket_room[b];
-            }
-            off += u;
-        }
-        sc->compact[nb] = off;
-
-        if (res.overflow || nhost > host_capacity)
-            return res;
-
-        if (off > sc->updates_capacity) {
-            /* Grow generously: the high-water mark drifts up over the
-             * first few special-q's and reallocating page-locked memory
-             * is not cheap. */
-            uint64_t const want = off + off / 4;
+        if (total > sc->updates_capacity) {
+            /* Only on the first few special-q's: the high-water mark
+             * drifts up, so grow generously. The counts are still
+             * good; only the scatter has to be done again. */
+            uint64_t want = uint64_t(total) + total / 4;
+            if (want > UINT32_MAX)
+                want = UINT32_MAX;
             cudaFree(sc->d_updates);
-            cudaFreeHost(sc->h_updates);
             CUDA_CHECK(cudaMalloc(&sc->d_updates,
                                   size_t(want) * sizeof(gpu_fib_update)));
+            sc->updates_capacity = uint32_t(want);
+            fib_enqueue_scatter(sc, grid);
+        }
+        if (total > sc->h_updates_capacity) {
+            cudaFreeHost(sc->h_updates);
             CUDA_CHECK(cudaHostAlloc(&sc->h_updates,
-                                     size_t(want) * sizeof(gpu_fib_update),
+                                     size_t(sc->updates_capacity) *
+                                         sizeof(gpu_fib_update),
                                      cudaHostAllocDefault));
-            sc->updates_capacity = want;
+            sc->h_updates_capacity = sc->updates_capacity;
         }
 
-        CUDA_CHECK(cudaMemcpyAsync(sc->d_cursor, sc->h_cursor,
-                                   grid * sizeof(uint64_t),
-                                   cudaMemcpyHostToDevice, stream));
-
-        kernel_fib_scatter<<<grid_e, block, 0, stream>>>(
-            t->d_entries, t->d_entry_slice, t->nentries, plan, sc->d_cursor,
-            nb, sc->d_updates);
-        CUDA_CHECK(cudaGetLastError());
-
         if (nhost)
-            CUDA_CHECK(cudaMemcpyAsync(host_entries, sc->d_host_entries,
+            CUDA_CHECK(cudaMemcpyAsync(sc->h_host_entries, sc->d_host_entries,
                                        size_t(nhost) * sizeof(uint32_t),
                                        cudaMemcpyDeviceToHost, stream));
-
         CUDA_CHECK(cudaMemcpyAsync(sc->h_updates, sc->d_updates,
-                                   size_t(off) * sizeof(gpu_fib_update),
+                                   size_t(total) * sizeof(gpu_fib_update),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        /* Device-side the buckets are back to back; in the bucket array
-         * they are not, and the gaps may hold updates that an ordinary
-         * CPU task put there. */
-        for (uint32_t b = 0; b < nb; b++) {
-            if (!sc->used[b])
-                continue;
-            memcpy(out + bucket_begin[b], sc->h_updates + sc->compact[b],
-                   size_t(sc->used[b]) * sizeof(gpu_fib_update));
-        }
+        return gpu_fib_output {
+            t->nslices, sc->plan.n_buckets,
+            sc->h_counts, sc->h_offsets, sc->h_updates,
+            sc->h_host_entries, nhost,
+        };
+    }
 
-        return res;
+    void fib_release(gpu_fib_pass * pass) override
+    {
+        auto * sc = reinterpret_cast<cuda_fib_scratch *>(pass);
+        sc->task = nullptr;
+        std::lock_guard<std::mutex> const lock(fib_mu);
+        fib_free.push_back(sc);
     }
 };
 
@@ -807,6 +812,17 @@ bool cuda_device_usable(int device)
     if (device < 0 || device >= count)
         return false;
     CUDA_TRY(cudaSetDevice(device));
+    /* By default a thread waiting on the device spins as long as there
+     * are fewer active host threads than cores, which in las is always:
+     * the pool has one thread per core, and the ones waiting on a pass
+     * would burn the very cores the rest of the sieve needs. Make them
+     * sleep instead. This has to be set before the context exists; if
+     * some other code got there first, the default stays, which is
+     * merely slower. */
+    cudaError_t const e = cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+    if (e != cudaSuccess && e != cudaErrorSetOnActiveProcess)
+        return false;
+    (void) cudaGetLastError();
     CUDA_TRY(cudaFree(nullptr)); /* forces context creation */
     return true;
 }

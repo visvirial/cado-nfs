@@ -88,60 +88,35 @@ static int64_t pick(gmp_randstate_t rs, int bits)
 
 namespace {
 struct run_output {
-    std::vector<gpu_fib_update> updates;
     std::vector<uint32_t> counts;
+    std::vector<uint32_t> offsets;
+    std::vector<gpu_fib_update> updates;
     std::vector<uint32_t> host_entries;
-    uint64_t nhost = 0;
-    bool overflow = false;
 };
 }
 
-static void run_one(gpu_engine * eng, std::vector<gpu_fib_entry> const & entries,
-                    std::vector<gpu_fib_slice> const & slices,
-                    gpu_fib_plan const & plan,
-                    std::vector<uint64_t> const & begin,
-                    std::vector<uint64_t> const & room, size_t storage,
-                    run_output & out)
+static void collect(gpu_engine * eng, gpu_fib_pass * pass, run_output & out)
 {
-    gpu_fib_task * const task = eng->fib_task_create(
-            entries.data(), uint32_t(entries.size()), slices.data(),
-            uint32_t(slices.size()));
-
-    out.updates.assign(storage, gpu_fib_update {0xffff, 0xffff});
-    out.counts.assign(slices.size() * plan.n_buckets, 0);
-    out.host_entries.assign(std::max<size_t>(entries.size(), 1), 0);
-
-    gpu_fib_result const r = eng->fib_run(task, plan, begin.data(), room.data(),
-                                          out.updates.data(),
-                                          out.counts.data(),
-                                          out.host_entries.data(),
-                                          out.host_entries.size());
-    out.nhost = r.nhost;
-    out.overflow = r.overflow;
-    eng->fib_task_destroy(task);
+    gpu_fib_output const o = eng->fib_wait(pass);
+    size_t const grid = size_t(o.nslices) * o.n_buckets;
+    out.counts.assign(o.counts, o.counts + grid);
+    out.offsets.assign(o.offsets, o.offsets + grid + 1);
+    out.updates.assign(o.updates, o.updates + o.offsets[grid]);
+    out.host_entries.assign(o.host_entries, o.host_entries + o.nhost);
+    eng->fib_release(pass);
 }
 
 static bool compare(run_output const & a, run_output const & b,
-                    std::vector<gpu_fib_slice> const & slices,
-                    std::vector<uint64_t> const & begin, uint32_t nb,
-                    unsigned long & nupdates)
+                    uint32_t nslices, unsigned long & nupdates)
 {
-    size_t const nslices = slices.size();
-
-    if (a.overflow != b.overflow) {
-        fprintf(stderr, "FAIL: overflow %d vs %d\n", a.overflow, b.overflow);
-        return false;
-    }
-    if (a.nhost != b.nhost) {
-        fprintf(stderr, "FAIL: %lu vs %lu entries handed back\n",
-                (unsigned long) a.nhost, (unsigned long) b.nhost);
+    if (a.host_entries.size() != b.host_entries.size()) {
+        fprintf(stderr, "FAIL: %zu vs %zu entries handed back\n",
+                a.host_entries.size(), b.host_entries.size());
         return false;
     }
     {
-        std::vector<uint32_t> ha(a.host_entries.begin(),
-                                 a.host_entries.begin() + ptrdiff_t(a.nhost));
-        std::vector<uint32_t> hb(b.host_entries.begin(),
-                                 b.host_entries.begin() + ptrdiff_t(b.nhost));
+        std::vector<uint32_t> ha = a.host_entries;
+        std::vector<uint32_t> hb = b.host_entries;
         std::ranges::sort(ha);
         std::ranges::sort(hb);
         if (ha != hb) {
@@ -149,44 +124,42 @@ static bool compare(run_output const & a, run_output const & b,
             return false;
         }
     }
-    if (a.counts != b.counts) {
-        for (size_t s = 0; s < nslices; s++)
-            for (uint32_t b2 = 0; b2 < nb; b2++)
-                if (a.counts[s * nb + b2] != b.counts[s * nb + b2]) {
-                    fprintf(stderr,
-                            "FAIL: slice %zu bucket %" PRIu32
-                            ": %" PRIu32 " vs %" PRIu32 " updates\n",
-                            s, b2, a.counts[s * nb + b2],
-                            b.counts[s * nb + b2]);
-                    return false;
-                }
+    for (size_t i = 0; i < a.counts.size(); i++)
+        if (a.counts[i] != b.counts[i] || a.offsets[i] != b.offsets[i]) {
+            fprintf(stderr,
+                    "FAIL: bucket %zu slice %zu: %" PRIu32 "@%" PRIu32
+                    " vs %" PRIu32 "@%" PRIu32 " updates\n",
+                    i / nslices, i % nslices, a.counts[i], a.offsets[i],
+                    b.counts[i], b.offsets[i]);
+            return false;
+        }
+    if (a.offsets.back() != b.offsets.back()) {
+        fprintf(stderr, "FAIL: different totals\n");
+        return false;
     }
 
-    /* same counts: now the contents, bucket by bucket and slice by
-     * slice, as multisets */
+    /* same layout: now the contents, (bucket, slice) by (bucket,
+     * slice), as multisets */
     auto key = [](gpu_fib_update const & u) {
         return (uint32_t(u.x) << 16) | u.hint;
     };
-    for (uint32_t b2 = 0; b2 < nb; b2++) {
-        uint64_t off = begin[b2];
-        for (size_t s = 0; s < nslices; s++) {
-            uint32_t const n = a.counts[s * nb + b2];
-            std::vector<uint32_t> va(n), vb(n);
-            for (uint32_t k = 0; k < n; k++) {
-                va[k] = key(a.updates[off + k]);
-                vb[k] = key(b.updates[off + k]);
-            }
-            std::ranges::sort(va);
-            std::ranges::sort(vb);
-            if (va != vb) {
-                fprintf(stderr,
-                        "FAIL: bucket %" PRIu32 " slice %zu (%" PRIu32
-                        " updates) differs\n", b2, s, n);
-                return false;
-            }
-            nupdates += n;
-            off += n;
+    for (size_t i = 0; i < a.counts.size(); i++) {
+        uint32_t const o = a.offsets[i];
+        uint32_t const n = a.counts[i];
+        std::vector<uint32_t> va(n), vb(n);
+        for (uint32_t k = 0; k < n; k++) {
+            va[k] = key(a.updates[o + k]);
+            vb[k] = key(b.updates[o + k]);
         }
+        std::ranges::sort(va);
+        std::ranges::sort(vb);
+        if (va != vb) {
+            fprintf(stderr,
+                    "FAIL: bucket %zu slice %zu (%" PRIu32
+                    " updates) differs\n", i / nslices, i % nslices, n);
+            return false;
+        }
+        nupdates += n;
     }
     return true;
 }
@@ -261,34 +234,36 @@ int main(int argc, char const * argv[])
         plan.n_q_factors = 1;
         plan.q_factors[0] = entries[gmp_urandomm_ui(rs, entries.size())].p;
 
-        /* A lattice of determinant p hits the area about area/p
-         * times; give each bucket twice its share of that, and grow if
-         * the estimate was unlucky. We want no overflow here: the
-         * overflow path is las's business, and it exercises it on its
-         * own whenever a bucket turns out too small. */
-        uint64_t est = 0;
-        for (auto const & e: entries)
-            est += area / e.p;
-        size_t per_bucket = size_t(2 * est / nb) + 1024;
+        gpu_fib_task * const tc = cpu->fib_task_create(
+                entries.data(), uint32_t(entries.size()), slices.data(),
+                uint32_t(slices.size()));
+        gpu_fib_task * const tg = cuda->fib_task_create(
+                entries.data(), uint32_t(entries.size()), slices.data(),
+                uint32_t(slices.size()));
 
-        std::vector<uint64_t> begin(nb), room(nb);
-        run_output A, B;
-        for (;;) {
-            size_t const gap = 7;
-            for (uint32_t b = 0; b < nb; b++) {
-                begin[b] = uint64_t(b) * (per_bucket + gap) + gap;
-                room[b] = per_bucket;
-            }
-            run_one(cpu, entries, slices, plan, begin, room,
-                    size_t(nb) * (per_bucket + gap) + gap, A);
-            if (!A.overflow)
-                break;
-            per_bucket *= 2;
-        }
-        run_one(cuda, entries, slices, plan, begin, room,
-                size_t(nb) * (per_bucket + 7) + 7, B);
-        nhost_total += (unsigned long) A.nhost;
-        if (!compare(A, B, slices, begin, nb, nupdates)) {
+        /* Two device passes in flight at once, as when both sides are
+         * sieved concurrently: they must not share scratch. The second
+         * one is over a different q-lattice. */
+        gpu_fib_plan plan2 = plan;
+        plan2.basis = gpu_qlattice {pick(rs, 31), pick(rs, 31),
+                                    pick(rs, 31), pick(rs, 31)};
+
+        gpu_fib_pass * const p1 = cuda->fib_launch(tg, plan);
+        gpu_fib_pass * const p2 = cuda->fib_launch(tg, plan2);
+
+        run_output A, B, A2, B2;
+        collect(cpu, cpu->fib_launch(tc, plan), A);
+        collect(cpu, cpu->fib_launch(tc, plan2), A2);
+        collect(cuda, p2, B2);
+        collect(cuda, p1, B);
+
+        cuda->fib_task_destroy(tg);
+        cpu->fib_task_destroy(tc);
+
+        nhost_total += (unsigned long) (A.host_entries.size() +
+                                        A2.host_entries.size());
+        if (!compare(A, B, uint32_t(nslices), nupdates) ||
+            !compare(A2, B2, uint32_t(nslices), nupdates)) {
             fprintf(stderr, "  logI=%d J=%" PRIu32 " nb=%" PRIu32
                             " nentries=%zu nslices=%zu\n",
                     logI, J, nb, nentries, nslices);
@@ -301,6 +276,6 @@ int main(int argc, char const * argv[])
     tests_common_clear();
 
     printf("%lu passes agree, %lu updates compared, %lu handed back\n",
-           iter, nupdates, nhost_total);
+           2 * iter, nupdates, nhost_total);
     return EXIT_SUCCESS;
 }

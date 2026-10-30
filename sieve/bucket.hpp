@@ -408,13 +408,38 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
     // For each slice that gets sieved, new index is added here
     std::vector<slice_index_t> slice_index;
 
+    // Slices whose updates are not in our storage; see
+    // add_external_slices(). They come after the ordinary ones.
+    struct external_slice {
+        slice_index_t index;
+        update_t const * base;
+        uint32_t const * offsets;
+        size_t stride;
+        size_t s;
+        update_t const * begin(size_t b) const
+        {
+            return base + offsets[b * stride + s];
+        }
+        update_t const * end(size_t b) const
+        {
+            return base + offsets[b * stride + s + 1];
+        }
+    };
+    std::vector<external_slice> external;
+
     // For each slice there are n_bucket pointers, each pointer tells
     // where in the corresponding bucket the updates from that slice
     // start
     std::vector<update_t *> slice_start;
 
   public:
-    slice_index_t get_nr_slices() const { return slice_index.size(); }
+    slice_index_t get_nr_slices() const
+    {
+        return slice_index.size() + external.size();
+    }
+  private:
+    slice_index_t get_nr_own_slices() const { return slice_index.size(); }
+  public:
 
     /* This is for projective primes only. We expect these to be rare, so
      * that an std::vector is appropriate (TBH, we should use vectors for
@@ -469,6 +494,8 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
     update_t const * begin(size_t i_bucket, slice_index_t i_slice) const
     {
         ASSERT_ALWAYS(i_slice < get_nr_slices());
+        if (i_slice >= get_nr_own_slices())
+            return external[i_slice - get_nr_own_slices()].begin(i_bucket);
         update_t const * const p = get_slice_pointers(i_slice)[i_bucket];
         /* The first slice we wrote must start at the bucket start */
         ASSERT_ALWAYS(i_slice != 0 || p == bucket_start[i_bucket]);
@@ -479,7 +506,9 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
     update_t const * end(size_t i_bucket, slice_index_t i_slice) const
     {
         ASSERT_ALWAYS(i_slice < get_nr_slices());
-        return (i_slice + 1 < get_nr_slices())
+        if (i_slice >= get_nr_own_slices())
+            return external[i_slice - get_nr_own_slices()].end(i_bucket);
+        return (i_slice + 1 < get_nr_own_slices())
                    ? get_slice_pointers(i_slice + 1)[i_bucket]
                    : bucket_write[i_bucket];
     }
@@ -508,7 +537,9 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
     void reset_pointers();
     slice_index_t get_slice_index(slice_index_t const i_slice) const
     {
-        ASSERT_ALWAYS(i_slice < slice_index.size());
+        ASSERT_ALWAYS(i_slice < get_nr_slices());
+        if (i_slice >= get_nr_own_slices())
+            return external[i_slice - get_nr_own_slices()].index;
         return slice_index[i_slice];
     }
     void add_slice_index(slice_index_t new_slice_index)
@@ -518,51 +549,31 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
         slice_index.push_back(new_slice_index);
     }
 
-    /* {{{ filling the whole array from a device
+    /* {{{ slices whose updates live elsewhere
      *
      * The GPU bucket-sieving path (sieve/las-fill-in-buckets-gpu.cpp)
-     * produces every slice of every bucket in a single pass, so instead
-     * of push_update()ing one at a time it writes straight into our
-     * storage and then tells us what it did. These three members are
-     * the only way in, so that the invariants tying bucket_write to
-     * slice_start stay in one place.
+     * produces every slice of every bucket in a single pass, into a
+     * buffer of its own. Rather than copying that into our storage --
+     * which costs as much memory traffic again as the bucket sieving
+     * the device saved, and competes with everything else for it --
+     * the buffer's runs are registered here as extra slices, which
+     * slice_range() and get_slice_index() serve like any other. The
+     * buffer must outlive them, i.e. stay valid until the next
+     * reset_pointers().
+     *
+     * The buffer is laid out bucket-major: the updates that slice s
+     * put in bucket b are base[offsets[b * stride + s]] up to
+     * base[offsets[b * stride + s + 1]]. Slice s gets slice index
+     * indices[s]. These updates take no room in the array, and do not
+     * count towards nb_of_updates() and friends.
      */
-
-    /* The storage itself; offsets below are relative to it. */
-    update_t * gpu_storage() { return bucket_start[0]; }
-
-    /* Where the device should start writing bucket i, and how many
-     * updates still fit there. We hand out the current write head
-     * rather than the start of the bucket, so that the device can share
-     * an array with the ordinary per-slice tasks: reserve_BA() gives
-     * exclusive use for the duration, but the array may well have been
-     * used by a CPU task for an earlier slice.
-     */
-    uint64_t gpu_bucket_begin(size_t const i) const
+    void add_external_slices(slice_index_t const * indices, size_t s0,
+                             size_t s1, update_t const * base,
+                             uint32_t const * offsets, size_t stride)
     {
-        return uint64_t(bucket_write[i] - bucket_start[0]);
-    }
-
-    uint64_t gpu_bucket_room(size_t const i) const
-    {
-        return uint64_t(bucket_start[i + 1] - bucket_write[i]);
-    }
-
-    /* counts[] holds nslices * n_bucket values: how many updates slice
-     * s wrote into bucket b. The slices must be given in the order the
-     * device laid them out, which is the order in which their updates
-     * appear in each bucket.
-     */
-    void gpu_commit(slice_index_t const * indices, size_t nslices,
-                    uint32_t const * counts)
-    {
-        for (size_t s = 0; s < nslices; s++) {
-            /* records the current write heads as slice s's starting
-             * points, which is where the device put them */
-            add_slice_index(indices[s]);
-            for (size_t b = 0; b < n_bucket; b++)
-                bucket_write[b] += counts[s * n_bucket + b];
-        }
+        for (size_t s = s0; s < s1; s++)
+            external.push_back(external_slice {
+                    indices[s], base, offsets, stride, s});
     }
     /* }}} */
     double max_full(unsigned int * fullest_index = nullptr) const;

@@ -62,6 +62,7 @@ void bucket_array_t<LEVEL, HINT>::reset_pointers()
     std::copy_n(bucket_start.get(), pointer_pack, bucket_read.get());
     slice_start.clear();
     slice_index.clear();
+    external.clear();
     for (auto & r: row_updates)
         r.clear();
 }
@@ -254,12 +255,12 @@ bucket_array_t<LEVEL, HINT>::slice_statistics(int side, int idx, fb_factorbase::
     for (unsigned int i = 0; i < n_bucket; ++i)
         a += nb_of_updates (i);
     verbose_fmt_print (0, 0, "# side-{} array #{} processed {} slices, total {} updates\n",
-            side, idx, get_nr_slices(), a);
+            side, idx, get_nr_own_slices(), a);
     ASSERT_ALWAYS(side >= 0);
-    std::vector<size_t> nupdates_per_slice(get_nr_slices(), 0);
+    std::vector<size_t> nupdates_per_slice(get_nr_own_slices(), 0);
 
     update_t const * const * fence = bucket_write.get();
-    for(size_t i = get_nr_slices() ; i-- ; ) {
+    for(size_t i = get_nr_own_slices() ; i-- ; ) {
         update_t const * const * previous = get_slice_pointers(i);
         for(unsigned int j = 0 ; j < n_bucket ; j++) {
             nupdates_per_slice[i] += fence[j] - previous[j];
@@ -267,7 +268,7 @@ bucket_array_t<LEVEL, HINT>::slice_statistics(int side, int idx, fb_factorbase::
         fence = previous;
     }
 
-    for(size_t i = 0 ; i < get_nr_slices() ; i++) {
+    for(size_t i = 0 ; i < get_nr_own_slices() ; i++) {
         double w =
             slice_index[i] < get_nr_slices() ? fbs[slice_index[i]].get_weight() : -1;
 

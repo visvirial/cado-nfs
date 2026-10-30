@@ -495,9 +495,23 @@ struct small_sieve_base {/*{{{*/
             i0ref = (-I()/2);
         }
         fbprime_t const q = sublat_reduced_modulus(ssp.get_p());
+        /* jj*r exceeds 2^31 for the largest power-of-two ssp on the far
+         * lines of a large-I run, and computing it in spos_t is signed
+         * overflow. That is not harmless: having been told the product
+         * cannot overflow, the compiler keeps it in 64 bits and passes
+         * it to fix_sublat_i() untruncated, which is what trips the
+         * ASSERT there rather than any wraparound we could live with.
+         *
+         * Only the value mod q matters below -- q divides p, a power of
+         * two, and the result is masked -- and fix_sublat_i() moves its
+         * result by a multiple of p when its argument moves by a
+         * multiple of p*sublat.m, which also keeps it the same mod any
+         * g dividing sublat.m. So reduce, in 64 bits, before narrowing.
+         */
+        int64_t xx = int64_t(jj) * int64_t(ssp.get_r());
+        xx %= int64_t(ssp.get_p()) * int64_t(sublat.m);
         int xi;
-        if (!fix_sublat_i_checked((spos_t)jj * (spos_t)ssp.get_r(),
-                                  ssp.get_p(), xi))
+        if (!fix_sublat_i_checked(xx, ssp.get_p(), xi))
             return NO_POSITION;
         spos_t x = xi;
         x = (x - i0ref) & (q - 1);

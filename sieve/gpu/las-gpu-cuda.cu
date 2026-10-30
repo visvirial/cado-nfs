@@ -160,6 +160,23 @@ fib_resume(gpu_ple & ple, gpu_fib_plan const & plan,
         ple.x = state[k];
 }
 
+/* Whether this chunk has nothing for this lattice, as can be told from
+ * where its walk stopped. A large prime hits a chunk only now and then,
+ * and this spares it all of gpu_fib_prepare, which is by far the most
+ * expensive part of a lattice that has no update to emit: at c270 sizes,
+ * most lattices are over and done with here in all chunks but the first.
+ *
+ * The scatter of the first chunk sees to it that all lattices have a
+ * position, UINT64_MAX for those that have nothing to walk. */
+static __device__ __forceinline__ bool
+fib_skips_chunk(gpu_fib_plan const & plan,
+                uint64_t const * __restrict__ state, uint32_t k,
+                uint64_t x_end, gpu_fib_fence const & F)
+{
+    return state && plan.chunk_begin &&
+        state[k] >= (x_end < F.end ? x_end : F.end);
+}
+
 __global__ void kernel_fib_count(gpu_fib_entry const * __restrict__ entries,
                                  uint32_t const * __restrict__ entry_slice,
                                  uint32_t nentries, gpu_fib_plan plan,
@@ -178,6 +195,8 @@ __global__ void kernel_fib_count(gpu_fib_entry const * __restrict__ entries,
 
     for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < nentries;
          k += stride) {
+        if (fib_skips_chunk(plan, state, k, x_end, F))
+            continue;
         gpu_fib_entry const e = entries[k];
         if (!gpu_fib_entry_is_sieved(plan, e.p))
             continue;
@@ -230,14 +249,22 @@ __global__ void kernel_fib_scatter(gpu_fib_entry const * __restrict__ entries,
 
     for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < nentries;
          k += stride) {
-        gpu_fib_entry const e = entries[k];
-        if (!gpu_fib_entry_is_sieved(plan, e.p))
+        if (fib_skips_chunk(plan, state, k, x_end, F))
             continue;
+        gpu_fib_entry const e = entries[k];
+        if (!gpu_fib_entry_is_sieved(plan, e.p)) {
+            if (state && !last)
+                state[k] = UINT64_MAX;
+            continue;
+        }
 
         gpu_ple ple {};
         int const kind = gpu_fib_prepare(&ple, e, plan.basis, F, plan.logI);
-        if (kind == GPU_FIB_HOST)
+        if (kind == GPU_FIB_HOST) {
+            if (state && !last)
+                state[k] = UINT64_MAX;
             continue;
+        }
         fib_resume(ple, plan, state, k);
 
         uint32_t const s = entry_slice[k];

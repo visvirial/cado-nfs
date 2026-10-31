@@ -42,7 +42,9 @@ This is the `latest` version.
   Python 3.10 with `flask` and `requests` (the CADO-NFS requirements).
 - CUDA 12.4 or later with `nvcc`; NCCL; an MPI implementation with
   `mpicxx` (Open MPI is what the linear algebra ran with).
-- One or more NVIDIA GPUs of compute capability 9.0 or later.
+- One or more NVIDIA GPUs of compute capability 9.0 or later, or 8.0
+  for an A100. On the A100, `glas` has been tested and the
+  other CUDA programs have only been compiled.
 
 ## Build
 
@@ -118,6 +120,34 @@ polynomial selection block of each is the fallback for a plain CADO
 run and is normally overridden on the command line
 (`tasks.polyselect.P`, `admax`, `adrange`, `threads`). A polynomial
 found elsewhere is imported with `tasks.polyselect.import=<poly>`.
+
+## Vast.ai
+
+Rent an A100 with 80 GB (`gpu_name=A100_SXM4 num_gpus=1 gpu_ram>=70`, in
+GB; `A=33` used 60 GB there, and a 40 GB card is untested) and the image
+`nvidia/cuda:12.4.1-devel-ubuntu22.04`. Keep that CUDA version: on the
+same machine, `glas` built with 12.8 takes 20% longer per special-q.
+
+    gpu-siever/scripts/vast-a100-setup.sh
+
+builds `glas-gpu` for the GPU it finds. To sieve, point the client at
+the server, with 8 threads: the GPU is what limits `glas` there, and
+32 threads are no faster.
+
+    GLAS_THREADS=8 GLAS_BIN=$PWD/gpu-siever/glas-gpu \
+      build/<host>/cado-nfs-client.py --server=<url> --certsha1=<fingerprint>
+
+On the server, the options of `cado-nfs.py` go before the number, and
+the `tasks.*` settings after it:
+
+    cado-nfs.py --parameters params/params.c270 <N> \
+      tasks.polyselect.import=<poly> \
+      tasks.sieve.las.execpath=$PWD/scripts \
+      tasks.sieve.las.execbin=las-glas
+
+`glas` needs `I >= 12`: below `c120`, add `tasks.I=12`. Parameters
+tuned for `las` with a large `mfb0`, such as `parameters/factor/params.c270`,
+overflow the device and fall back to the CPU, so use the ones in `params/`.
 
 ## Running the programs directly
 

@@ -1228,6 +1228,15 @@ fill_local_pair_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
     }
 }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+/* Thread block clusters need compute capability 9.0.  Older devices only
+ * ever run C == 1, which never touches the cluster. */
+struct no_cluster {
+    __device__ void sync() const { __syncthreads(); }
+    __device__ uint32_t * map_shared_rank(uint32_t * p, uint32_t) const { return p; }
+};
+#endif
+
 template <bool GROUP, uint32_t ROWS = 0, uint32_t C = 1, bool LEAN = false,
           uint32_t BLOCKS = 2>
 __global__ void __launch_bounds__(FILL_THREADS, ROWS ? BLOCKS : 6)
@@ -1277,7 +1286,11 @@ fill_row_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
     uint32_t off = ((uint64_t)r * jb + I / 2) % q;
     if constexpr (ROWS) {
         static_assert(FILL_THREADS * ROWS < (1u << (32 - 17)));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+        no_cluster const cluster;
+#else
         auto const cluster = cooperative_groups::this_cluster();
+#endif
         auto sync = [&] {
             if constexpr (C == 1) __syncthreads();
             else cluster.sync();

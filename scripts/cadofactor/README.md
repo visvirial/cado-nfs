@@ -403,6 +403,43 @@ tasks.filter.add_ratio=0.05
 specifies that you want 5% more relations before next filtering step.
 The default value is 0.01 (i.e. 1% more relations).
 
+The purge step spends the excess above `keep` in clique-removal steps.
+The number of steps is chosen by purge by default (at most 50). To set
+it:
+
+```
+tasks.filter.purge.nsteps=20
+```
+
+The merge step raises its merge cost bound by `incr` between passes.
+A smaller value gives a smaller matrix and a longer merge. The default
+is 8. To change it:
+
+```
+tasks.filter.merge.incr=4
+```
+
+The two duplicate removal passes are serial by default. Two opt-in
+parameters make them parallel:
+
+```
+tasks.filter.duplicates1.nshards=4
+```
+
+runs the splitting pass (dup1) as 4 concurrent processes. Each process
+splits a share of the input files and writes its own output files into
+the same slice directories. The slice of each relation stays the same.
+The default is 1, which is the single-process behavior.
+
+```
+tasks.filter.duplicates2.concurrent=true
+```
+
+runs the removal pass (dup2) on all slices at the same time. Each dup2
+process keeps a hash table of the relations of its slice in memory, so
+the peak memory use is the sum over the slices. The default is false,
+which runs the slices one after the other.
+
 Printing and manipulating the database
 ======================================
 

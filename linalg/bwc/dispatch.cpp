@@ -144,11 +144,13 @@ static void * dispatch_prog(parallelizing_info & pi, cxx_param_list & pl, void *
 
     const char * sanity_check_vector = pl.lookup_old("sanity_check_vector");
     bool const only_export = pl.has("export_cachelist");
+    int build_only = 0;
+    pl.parse("build_only", build_only);
 
     // in no situation shall we try to do our sanity check if we've just
     // been told to export our cache list. Note also that this sanity
     // check is currently only valid for GF(2).
-    if (sanity_check_vector != nullptr && !only_export && mpz_cmp_ui(bw->p, 2) == 0 && mmt.abase->simd_groupsize()) {
+    if (sanity_check_vector != nullptr && !only_export && !build_only && mpz_cmp_ui(bw->p, 2) == 0 && mmt.abase->simd_groupsize()) {
         /* We have computed a sanity check vector, which is H=M*K, with K
          * constant and easily given. Note that we have not computed K*M,
          * but really M*K. Thus independently of which side we prefer, we
@@ -175,8 +177,8 @@ static void * dispatch_prog(parallelizing_info & pi, cxx_param_list & pl, void *
         // compare if files are equal.
         if (pi.m.jrank == 0 && pi.m.trank == 0) {
             char cmd[1024];
-            int rc = snprintf(cmd, 80, "diff -q %s Hx0-64", sanity_check_vector);
-            ASSERT_ALWAYS(rc>=0);
+            int rc = snprintf(cmd, sizeof(cmd), "diff -q %s Hx0-64", sanity_check_vector);
+            ASSERT_ALWAYS(rc >= 0 && size_t(rc) < sizeof(cmd));
             rc = system(cmd);
             if (rc) {
                 printf("%s : failed\n", checkname);
@@ -272,13 +274,17 @@ static int main_(int argc, char const * argv[])
     parallelizing_info::declare_usage(pl);
     matmul_top_decl_usage(pl);
     /* declare local parameters and switches */
+    pl.declare_usage("build_only",
+            "build and save the cache (and the sanity_check_vector file),"
+            " skip the two matrix product checks: a later dispatch run"
+            " that loads the cache runs them");
 
     bw_common_parse_cmdline(bw, pl, &argc, &argv);
 
     bw_common_interpret_parameters(bw, pl);
     parallelizing_info::lookup_parameters(pl);
     matmul_top_lookup_parameters(pl);
-    /* interpret our parameters: none here (so far). */
+    pl.lookup("build_only");
 
     ASSERT_ALWAYS(pl.has("ys"));
     ASSERT_ALWAYS(!pl.has("solutions"));

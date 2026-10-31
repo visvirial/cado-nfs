@@ -4,10 +4,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
+#include <atomic>
 #include <compare>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -28,16 +31,36 @@ concept container_with_h = requires {
 template <typename F>
 concept weight_function = requires { float(F()(3)); };
 
-struct purge_matrix : simple_minded_chunk_allocator<index_t> {
-    static constexpr index_t END_OF_ROW = std::numeric_limits<index_t>::max();
+/* A row is the list of its column indices, each packed on index_bytes
+ * bytes, little endian, followed by end_of_row. The rows live in
+ * blocks with 8 spare bytes at the end, so that a row is read with
+ * 8-byte loads.
+ */
+using purge_row_allocator =
+    simple_minded_chunk_allocator<uint8_t, size_t(1) << 20, 8>;
+
+struct purge_matrix : purge_row_allocator {
     static constexpr weight_t OVERWEIGHT = std::numeric_limits<weight_t>::max();
-    std::vector<index_t *> rows;
+    /* only the columns in [col_min_index, col_max_index) are stored */
+    size_t col_min_index = 0;
+    size_t col_max_index = std::numeric_limits<index_t>::max();
+    unsigned int index_bytes = sizeof(index_t);
+    /* all ones on index_bytes bytes: the mask of a packed index, and
+     * the sentinel after the last index of a row */
+    index_t end_of_row = std::numeric_limits<index_t>::max();
+    std::vector<uint8_t *> rows;
     std::vector<weight_t> column_weights;
+    /* xor of i+1 over the active rows i of each column. It gives the
+     * last row of a column of weight one, and the other row of a column
+     * of weight two. The first call of singleton_removal creates it,
+     * and delete_row updates it. */
+    std::vector<index_t> row_xors;
+    /* columns whose weight fell to one since the last singleton
+     * removal: their last rows are the singletons to remove. */
+    std::vector<index_t> singleton_columns;
+    std::mutex singleton_columns_mutex;
     size_t remaining_rows = 0;
     size_t remaining_columns = 0;
-    private:
-    mutable std::mutex m;
-    public:
 
     std::make_signed_t<size_t> excess() const
     {
@@ -46,69 +69,124 @@ struct purge_matrix : simple_minded_chunk_allocator<index_t> {
 
     bool is_active(size_t i) const { return rows[i] != nullptr; }
 
-    /* Insert row i into the matrix, containing the primes in the given
-     * list that are within the column index range [col0, col1).
-     *
-     * remaining_rows increases by one
-     * remaining_columns increases if needed.
-     *
-     * This method is **not** thread-safe.
-     */
-    template <container_with_h C>
-    void new_row(size_t i, C const & primes)
+    /* the other row of the column h of weight two, given one row i */
+    size_t other_row(size_t h, size_t i) const
     {
-        size_t newcols = 0;
-        size_t active_weight = 0;
-        for (auto & c: primes) {
-            auto h = c.h;
-            if (h >= column_weights.size()) {
-                column_weights.resize(h+1, 0);
+        index_t const x = std::atomic_ref(row_xors[h])
+            .load(std::memory_order_relaxed);
+        return (x ^ index_t(i + 1)) - 1;
+    }
+
+    /* Set the column range; index_bytes is the smallest width that
+     * holds col_max_index - 1 and the sentinel. */
+    void set_column_range(size_t col0, size_t col1);
+
+    index_t unpack(uint8_t const * p) const
+    {
+        uint64_t v;
+        std::memcpy(&v, p, sizeof(v));
+        return v & end_of_row;
+    }
+
+    /* The column indices of one row, in the order of the relation: a
+     * range that is its own iterator, up to end_of_row. */
+    struct row_columns {
+        purge_matrix const & M;
+        uint8_t const * p;
+        struct sentinel {};
+        row_columns begin() const { return *this; }
+        sentinel end() const { return {}; }
+        index_t operator*() const { return M.unpack(p); }
+        row_columns & operator++() { p += M.index_bytes; return *this; }
+        bool operator==(sentinel) const { return **this == M.end_of_row; }
+    };
+    row_columns columns(uint8_t const * p) const { return {*this, p}; }
+    row_columns columns(size_t i) const { return columns(rows[i]); }
+
+    /* The column weights while several threads count them at the same
+     * time: chunks of 2^24 weights, which a thread creates when it
+     * first meets a column of their range, and saturating increments.
+     * take_column_weights() copies them into column_weights.
+     */
+    struct column_weight_counter {
+        static constexpr unsigned int chunk_bits = 24;
+        static constexpr size_t chunk_size = size_t(1) << chunk_bits;
+        /* 2^40 columns at most: their weights alone would fill 1 TB. */
+        static constexpr size_t max_chunks = size_t(1) << 16;
+        std::vector<std::atomic<weight_t *>> chunks =
+            std::vector<std::atomic<weight_t *>>(max_chunks);
+        ~column_weight_counter();
+        void increment(size_t h);
+    };
+
+    /* The rows of one group of relations. One thread fills one
+     * row_builder. append() moves its rows into the matrix.
+     */
+    struct row_builder : purge_row_allocator {
+        std::vector<uint8_t *> rows;
+
+        /* Add a row that contains the primes in the given list that
+         * are within the column range of M, and count every prime in
+         * the column weights. The row gets the next row number.
+         */
+        template <container_with_h C>
+        void new_row(column_weight_counter & weights, purge_matrix const & M,
+                     C const & primes)
+        {
+            size_t active_weight = 0;
+            for (auto & c: primes)
+                active_weight += M.is_stored(c.h);
+
+            auto * p = alloc(M.index_bytes * (active_weight + 1));
+            auto * q = p;
+            for (auto & c: primes) {
+                auto h = c.h;
+                weights.increment(h);
+                if (M.is_stored(h))
+                    q = M.pack(q, h);
             }
-            auto & w = column_weights[h];
-            newcols += (w == 0);
-            w += (w < OVERWEIGHT);
-            active_weight += (w < OVERWEIGHT);
+            M.pack(q, M.end_of_row);
+            rows.push_back(p);
         }
+    };
 
-        auto * p = alloc(active_weight + 1);
-        p[active_weight] = END_OF_ROW;
-        auto * q = p;
-        for (auto & c: primes) {
-            if (column_weights[c.h] < OVERWEIGHT)
-                *q++ = c.h;
-        }
-        remaining_rows++;
-        remaining_columns += newcols;
-        if (i >= rows.size())
-            rows.resize(i+1, nullptr);
-        rows[i] = p;
-    }
-
-    /* Remove OVERWEIGHT columns from rows where they could have been written
-     * before being marked as OVERWEIGHT. It does not reduce memory usage
-     * (no memory is freed), but it is needed to be coherent (no overweight
-     * columns should appear in a row).
-     */
-    void remove_overweight_columns_from_rows()
+    bool is_stored(size_t h) const
     {
-      for (auto & row: rows) {
-          auto * q = row;
-          for (index_t *p = row; *p != END_OF_ROW; ++p)
-              if (column_weights[*p] < OVERWEIGHT)
-                  *q++ = *p;
-          *q = END_OF_ROW;
-      }
+        return h >= col_min_index && h < col_max_index;
     }
 
-    /* for the purposes of clique removal, this computes the addition
-     * i1+i2 of the row indices of the non-zero coefficients,
-     * specifically in the columns of weight 2.
+    /* Writes h at q, and returns the position after it. */
+    uint8_t * pack(uint8_t * q, index_t h) const
+    {
+        std::memcpy(q, &h, index_bytes);
+        return q + index_bytes;
+    }
+
+    /* Put the rows of b after the rows of the matrix. b is empty
+     * afterwards.
      */
-    using sum2_type = std::vector<size_t>;
+    void append(row_builder & b);
+
+    /* Set column_weights from the counter, and count the non-empty
+     * columns.
+     */
+    void take_column_weights(column_weight_counter const & weights);
+
+    /* one bit per column */
+    using column_bitset = std::vector<uint64_t>;
+    static bool test_bit(column_bitset const & b, size_t h)
+    {
+        return b[h / 64] >> (h % 64) & 1;
+    }
+
+    /* The resident size of the process and the bytes of the matrix
+     * structures, on one line that starts with "# MEMORY: <label>". */
+    void print_memory(std::string const & label) const;
 
     void print_stats_column_weights(FILE *, int verbose) const;
     void print_stats_row_weights(FILE *, int verbose) const;
-    void print_stats_on_cliques (FILE *, sum2_type const &, int verbose) const;
+    void print_stats_on_cliques (FILE *, column_bitset const & weight_two,
+            int verbose) const;
 
     int64_t singleton_removal(size_t nthreads, int verbose);
 
@@ -144,39 +222,52 @@ struct purge_matrix : simple_minded_chunk_allocator<index_t> {
      */
     static constexpr size_t ccc_quadratic_abort = 10;
 
+    /* The connected components follow the columns of weight two. The
+     * bitset weight_two marks the columns that had weight two when the
+     * components were computed: a column that falls to weight two
+     * during the deletions is not followed.
+     */
     template <weight_function F>
     std::pair<size_t, connected_component>
-    compute_connected_component(size_t i0, std::vector<size_t> const & sum2,
+    compute_connected_component(size_t i0, column_bitset const & weight_two,
                                     std::vector<size_t> & buf,
                                     F const & f) const;
 
     template <weight_function F>
     std::pair<size_t, connected_component>
     compute_connected_component_with_set(size_t i0,
-            std::vector<size_t> const & sum2,
+            column_bitset const & weight_two,
             std::vector<size_t>  & buf,
             F const & f) const;
 
     void delete_connected_component(size_t i0,
-            std::vector<size_t> const & sum2,
-            std::vector<size_t> & buf);
+            column_bitset const & weight_two,
+            std::vector<size_t> & buf, std::vector<index_t> & weight_one);
 
-    size_t clique_removal_core (sum2_type const &,
+    size_t clique_removal_core (column_bitset const & weight_two,
             int64_t target_excess, size_t max_nb_comp,
             size_t nthreads, int verbose);
 
-    size_t one_singleton_removal(size_t nthreads);
+    column_bitset columns_of_weight(weight_t w, size_t nthreads) const;
+    void compute_row_xors(size_t nthreads);
+    void delete_rows_with_weight_one_column(size_t nthreads);
+    void delete_singletons(size_t nthreads);
+    void add_singleton_columns(std::vector<index_t> const & weight_one);
 
     /* this function needs to touch the matrix data atomically. For this
      * reason, we prefer to limit its exposition. It is used concurrently
-     * within singleton_removal and clique_removal
+     * within singleton_removal and clique_removal.
+     *
+     * The columns whose weight falls to one are appended to weight_one.
+     * Returns false, and does nothing, if the row is deleted already.
      */
-    void delete_row(size_t i);
-
-    sum2_type compute_sum2(size_t nthreads = 1) const;
+    bool delete_row(size_t i, std::vector<index_t> & weight_one);
 
     static void print_stats_generic(FILE * out, std::vector<size_t> const & w,
                         char const * name, char const * unit, int verbose);
+
+    /* wall time since program start, comparable to seconds() */
+    static double wct_elapsed();
 };
 
 #endif /* CADO_PURGE_MATRIX_HPP */

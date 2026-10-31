@@ -8,6 +8,7 @@
 #include <cerrno>
 
 #include <algorithm>
+#include <array>
 #include <ranges>
 #include <memory>
 #include <string>
@@ -31,6 +32,7 @@
 #include "matmul.hpp"
 #include "matmul_top.hpp"
 #include "matmul_top_comm.hpp"
+#include "matmul_top_comm_plugin.hpp"
 #include "matmul_top_vec.hpp"
 #include "matrix_u32.hpp"
 #include "mf_bal.hpp"
@@ -73,6 +75,7 @@ void matmul_top_decl_usage(cxx_param_list & pl)
             "whether to chain several matrices (experimental)");
     balancing_decl_usage(pl);
     matmul_decl_usage(pl);
+    matmul_top_comm_plugin_decl_usage(pl);
 }
 
 void matmul_top_lookup_parameters(cxx_param_list & pl)
@@ -90,17 +93,24 @@ void matmul_top_lookup_parameters(cxx_param_list & pl)
     pl.lookup("multi_matrix");
     balancing_lookup_parameters(pl);
     matmul_lookup_parameters(pl);
+    matmul_top_comm_plugin_lookup_parameters(pl);
 }
 
 //////////////////////////////////////////////////////////////////////////
 
 void matmul_top_mul(matmul_top_data & mmt, mmt_vec * v, struct timing_data * tt)/*{{{*/
 {
+    matmul_top_mul_to(mmt, v, v[0], tt);
+}
+/*}}}*/
+
+void matmul_top_mul_to(matmul_top_data & mmt, mmt_vec * v, mmt_vec & out, struct timing_data * tt)/*{{{*/
+{
     /* Do all matrices in turn.
      *
      * We represent M as * M0*M1*..*M_{n-1}.
      *
-     * The input vector is v[0], and the result is put in v[0] again.
+     * The input vector is v[0], and the result is put in out.
      *
      * The direction in which we apply the product is given by v[0].d.
      * For v[0].d == 0, we do v[0]*M. For v[0].d==1, we do M*v[0]
@@ -112,7 +122,7 @@ void matmul_top_mul(matmul_top_data & mmt, mmt_vec * v, struct timing_data * tt)
      *  if n is odd:
      *  v[n] <- v[n-1] * M_{n-1} ; v[n].d == 1
      *  if n is even:
-     *  v[0] <- v[n-1] * M_{n-1} ; v[0].d == 0
+     *  out <- v[n-1] * M_{n-1} ; out.d == 0
      *
      * For v[0].d == 1:
      *  v[1] <- M0 * v[0] ; v[1].d == 0
@@ -120,7 +130,7 @@ void matmul_top_mul(matmul_top_data & mmt, mmt_vec * v, struct timing_data * tt)
      *  if n is odd:
      *  v[n] <- M_{n-1} * v[n-1] ; v[n].d == 0
      *  if n is even:
-     *  v[0] <- M_{n-1} * v[n-1] ; v[0].d == 1
+     *  out <- M_{n-1} * v[n-1] ; out.d == 1
      *
      * This has the consequence that v must hold exactly n+(n&1) vectors.
      *
@@ -143,8 +153,7 @@ void matmul_top_mul(matmul_top_data & mmt, mmt_vec * v, struct timing_data * tt)
     for(size_t l = 0 ; l < mmt.matrices.size() ; l++) {
         mmt_vec const & src = v[l];
         bool const last = l == (mmt.matrices.size() - 1);
-        size_t const lnext = last && !nmats_odd ? 0 : (l+1);
-        mmt_vec & dst = v[lnext];
+        mmt_vec & dst = last && !nmats_odd ? out : v[l+1];
 
         ASSERT_ALWAYS(src.consistency == 2);
         matmul_top_mul_cpu(mmt, midx, d, dst, src);
@@ -158,20 +167,19 @@ void matmul_top_mul(matmul_top_data & mmt, mmt_vec * v, struct timing_data * tt)
 
         /* Now we can resume MPI communications. */
         if (last && nmats_odd) {
-            ASSERT_ALWAYS(lnext == mmt.matrices.size());
-            matmul_top_mul_comm(v[0], dst);
+            matmul_top_mul_comm(out, dst);
         } else {
             mmt_vec_allreduce(dst);
         }
         timing_next_timer(tt);
         /* now measuring jitter */
-        mmt.pi.interleaving_flip();
         mmt.pi.m.serialize(__FILE__, __LINE__);
+        mmt.pi.interleaving_flip();
 
         timing_next_timer(tt);
         midx += d ? -1 : 1;
     }
-    ASSERT_ALWAYS(v[0].consistency == 2);
+    ASSERT_ALWAYS(out.consistency == 2);
 }
 /*}}}*/
 
@@ -355,14 +363,37 @@ void mmt_apply_identity(mmt_vec & w, mmt_vec const & v)
     unsigned int const how_many = intersect_two_intervals(&v_off, &w_off,
             v.i0, v.i1, w.i0, w.i1);
 
-    A->vec_set(A->vec_subvec(w.v, w_off), A->vec_subvec(v.v, v_off), how_many);
+    mmt_vec_copy_items(A,
+            A->vec_subvec(w.v, w_off),
+            A->vec_subvec(v.v, v_off),
+            how_many);
     w.consistency = 1;
+}
+
+/* the zero temporary in direction !y.d, with a mirror next to y when y
+ * has one. The same shape returns on every call of a run, so the
+ * buffer and the mirror are allocated once.
+ *
+ * Only the arithmetic of mmt is known to outlive mmt.scratch. A vector
+ * with another one, which the caller may delete at any time, gets a
+ * temporary that it owns through foreign. */
+static mmt_vec & mmt_scratch(matmul_top_data & mmt, mmt_vec const & y,
+        std::unique_ptr<mmt_vec> & foreign)
+{
+    bool const cached = y.abase == mmt.abase;
+    std::unique_ptr<mmt_vec> & s = cached ? mmt.scratch[!y.d] : foreign;
+    if (!s || s->abase != y.abase || s->n != y.n)
+        s = std::make_unique<mmt_vec>(mmt, y.abase, y.pitype, !y.d, 0, y.n);
+    mmt_vec_dev_mirror(*s, y);
+    mmt_full_vec_set_zero(*s);
+    return *s;
 }
 
 static void mmt_vec_apply_or_unapply_P_inner(matmul_top_data & mmt, mmt_vec & y, int apply)
 {
     ASSERT_ALWAYS(y.consistency == 2);
-    mmt_vec yt(mmt, y.abase, y.pitype, !y.d, 0, y.n);
+    std::unique_ptr<mmt_vec> foreign;
+    mmt_vec & yt = mmt_scratch(mmt, y, foreign);
     if ((apply ^ y.d) == 0) {
         // y.d == 0: get v*P^-1
         // y.d == 1: get v*P
@@ -389,6 +420,61 @@ void mmt_vec_apply_P(matmul_top_data & mmt, mmt_vec & y)
     mmt_vec_apply_or_unapply_P_inner(mmt, y, 1);
 }
 
+/* the indices of dst item uv[dc] <- src item uv[dc^1] for the pairs uv
+ * of s whose two indices fall in the ranges of dst and src */
+static void mmt_perm_index_build(mmt_perm_index & x, mmt_vec const & dst,
+        int dc, mmt_vec const & src,
+        std::vector<std::array<unsigned int, 2>> const & s)
+{
+    ASSERT_ALWAYS(!x.built);
+    for(auto const & uv : s) {
+        if (uv[dc] < dst.i0 || uv[dc] >= dst.i1)
+            continue;
+        if (uv[dc^1] < src.i0 || uv[dc^1] >= src.i1)
+            continue;
+        x.di.push_back(uv[dc] - dst.i0);
+        x.si.push_back(uv[dc^1] - src.i0);
+    }
+    x.built = true;
+}
+
+/* the indices get a current mirror next to dst once dst has one (dst
+ * gets its mirror in its first product, which may come after the first
+ * permutation) */
+static void mmt_perm_index_mirror(mmt_perm_index & x, mmt_vec const & dst)
+{
+    if (x.di.empty() || bwc_dev_find(x.di.data()))
+        return;
+    for (std::vector<uint32_t> * idx : { &x.di, &x.si }) {
+        bwc_dev_mirror(idx->data(), idx->size() * sizeof(uint32_t), dst.v);
+        bwc_dev_adopt(idx->data());
+    }
+}
+
+/* dst item uv[dc] <- src item uv[dc^1] for the pairs uv of s whose two
+ * indices fall in the ranges of dst and src. dst is zero on entry and
+ * inconsistent on exit. */
+static void mmt_vec_permute_items(mmt_perm_index & x, mmt_vec & dst,
+        int dc, mmt_vec const & src,
+        std::vector<std::array<unsigned int, 2>> const & s)
+{
+    arith_generic * A = dst.abase;
+    if (!x.built)
+        mmt_perm_index_build(x, dst, dc, src, s);
+    mmt_perm_index_mirror(x, dst);
+    dst.pi.m.serialize_threads(__FILE__, __LINE__);
+    if (!bwc_dev_scatter(dst.v, x.di.data(), src.v, x.si.data(),
+                x.di.size(), A->vec_elt_stride(1))) {
+        mmt_vec_dev_fetch(src);
+        mmt_vec_dev_fetch(dst);
+        for(size_t k = 0 ; k < x.di.size() ; k++)
+            A->set(A->vec_item(dst.v, x.di[k]), A->vec_item(src.v, x.si[k]));
+        mmt_vec_dev_invalidate(dst);
+    }
+    dst.consistency = 1;
+    dst.pi.m.serialize_threads(__FILE__, __LINE__);
+}
+
 /* apply == 1 for apply, apply == 0 for unapply *
  * apply == 1 d == 0 Sr defined:   v <- v * Sr
  * apply == 1 d == 0 Sr implicit:  v <- v * Sc
@@ -408,7 +494,6 @@ static void mmt_vec_apply_or_unapply_S_inner(matmul_top_data & mmt, int midx, mm
     /* input: fully consistent */
     /* output: fully consistent */
     int const d = y.d;
-    arith_generic * A = y.abase;
 
     y.pi.m.serialize_threads(__FILE__, __LINE__);
 
@@ -422,7 +507,7 @@ static void mmt_vec_apply_or_unapply_S_inner(matmul_top_data & mmt, int midx, mm
      *  i in [y.i0..y.i1[
      *  j in [yt->i0..yt->i1[
      */
-    matmul_top_matrix const & Mloc = mmt.matrices[midx];
+    matmul_top_matrix & Mloc = mmt.matrices[midx];
 
     /* For square matrices, we'll use the other permutation transparently
      * with this piece of code. Note though that when we do so, applying
@@ -438,6 +523,9 @@ static void mmt_vec_apply_or_unapply_S_inner(matmul_top_data & mmt, int midx, mm
 
     auto const & s(Mloc.perm[xd]);
 
+    std::unique_ptr<mmt_vec> foreign;
+    mmt_vec & yt = mmt_scratch(mmt, y, foreign);
+
     if ((apply^d^xd) == 0) {
         /*
          * apply == 0 d == 0 Sr defined:   v <- v * Sr^-1
@@ -445,22 +533,10 @@ static void mmt_vec_apply_or_unapply_S_inner(matmul_top_data & mmt, int midx, mm
          * apply == 1 d == 0 Sr implicit:  v <- v * Sc
          * apply == 1 d == 1 Sc implicit:  v <- v * Sr
          */
-        mmt_vec yt(mmt, A, y.pitype, !d, 0, y.n);
-
         mmt_apply_identity(yt, y);
         mmt_vec_allreduce(yt);
         mmt_full_vec_set_zero(y);
-        y.pi.m.serialize_threads(__FILE__, __LINE__);
-        for(auto const & uv : s) {
-            if (uv[d^xd] < y.i0 || uv[d^xd] >= y.i1)
-                continue;
-            if (uv[d^xd^1] < yt.i0 || uv[d^xd^1] >= yt.i1)
-                continue;
-            A->set( A->vec_item( y.v, uv[d^xd]  - y.i0),
-                    A->vec_item(yt.v, uv[d^xd^1] - yt.i0));
-        }
-        y.consistency = 1;
-        y.pi.m.serialize_threads(__FILE__, __LINE__);
+        mmt_vec_permute_items(Mloc.perm_index[xd][d], y, d^xd, yt, s);
         mmt_vec_allreduce(y);
     } else {
         /*
@@ -469,16 +545,7 @@ static void mmt_vec_apply_or_unapply_S_inner(matmul_top_data & mmt, int midx, mm
          * apply == 0 d == 0 Sr implicit:  v <- v * Sc^-1
          * apply == 0 d == 1 Sc implicit:  v <- v * Sr^-1
          */
-        mmt_vec yt(mmt, A, y.pitype, !d, 0, y.n);
-        for(auto const & uv : s) {
-            if (uv[d^xd] < y.i0 || uv[d^xd] >= y.i1)
-                continue;
-            if (uv[d^xd^1] < yt.i0 || uv[d^xd^1] >= yt.i1)
-                continue;
-            A->set( A->vec_item(yt.v, uv[d^xd^1] - yt.i0),
-                    A->vec_item( y.v, uv[d^xd] -  y.i0));
-        }
-        yt.consistency = 1;
+        mmt_vec_permute_items(Mloc.perm_index[xd][!d], yt, d^xd^1, y, s);
         mmt_vec_allreduce(yt);
         mmt_apply_identity(y, yt);
         mmt_vec_allreduce(y);
@@ -546,6 +613,37 @@ void mmt_vec_untwist(matmul_top_data & mmt, mmt_vec & y)
     mmt_vec_apply_S(mmt, y.d == 0 ? 0 : (mmt.matrices.size()-1), y);
 }
 
+/* The untwist as one permutation of the items of a vector shaped like
+ * `like`, in the order of mmt_vec_gather: untwisted item j is twisted
+ * item perm[j]. It comes from untwisting a vector whose item i holds
+ * the index i in its first word, which needs items of 64 bits or more
+ * and the characteristic 2 (the allreduces then do not touch the
+ * indices). The permutation is at the leader; empty elsewhere. */
+std::vector<uint32_t> mmt_untwist_perm(matmul_top_data & mmt, mmt_vec const & like)
+{
+    ASSERT_ALWAYS(like.abase->is_characteristic_two());
+    mmt_vec v(mmt, like.abase, like.pitype, like.d, 0, like.n);
+    mmt_full_vec_set_zero(v);
+    arith_generic::elt * own = mmt_my_own_subvec(v);
+    uint64_t const own0 = v.i0 + mmt_my_own_offset_in_items(v);
+    for(size_t k = 0 ; k < mmt_my_own_size_in_items(v) ; k++)
+        *(uint64_t *) &v.abase->vec_item(own, k) = own0 + k;
+    v.consistency = 1;
+    mmt_vec_allreduce(v);
+    std::vector<bwc_file> const before = mmt_vec_gather(v, "{}-{}", v.n, 0);
+    mmt_vec_untwist(mmt, v);
+    std::vector<bwc_file> const after = mmt_vec_gather(v, "{}-{}", v.n, 0);
+    std::vector<uint32_t> perm;
+    if (v.pi.m.trank || v.pi.m.jrank)
+        return perm;
+    auto const * q = (const uint64_t *) before[0].data.data();
+    auto const * p = (const uint64_t *) after[0].data.data();
+    for(size_t j = 0 ; j < v.n ; j++)
+        ASSERT_ALWAYS(q[j] == j);
+    perm.assign(p, p + v.n);
+    return perm;
+}
+
 /* {{{ mmt_vec_{un,}appy_T -- this applies the fixed column
  * permutation which we use unconditionally in bwc to avoid correlation
  * of row and column weights.
@@ -566,8 +664,11 @@ static void mmt_vec_apply_or_unapply_T_inner(matmul_top_data & mmt, mmt_vec & y,
 
     matmul_top_matrix  const& Mloc = mmt.matrices[mmt.matrices.size() - 1];
     ASSERT_ALWAYS(y.consistency == 2);
+    std::unique_ptr<mmt_vec> foreign;
+    mmt_vec & yt = mmt_scratch(mmt, y, foreign);
+    mmt_vec_dev_fetch(y);
+    mmt_vec_dev_fetch(yt);
     y.pi.m.serialize_threads(__FILE__, __LINE__);
-    mmt_vec yt(mmt, y.abase, y.pitype, !y.d, 0, y.n);
     for(unsigned int i = y.i0 ; i < y.i1 ; i++) {
         unsigned int j;
         if (apply) {
@@ -581,6 +682,7 @@ static void mmt_vec_apply_or_unapply_T_inner(matmul_top_data & mmt, mmt_vec & y,
                     y.abase->vec_item(y.v, i - y.i0));
         }
     }
+    mmt_vec_dev_invalidate(yt);
     yt.consistency = 0;
     mmt_vec_allreduce(yt);
     mmt_apply_identity(y, yt);
@@ -802,16 +904,17 @@ void mmt_vec_truncate_above_index(matmul_top_data & mmt MAYBE_UNUSED, mmt_vec & 
 {
     idx = std::max(idx, v.i0);
     if (v.i0 <= idx && idx < v.i1) {
+        arith_generic::elt * z = v.abase->vec_subvec(v.v, idx - v.i0);
+        size_t const bytes = v.abase->vec_elt_stride(v.i1 - idx);
         if (v.siblings) {
-            v.abase->vec_set_zero(
-                    v.abase->vec_subvec(v.v, idx - v.i0),
-                    v.i1 - idx);
+            v.abase->vec_set_zero(z, v.i1 - idx);
+            bwc_dev_push(z, bytes);
         } else {
             v.pi.wr[v.d].serialize_threads(__FILE__, __LINE__);
-            if (v.pi.wr[v.d].trank == 0)
-                v.abase->vec_set_zero(
-                        v.abase->vec_subvec(v.v, idx - v.i0),
-                        v.i1 - idx);
+            if (v.pi.wr[v.d].trank == 0) {
+                v.abase->vec_set_zero(z, v.i1 - idx);
+                bwc_dev_push(z, bytes);
+            }
             v.pi.wr[v.d].serialize_threads(__FILE__, __LINE__);
         }
     }
@@ -821,12 +924,16 @@ void mmt_vec_truncate_below_index(matmul_top_data & mmt MAYBE_UNUSED, mmt_vec & 
 {
     idx = std::min(idx, v.i1);
     if (v.i0 <= idx && idx < v.i1) {
+        size_t const bytes = v.abase->vec_elt_stride(idx - v.i0);
         if (v.siblings) {
             v.abase->vec_set_zero(v.v, idx - v.i0);
+            bwc_dev_push(v.v, bytes);
         } else {
             v.pi.wr[v.d].serialize_threads(__FILE__, __LINE__);
-            if (v.pi.wr[v.d].trank == 0)
+            if (v.pi.wr[v.d].trank == 0) {
                 v.abase->vec_set_zero(v.v, idx - v.i0);
+                bwc_dev_push(v.v, bytes);
+            }
             v.pi.wr[v.d].serialize_threads(__FILE__, __LINE__);
         }
     }
@@ -1030,13 +1137,13 @@ static void matmul_top_init_prepare_local_permutations(matmul_top_data & mmt, in
             ASSERT_ALWAYS(rowperm_items == Mloc.bal.trows);
             if (mmt.pi.m.jrank != 0)
                 bal_tmp.rowperm = (uint32_t *) malloc(Mloc.bal.trows * sizeof(uint32_t));
-            MPI_Bcast(bal_tmp.rowperm, Mloc.bal.trows * sizeof(uint32_t), MPI_BYTE, 0, mmt.pi.m.pals);
+            MPI_Bcast(bal_tmp.rowperm, Mloc.bal.trows, CADO_MPI_UINT32_T, 0, mmt.pi.m.pals);
         }
         if (colperm_items) {
             ASSERT_ALWAYS(colperm_items == Mloc.bal.tcols);
             if (mmt.pi.m.jrank != 0)
                 bal_tmp.colperm = (uint32_t *) malloc(Mloc.bal.tcols * sizeof(uint32_t));
-            MPI_Bcast(bal_tmp.colperm, Mloc.bal.tcols * sizeof(uint32_t), MPI_BYTE, 0, mmt.pi.m.pals);
+            MPI_Bcast(bal_tmp.colperm, Mloc.bal.tcols, CADO_MPI_UINT32_T, 0, mmt.pi.m.pals);
         }
     }
     mmt.pi.m.serialize_threads(__FILE__, __LINE__);      /* important ! */
@@ -1101,6 +1208,7 @@ matmul_top_data::matmul_top_data(
     matmul_top_data & mmt = *this;
 
     pl.parse("mm_bucket_heatmap", mmt.heatmap_file);
+    matmul_top_comm_plugin_init(pl);
 
     int const nbals = pl.get_list_count("balancing");
     int multimat = 0;

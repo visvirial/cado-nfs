@@ -48,7 +48,7 @@ char const * path_basename(char const * path)
 int is_supported_compression_format(char const * s)
 {
     for (auto const & r: cado::details::supported_compression_formats) {
-        if (r.suffix == s)
+        if (strcmp(r.suffix, s) == 0)
             return 1;
     }
     return 0;

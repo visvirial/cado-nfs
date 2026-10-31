@@ -20,6 +20,8 @@ int main(int argc, char const * argv[])
 
     hwloc_topology_t top;
     hwloc_topology_init(&top);
+    /* see hwloc_aux_topology_load in utils/hwloc-aux.cpp */
+    setenv("HWLOC_COMPONENTS", "-x86", 0);
     hwloc_topology_load(top);
     int const depth = hwloc_topology_get_depth(top);
 

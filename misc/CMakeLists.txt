@@ -2,6 +2,10 @@ add_executable(check_rels check_rels.cpp)
 target_link_libraries(check_rels PRIVATE utils_with_io)
 install(TARGETS check_rels RUNTIME DESTINATION ${LIBSUFFIX}/misc)
 
+add_executable(check_matrix check_matrix.cpp)
+target_link_libraries(check_matrix PRIVATE utils)
+install(TARGETS check_matrix RUNTIME DESTINATION ${LIBSUFFIX}/misc)
+
 if (HAVE_GMPECM)
 add_executable(descent_init_Fp descent_init_Fp.cpp smooth_detect.cpp)
 target_link_libraries(descent_init_Fp PRIVATE utils ecm)

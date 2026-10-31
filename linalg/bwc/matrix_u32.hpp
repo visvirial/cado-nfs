@@ -69,6 +69,15 @@ struct matrix_u32 {
 
     /* A few interfaces are allowed to call the default ctor */
     friend struct random_matrix_ddata;
+    friend matrix_u32 random_matrix_get_u32(
+            parallelizing_info & pi,
+            cxx_param_list & pl,
+            unsigned long data_nrows,
+            unsigned long data_ncols,
+            unsigned long padded_nrows,
+            unsigned long padded_ncols,
+            bool withcoeffs,
+            bool transpose);
     friend matrix_u32 balancing_get_matrix_u32(
             parallelizing_info & pi,
             cxx_param_list & pl,

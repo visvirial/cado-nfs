@@ -1058,6 +1058,18 @@ class Las(Program):
                  qfac_max: Parameter(dash=True, checktype=int) = None,
                  adjust_strategy: Parameter(dash=True, checktype=int) = None,
                  stats_stderr: Toggle(dash=True) = None,
+                 # Band count of the fill kernel of the GPU siever
+                 # (glas); the stock las ignores the option.
+                 fill_bands: Parameter(dash=True, checktype=int) = None,
+                 # The GPU siever runs the deferred leftover primality
+                 # tests on the host; the stock las ignores the option.
+                 host_mr: Parameter(dash=True, checktype=int) = None,
+                 # The GPU siever runs all cofactorization on the
+                 # device (1) or in its adaptive host/device mode (0),
+                 # with ecm_curves curves per composite; the stock las
+                 # ignores both options.
+                 cofac_gpu: Parameter(dash=True, checktype=int) = None,
+                 ecm_curves: Parameter(dash=True, checktype=int) = None,
                  # We have no checktype for parameters of the form <int>,<int>,
                  # so these are passed just as strings
                  traceab: Parameter() = None,
@@ -1217,8 +1229,11 @@ class Purge(Program):
                  subdirlist: Parameter() = None,
                  outdel: Parameter(is_output_file=True) = None,
                  keep: Parameter(checktype=int) = None,
+                 col_min_index: Parameter(dash=True, checktype=int) = None,
+                 nprimes: Parameter("col-max-index",  # noqa: F821
+                                    checktype=int) = None,
                  threads: Parameter("t", checktype=int) = None,  # noqa: F821
-                 npass: Parameter(checktype=int) = None,
+                 nsteps: Parameter(checktype=int) = None,
                  force_posix_threads: Toggle(dash=True) = None,
                  required_excess: Parameter(checktype=float) = None,
                  **kwargs):
@@ -1233,9 +1248,12 @@ class Merge(Program):
     def __init__(self,
                  purged: Parameter("mat", is_input_file=True),  # noqa: F821
                  out: Parameter(is_output_file=True),
+                 matrix: Parameter(is_output_file=True) = None,
+                 index: Parameter(is_output_file=True) = None,
                  skip: Parameter(checktype=int) = None,
                  target_density: Parameter(checktype=float) = None,
                  target_excess: Parameter(checktype=int) = None,
+                 incr: Parameter(checktype=int) = None,
                  threads: Parameter("t", checktype=int) = None,  # noqa: F821
                  force_posix_threads: Toggle(dash=True) = None,
                  **kwargs):
@@ -1250,9 +1268,13 @@ class MergeDLP(Program):
     def __init__(self,
                  purged: Parameter("mat", is_input_file=True),  # noqa: F821
                  out: Parameter(is_output_file=True),
+                 matrix: Parameter(is_output_file=True) = None,
+                 index: Parameter(is_output_file=True) = None,
+                 ideals: Parameter(is_output_file=True) = None,
                  skip: Parameter(checktype=int) = None,
                  target_density: Parameter(checktype=float) = None,
                  target_excess: Parameter(checktype=int) = None,
+                 incr: Parameter(checktype=int) = None,
                  threads: Parameter("t", checktype=int) = None,  # noqa: F821
                  **kwargs):
         super().__init__(locals(), **kwargs)
@@ -1271,6 +1293,7 @@ class Replay(Program):
                  out: Parameter() = None,
                  for_msieve: Toggle() = None,
                  skip: Parameter(checktype=int) = None,
+                 threads: Parameter("t", checktype=int) = None,  # noqa: F821
                  force_posix_threads: Toggle(dash=True) = None,
                  bwcostmin: Parameter(checktype=int) = None,
                  **kwargs):
@@ -1289,6 +1312,7 @@ class ReplayDLP(Program):
                  index: Parameter() = None,
                  out: Parameter() = None,
                  skip: Parameter() = None,
+                 threads: Parameter("t", checktype=int) = None,  # noqa: F821
                  nmatrices: Parameter("nsquare_matrices",  # noqa: F821
                                       checktype=int) = None,
                  **kwargs):
@@ -1352,8 +1376,12 @@ class BWC(Program):
                  hosts: ParameterEq() = None,
                  hostfile: ParameterEq() = None,
                  interleaving: ParameterEq() = None,
+                 krylov_jobs: ParameterEq() = None,
+                 mksol_jobs: ParameterEq() = None,
+                 gather_jobs: ParameterEq() = None,
                  bwc_bindir: ParameterEq() = None,
                  mm_impl: ParameterEq() = None,
+                 lingen_ft_impl: ParameterEq() = None,
                  cpubinding: ParameterEq(is_input_file=True) = None,
                  # lingen_threshold: ParameterEq() = None,
                  precmd: ParameterEq() = None,

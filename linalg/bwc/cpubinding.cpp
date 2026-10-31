@@ -22,6 +22,8 @@
 #include <hwloc.h>
 #include <hwloc/bitmap.h>
 
+#include "hwloc-aux.hpp"
+
 #include "cpubinding.hpp"
 #include "params.hpp"
 #include "macros.h"
@@ -901,7 +903,7 @@ void cpubinder::read_param_list(cxx_param_list & pl, int want_conf_file)
     } else {
         fake = false;
     }
-    hwloc_topology_load(topology);
+    hwloc_aux_topology_load(topology);
     /* }}} */
 }
 

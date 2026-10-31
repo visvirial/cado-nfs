@@ -1682,8 +1682,8 @@ void parallelizing_info::hello()
 /*{{{ new i/o layer */
 /* Open a file handle on the leader node. The two pi_comm's
  * represent the inner and outer levels; they're mostly unused for this
- * function call, but requested for consistency with the pi_file_handle::read and
- * pi_file_handle::write calls.
+ * function call, but requested for consistency with the pi_file_handle::read
+ * calls.
  *
  * Return a globally consistent boolean indicating whether the operation
  * was successful (1) or not (0). In the latter case, set errno
@@ -1763,34 +1763,72 @@ static ssize_t pi_file_handle::read_leader(void * buf, size_t size)
 }
 */
 
-/* size is the chunk size on each core */
-size_t pi_file_handle::write(void * buf, size_t size, size_t totalsize)
+/* MPI counts are int. A message of more than INT_MAX bytes goes as a
+ * sequence of pieces of at most mpi_piece_max bytes, all with the same
+ * tag: MPI keeps the order of the messages of one sender to one
+ * receiver on one communicator, so the receiver posts the same
+ * sequence. */
+static constexpr size_t mpi_piece_max = size_t(1) << 30;
+
+template<typename F>
+static void mpi_for_each_piece(size_t size, F const & piece)
 {
-    return write_chunk(buf, size, totalsize, 1, 0, 1);
+    for(size_t done = 0 ; done < size ; ) {
+        size_t const n = MIN(size - done, mpi_piece_max);
+        piece(done, (int) n);
+        done += n;
+    }
 }
 
-/* Here, we write a fragment of a "virtual" file (of size totalsize) that
- * is made of several independent files. Think of entries in that virtual
- * file as being [chunksize] bytes long, and then we write specifically
- * bytes spos to epos of each of these chunks.
- *
- * Return a globally consistent count of written items. A full read is when
- * exactly (totalsize / chunksize) * (epos - spos) items are written.  When
- * a short read occurs, set errno (globally) to the value returned by the
- * fwrite function at the leader node.
- */
-size_t pi_file_handle::write_chunk(void * buf, size_t size, size_t sizeondisk, size_t chunksize, size_t spos, size_t epos)
+static void mpi_send_bytes(const void * buf, size_t size, int dest, int tag, MPI_Comm comm)
 {
+    const char * p = (const char *) buf;
+    mpi_for_each_piece(size, [&](size_t off, int n) {
+        MPI_Send(p + off, n, MPI_BYTE, dest, tag, comm);
+    });
+}
+
+static void mpi_recv_bytes(void * buf, size_t size, int src, int tag, MPI_Comm comm)
+{
+    char * p = (char *) buf;
+    mpi_for_each_piece(size, [&](size_t off, int n) {
+        MPI_Recv(p + off, n, MPI_BYTE, src, tag, comm, MPI_STATUS_IGNORE);
+    });
+}
+
+static void mpi_irecv_bytes(void * buf, size_t size, int src, int tag, MPI_Comm comm, std::vector<MPI_Request> & reqs)
+{
+    char * p = (char *) buf;
+    mpi_for_each_piece(size, [&](size_t off, int n) {
+        reqs.emplace_back();
+        MPI_Irecv(p + off, n, MPI_BYTE, src, tag, comm, &reqs.back());
+    });
+}
+
+/* Here, we gather at the leader a fragment of a "virtual" file (of size
+ * totalsize) that is made of several independent files. Think of entries
+ * in that virtual file as being [chunksize] bytes long, and then we take
+ * specifically bytes spos to epos of each of these chunks. The leader
+ * gets the (totalsize / chunksize) * (epos - spos) bytes of the file,
+ * the other threads and nodes get an empty vector.
+ *
+ * The file is the concatenation, over (outer job, outer thread, inner
+ * job), of the pieces of the inner threads. pi_gather_stage has every
+ * thread copy its piece into a buffer of the job (thread 0 owns it);
+ * pi_gather_exchange, on thread 0 only, does one send per outer thread
+ * to the leader. The exchange touches nothing but the staged buffer and
+ * comm, so it may run in another thread of the job.
+ */
+std::vector<char> pi_gather_stage(parallelizing_info & pi, int inner, void * buf, size_t size, size_t chunksize, size_t spos, size_t epos)
+{
+    int const outer = !inner;
     // coverity[result_independent_of_operands]
     ASSERT_ALWAYS(size <= ULONG_MAX);
     ASSERT_ALWAYS(spos <= chunksize);
     ASSERT_ALWAYS(spos <= epos);
     ASSERT_ALWAYS(epos <= chunksize);
-    ASSERT_ALWAYS(sizeondisk % chunksize == 0);
     ASSERT_ALWAYS(size % chunksize == 0);
-    size_t const loc_sizeondisk = (sizeondisk / chunksize) * (epos - spos);
     size_t const loc_size = (size / chunksize) * (epos - spos);
-    size_t const chunk_per_rank = size / chunksize;
 
     /* Some sanity checking. This is not technically required: of
      * course we would be able to cope with uneven data sets.
@@ -1801,83 +1839,67 @@ size_t pi_file_handle::write_chunk(void * buf, size_t size, size_t sizeondisk, s
 
     unsigned int const nci = pi.wr[inner].ncores;
     unsigned int const nco = pi.wr[outer].ncores;
-    unsigned int const nji = pi.wr[inner].njobs;
-    unsigned int const njo = pi.wr[outer].njobs;
     unsigned int const ci  = pi.wr[inner].trank;
     unsigned int const co  = pi.wr[outer].trank;
-    unsigned int const ji  = pi.wr[inner].jrank;
-    unsigned int const jo  = pi.wr[outer].jrank;
-    unsigned int const jm  = pi.m.jrank;
 
-    /* the inner threads will do writes and MPI sends in one go. For
-     * outer threads, it is not possible to concatenate similarly,
-     * because we have writes relative to the mpi-level interleaved.
-     */
-    void * sbuf = pi.m.shared_malloc_set_zero(loc_size * nci);
+    size_t const piece = loc_size * nci;
+    std::vector<char> staged(pi.m.trank ? 0 : piece * nco);
+    char * sbuf = staged.data();
+    pi.m.thread_bcast(&sbuf, sizeof(char *), BWC_PI_BYTE, 0);
+    /* the piece is the [spos, epos) window of every chunk: a strided
+     * copy, by words since the strides are word multiples */
+    ASSERT_ALWAYS(chunksize % sizeof(uint64_t) == 0);
+    ASSERT_ALWAYS((epos - spos) % sizeof(uint64_t) == 0);
+    auto * wptr = (uint64_t *) (sbuf + co * piece + ci * loc_size);
+    auto const * rptr = (const uint64_t *) ((const char *) buf + spos);
+    size_t const step = (epos - spos) / sizeof(uint64_t);
+    size_t const stride = chunksize / sizeof(uint64_t);
+    for(size_t i = 0 ; i < loc_size / sizeof(uint64_t) ; i += step) {
+        for(size_t k = 0 ; k < step ; k++)
+            wptr[i + k] = rptr[k];
+        rptr += stride;
+    }
+    pi.m.serialize_threads(__FILE__, __LINE__);
+    return staged;
+}
 
-    size_t res = 0;
-    int failed = 0;
-
-    for(unsigned int xjo = 0 ; xjo < njo ; xjo++) {
-        for(unsigned int xco = 0 ; xco < nco ; xco++) {
+std::vector<char> pi_gather_exchange(parallelizing_info & pi, int inner, MPI_Comm comm, std::vector<char> const & staged, size_t outsize)
+{
+    int const outer = !inner;
+    ASSERT_ALWAYS(pi.m.trank == 0);
+    unsigned int const nco = pi.wr[outer].ncores;
+    unsigned int const nji = pi.wr[inner].njobs;
+    unsigned int const njo = pi.wr[outer].njobs;
+    size_t const piece = staged.size() / nco;
+    std::vector<char> data(pi.m.jrank ? 0 : piece * nco * nji * njo);
+    std::vector<MPI_Request> reqs;
+    reqs.reserve(nco * njo * nji);
+    for(unsigned int xco = 0 ; xco < nco ; xco++) {
+        const char * const src = staged.data() + xco * piece;
+        if (pi.m.jrank) {
+            mpi_send_bytes(src, piece, 0, xco, comm);
+            continue;
+        }
+        for(unsigned int xjo = 0 ; xjo < njo ; xjo++) {
             for(unsigned int xji = 0 ; xji < nji ; xji++) {
-                unsigned int const xj = mrank_from_tworanks(pi, inner, xji, xjo);
-                if (jm == xj) {
-                    ASSERT_ALWAYS (ji == xji && jo == xjo);
-                    /* fill the buffer with the contents relevant to the
-                     * inner communicator (nci threads at work here) */
-                    pi.m.serialize_threads(__FILE__, __LINE__);
-                    if (xco == co) {
-                        void * wptr = pointer_arith(sbuf, ci * loc_size);
-                        const void * rptr = pointer_arith_const(buf, spos);
-                        if (epos - spos == chunksize) {
-                            memcpy(wptr, rptr, loc_size);
-                        } else {
-                            for(size_t i = 0 ; i < chunk_per_rank ; ++i) {
-                                memcpy(wptr, rptr, epos - spos);
-                                wptr = pointer_arith(wptr, epos - spos);
-                                rptr = pointer_arith_const(rptr, chunksize);
-                            }
-                        }
-                    }
-                    pi.m.serialize_threads(__FILE__, __LINE__);
+                int const xj = mrank_from_tworanks(pi, inner, xji, xjo);
+                char * const dst = data.data()
+                    + ((xjo * nco + xco) * nji + xji) * piece;
+                if (!xj) {
+                    memcpy(dst, src, piece);
+                    continue;
                 }
-                if (pi.m.trank == 0) {
-                    /* only one thread per node does something. */
-                    if (!jm) {
-                        /* leader node to receive data */
-                        if (xj) {       /* except its own... */
-                            MPI_Recv(sbuf, loc_size * nci, MPI_BYTE,
-                                    xj, xj, pi.m.pals,
-                                    MPI_STATUS_IGNORE);
-                        }
-                        if (!failed) {
-                            size_t const wanna_write = MIN(nci * loc_size, loc_sizeondisk - res);
-                            if (wanna_write < nci * loc_size)
-                                ASSERT_ALWAYS(area_is_zero(sbuf, wanna_write, nci * loc_size));
-                            /* POSIX fwrite is required to set errno
-                             * http://pubs.opengroup.org/onlinepubs/9699919799/functions/fwrite.html
-                             */
-                            errno = 0;
-                            size_t const x = fwrite(sbuf, 1, wanna_write, f);
-                            res += x;
-                            if (x < wanna_write)
-                                failed = errno ? errno : EIO;
-                        }
-                    } else if (jm == xj) {
-                        /* my turn to send data */
-                        MPI_Send(sbuf, loc_size * nci, MPI_BYTE,
-                                0, xj, pi.m.pals);
-                    }
-                }
+                mpi_irecv_bytes(dst, piece, xj, xco, comm, reqs);
             }
         }
     }
-    pi.m.shared_free(sbuf);
-    pi.m.bcast(&res, 1, BWC_PI_SIZE_T, 0, 0);
-    pi.m.bcast(&failed, 1, BWC_PI_INT, 0, 0);
-    if (failed) errno = failed;
-    return res;
+    MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
+    if (pi.m.jrank)
+        return data;
+    ASSERT_ALWAYS(outsize <= data.size());
+    ASSERT_ALWAYS(area_is_zero(data.data(), outsize, data.size()));
+    data.resize(outsize);
+    return data;
 }
 
 size_t pi_file_handle::read(void * buf, size_t size, size_t sizeondisk)
@@ -1950,14 +1972,13 @@ size_t pi_file_handle::read_chunk(void * buf, size_t size, size_t sizeondisk, si
                                 failed = errno ? errno : EIO;
                         }
                         if (xj) {       /* except to itself... */
-                            MPI_Send(sbuf, loc_size * nci, MPI_BYTE,
+                            mpi_send_bytes(sbuf, loc_size * nci,
                                     xj, xj, pi.m.pals);
                         }
                     } else if (jm == xj) {
                         /* my turn to receive data */
-                        MPI_Recv(sbuf, loc_size * nci, MPI_BYTE,
-                                0, xj, pi.m.pals,
-                                MPI_STATUS_IGNORE);
+                        mpi_recv_bytes(sbuf, loc_size * nci,
+                                0, xj, pi.m.pals);
                     }
                 }
                 if (jm == xj) {

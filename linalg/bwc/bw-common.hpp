@@ -165,7 +165,14 @@ void bw_common_decl_usage(cxx_param_list &);
 void bw_common_parse_cmdline(struct bw_params * bw, cxx_param_list & pl, int * p_argc, char const *** p_argv);
 void bw_common_interpret_parameters(struct bw_params * bw, cxx_param_list & pl);
 int bw_common_init(struct bw_params * bw, int * p_argc, char const *** p_argv);
+/* krylov and mksol ask for MPI_THREAD_MULTIPLE: their writer thread
+ * gathers the checkpoint over MPI while the main thread iterates */
+int bw_common_init(struct bw_params * bw, int * p_argc, char const *** p_argv, int mpi_thread_level);
 int bw_common_clear(struct bw_params * bw);
+
+/* true when MPI serves several threads at a time, so that a background
+ * thread may make MPI calls while the main thread iterates */
+bool bw_common_threaded_mpi();
 
 
 /* utility function. */

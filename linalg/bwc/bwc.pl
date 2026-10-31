@@ -54,6 +54,19 @@ simd                 SIMD width to be used for krylov (ys=) and mksol,
                      prime=2 or 1 otherwise
 lingen_mpi           like mpi, but for lingen only
 lingen_thr           like thr, but for lingen only
+lingen_ft_impl       plugin for the lingen products of Cantor-transformed matrices
+krylov_prog          program that runs the krylov task: krylov (default)
+                     or gkrylov (script only)
+mksol_prog           program that runs the mksol task: mksol (default)
+                     or gmksol (script only)
+lingen_prog          program that runs the lingen task for p=2: lingen_b64
+                     (default) or glingen (script only)
+krylov_jobs          number of krylov sequences to run at the same time
+                     (script only). The hosts list divides into that
+                     many equal groups, and each concurrent sequence
+                     runs on its own group. Defaults to 1.
+mksol_jobs           like krylov_jobs, but for the mksol solution ranges.
+gather_jobs          like krylov_jobs, but for the gather solution ranges.
 
 matrix               input matrix file. Must be a complete path. Binary, 32-b LE
 rhs                  rhs file for inhomogeneous systems (ascii with header)
@@ -228,6 +241,9 @@ my $stop_at_step;
 
 my $hostfile;
 my @hosts=();
+my %task_jobs = (krylov => 1, mksol => 1, gather => 1);
+my %task_prog = (krylov => 'krylov', mksol => 'mksol', lingen => 'lingen_b64');
+my %group_hostfiles;
 my @mpi_path=();
 my $mpi_ver;
 my $needs_mpd;
@@ -287,6 +303,24 @@ while (my ($k,$v) = each %$param) {
     # Some parameters which are simply _not_ relevant to the bwc programs.
     if ($k eq 'hostfile') { $hostfile=$v; next; }
     if ($k eq 'simd') { $simd=$v; next; }
+    if ($k =~ /^(krylov|mksol|gather)_jobs$/) {
+        my $t = $1;
+        usage "$k must be a whole number of at least 1"
+            unless $v =~ /^\d+$/ && $v >= 1;
+        $task_jobs{$t}=$v;
+        next;
+    }
+    if ($k =~ /^(krylov|mksol)_prog$/) {
+        my $t = $1;
+        usage "$k must be $t or g$t" unless $v =~ /^g?$t$/;
+        $task_prog{$t}=$v;
+        next;
+    }
+    if ($k eq 'lingen_prog') {
+        usage "$k must be lingen_b64 or glingen" unless $v =~ /^(lingen_b64|glingen)$/;
+        $task_prog{'lingen'}=$v;
+        next;
+    }
     if ($k eq 'mpi_extra_args') { $mpi_extra_args=$v; next; }
     ## if ($k eq 'force_complete') { $force_complete=$v; next; }
     if ($k eq 'stop_at_step') {
@@ -966,6 +1000,9 @@ if ($mpi_needed) {
 
     # quirk. If called with srun, then we want to avoid mpiexec anyway.
     if ($main =~ /^:srun/) {
+        for my $t (sort keys %task_jobs) {
+            usage "${t}_jobs is not supported with :srun" if $task_jobs{$t} > 1;
+        }
         push @mpi_precmd, 'srun', '--cpu-bind=verbose,none', '-u';
 	if ($mpi_ver =~ /^openmpi/) {
             # srun might like that we give it the hint that we're running
@@ -1012,6 +1049,27 @@ if ($mpi_needed) {
             push @tempfiles, $fh;
             for my $h (@hosts) { print $fh "$h\n"; }
             close $fh;
+        }
+
+        for my $t (sort keys %task_jobs) {
+            my $jobs = $task_jobs{$t};
+            next if $jobs == 1;
+            usage "${t}_jobs=$jobs needs the hosts parameter"
+                if defined($hostfile) && !scalar @hosts;
+            next unless scalar @hosts;
+            usage "the hosts count must be a multiple of ${t}_jobs"
+                if scalar(@hosts) % $jobs;
+            next if $group_hostfiles{$jobs};
+            my $g = scalar(@hosts) / $jobs;
+            my @files;
+            for my $i (0..$jobs-1) {
+                my $fh = File::Temp->new(TEMPLATE=>$auto_hostfile_pattern);
+                push @tempfiles, $fh;
+                print $fh "$_\n" for @hosts[$i*$g..($i+1)*$g-1];
+                close $fh;
+                push @files, $fh->filename;
+            }
+            $group_hostfiles{$jobs} = \@files;
         }
 
         if (defined($hostfile)) {
@@ -1357,14 +1415,12 @@ sub get_nrows_ncols {
     if (defined($random_matrix)) {
         my $nrows;
         my $ncols;
-        my @tokens = split(',', $random_matrix);
-        if ($tokens[0] =~ /^(\d+)/) {
-            $nrows = $1;
-            $ncols = $1;
+        # same nrows=N[,ncols=M],... syntax as random_matrix_process_data
+        for my $t (split(',', $random_matrix)) {
+            if ($t =~ /^nrows=(\d+)$/) { $nrows = $1; }
+            if ($t =~ /^ncols=(\d+)$/) { $ncols = $1; }
         }
-        if ($tokens[1] =~ /^(\d+)/) {
-            $ncols = $1;
-        }
+        $ncols //= $nrows;
         die "parameter random_matrix does not give nrows and ncols ??" unless defined($nrows) && defined($ncols);
         $cache->{$key} = [ $nrows, $ncols ];
         return @{$cache->{$key}};
@@ -1457,8 +1513,9 @@ sub list_afiles {
         for my $k (keys %$f) {
             $k =~ /^(\d+)\.\.(\d+)$/ or die "Bad key $k returned by list_files_generic";
             # We can tolerate $2-$1 == $n, because we still have acollect
-            # around.
-            if ($2-$1 != $splitwidth && $2-$1 != $n) {
+            # around. krylov with simd > $splitwidth writes A files of
+            # width $simd; acollect concatenates them all the same.
+            if ($2-$1 != $splitwidth && $2-$1 != $simd && $2-$1 != $n) {
                 die "Problem with the width of A files: $1-$2 is not good";
             }
             my $length = $m * ($2-$1) * ($f->{$k}->[0]->[1] - $f->{$k}->[0]->[0]);
@@ -1567,18 +1624,20 @@ sub task_common_run {
     # peculiarities).
     # none of the mm_* and matmul_* parameters, which configure the
     # low-level matrix times vector code, mean anything here.
-    @_ = grep !/^(skip_bw_early_rank_check|rebuild_cache|cpubinding|balancing.*|interleaving|matrix|mm_.*|matmul_.*|mpi|thr)?=/, @_ if $program =~ /(lingen|acollect$)/;
+    @_ = grep !/^(skip_bw_early_rank_check|rebuild_cache|cpubinding|balancing.*|interleaving|matrix|mm_.*|matmul_.*|comm_impl|mpi|thr)?=/, @_ if $program =~ /(lingen|acollect$)/;
     if ($program =~ /lingen/) {
         @_ = map { s/^lingen_mpi\b/mpi/; $_; } @_;
         @_ = map { s/^lingen_thr\b/thr/; $_; } @_;
     } else {
         @_ = grep !/^lingen_mpi?=/, @_;
         @_ = grep !/^lingen_thr?=/, @_;
+        @_ = grep !/^lingen_ft_impl=/, @_;
     }
+    @_ = grep !/^glingen_threshold=/, @_ unless $program =~ /^glingen$/;
     # @_ = grep !/lingen_threshold/, @_ unless $program =~ /lingen/;
     # @_ = grep !/lingen_mpi_threshold/, @_ unless $program =~ /lingen/;
     @_ = grep !/allow_zero_on_rhs/, @_ unless $program =~ /^lingen/;
-    @_ = grep !/^save_submatrices?=/, @_ unless $program =~ /^(prep|krylov|mksol|gather)$/;
+    @_ = grep !/^save_submatrices?=/, @_ unless $program =~ /^(prep|g?krylov|g?mksol|gather)$/;
     # are we absolutely sure that lingen needs no matrix ?
     @_ = grep !/^ys=/, @_ unless $program =~ /(krylov|dispatch)$/;
     @_ = grep !/^solutions=/, @_ unless $program =~ /(?:mksol|gather)$/;
@@ -1608,9 +1667,9 @@ sub task_common_run {
     if ($mpi_needed) {
         if ($program =~ /\/lingen[^\/]*$/) {
             unshift @_, @mpi_precmd_lingen;
-        } elsif ($program =~ /\/(?:split|acollect|lingen|cleanup|bwccheck|det_from_lingen)$/) {
+        } elsif ($program =~ /\/(?:split|acollect|lingen|glingen|cleanup|bwccheck|det_from_lingen)$/) {
             unshift @_, @mpi_precmd_single;
-        } elsif ($program =~ /\/(?:prep|secure|krylov|mksol|gather|dispatch)$/) {
+        } elsif ($program =~ /\/(?:prep|secure|g?krylov|g?mksol|gather|dispatch)$/) {
             unshift @_, @mpi_precmd;
         } else {
             die "Don't know the parallel status of program $program ... ?";
@@ -1673,9 +1732,10 @@ sub subtask_krylov_todo {
         my @for_this_y =
             grep { $_ == 0 || &$morecheck($yrange, $_); } @{$vfiles->{$yrange}}
             or do { print " none\n"; next; };
-        $vstarts->{$yrange} = $for_this_y[$#for_this_y];
-        $vstarts->{$yrange} .= " (DONE!)" if $vstarts->{$yrange} >= $length;
-        print " last $current_task checkpoint is $vstarts->{$yrange}\n";
+        $vstarts->{$yrange} = \@for_this_y;
+        my $last = $for_this_y[$#for_this_y];
+        $last .= " (DONE!)" if $last >= $length;
+        print " last $current_task checkpoint is $last\n";
     }
 
     my @todo;
@@ -1718,36 +1778,36 @@ sub subtask_krylov_todo {
         # most ys are double ranges, except maybe the last one.
         my ($a, $b) = @{$ab};
         my $yrange = $a . ".." . $b;
-        my $start;
         # now all saved vectors are for width = $splitwidth ; given that
-        # we have one single start= argument, we need to make sure that
-        # all the sub-vectors have reached the same checkpoint.
-        my $discard;
-        for(my $x = $a; $x < $b ; $x += $splitwidth) {
-            my $r = $x."..".($x + $splitwidth);
+        # we have one single start= argument, we start from the newest
+        # checkpoint that all the sub-vectors have. A sub-vector may have
+        # a newer one: a job that saves the sub-vectors one after the
+        # other and stops between two saves leaves a partial checkpoint,
+        # which the restarted job writes again when it passes it.
+        my @subranges = map { $_."..".($_ + $splitwidth) } grep { ($_ - $a) % $splitwidth == 0 } $a..$b-1;
+        my %reached;
+        for my $r (@subranges) {
             my $s = $vstarts->{$r};
             if (!defined($s)) {
                 task_check_message 'warning',
                 "No starting vector for range $r"
                 . " (sub-range from $yrange)\n";
-                $discard = 1;
-            } elsif (!defined($start)) {
-                $start = $s;
-            } elsif ($s != $start) {
-                task_check_message 'warning',
-                "Inconsistent start vectors for the "
-                . " sub-ranges from $yrange"
-                . " (found both $start and $s)\n";
-                $discard = 1;
+                next;
             }
-        } 
-        undef $start if $discard;
+            $reached{$_}++ for @$s;
+        }
+        my $start = max grep { $reached{$_} == @subranges } keys %reached;
         if (!defined($start)) {
             print STDERR "## Can't schedule any work for $yrange, as *NO* checkpoint is here\n";
             push @impossible, $yrange;
             next;
         }
-        next if $start =~ /DONE/;
+        for my $r (grep { $vstarts->{$_} && $vstarts->{$_}->[-1] > $start } @subranges) {
+            task_check_message 'missing',
+            "$r has checkpoint $vstarts->{$r}->[-1] past $start, the newest that all the"
+            . " sub-ranges of $yrange have (a partial checkpoint, written again)";
+        }
+        next if $start >= $length;
         push @todo, "ys=$yrange start=$start";
     }
     if (!@todo && @impossible) {
@@ -1880,7 +1940,9 @@ sub subtask_secure {
 sub task_dispatch {
     task_begin_message;
     return if defined $random_matrix;
-    if (defined(get_cached_bfile)) {
+    # a dispatch that must check the cache against a sanity_check_vector
+    # runs even when the cache is already there.
+    if (defined(get_cached_bfile) && !defined($param->{'sanity_check_vector'})) {
         task_check_message 'ok', "All balancing files are present, good.\n";
         return;
     }
@@ -1950,7 +2012,55 @@ sub task_safety_check_krylov {
 }
 
 
+# {{{ parallel runs on host groups (krylov_jobs, mksol_jobs, gather_jobs)
+sub use_host_group {
+    my ($jobs, $i) = @_;
+    my $files = $group_hostfiles{$jobs} or return;
+    my $group = $files->[$i];
+    if ($mpi_ver =~ /^\+hydra/) {
+        my_setenv 'HYDRA_HOST_FILE', $group;
+        return;
+    }
+    for my $j (0..$#mpi_precmd) {
+        next unless $mpi_precmd[$j] eq '-machinefile';
+        $mpi_precmd[$j+1] = $group;
+        return;
+    }
+    die "found no -machinefile option to replace for host groups";
+}
+
+# Run one $program invocation per entry of @runs, $jobs at a time. Each
+# run of a concurrent batch takes one host group.
+sub task_parallel_run {
+    my ($program, $jobs, @runs) = @_;
+    while (my @batch = splice @runs, 0, $jobs) {
+        if (@batch == 1) {
+            task_common_run $program, @{$batch[0]};
+            next;
+        }
+        my @pids;
+        for my $i (0..$#batch) {
+            my $pid = fork;
+            die "cannot fork: $!" unless defined $pid;
+            if ($pid == 0) {
+                # the temp host files belong to the parent
+                $_->unlink_on_destroy(0) for @tempfiles;
+                use_host_group $jobs, $i;
+                task_common_run $program, @{$batch[$i]};
+                exit 0;
+            }
+            push @pids, $pid;
+        }
+        my $failed = 0;
+        for my $pid (@pids) { waitpid($pid, 0); $failed ||= $?; }
+        die "parallel $program failed" if $failed;
+        expire_cache_entry 'leadernode_filelist';
+    }
+}
+# }}}
+
 # {{{ krylov
+
 sub task_krylov {
     task_begin_message;
 
@@ -1959,8 +2069,8 @@ sub task_krylov {
     #     More accurately, we need V${x0}-${x1}.$i for some iteration i.
     #
     # if ys is found in the command line, then we focus on that sequence
-    # specifically. Otherwise, we process all sequences one after
-    # another.
+    # specifically. Otherwise, we process all sequences, krylov_jobs at
+    # a time.
     #
     # side-effect files, which have no impact on whether this step gets
     # re-run or not:
@@ -1983,16 +2093,18 @@ sub task_krylov {
 
     task_check_message 'missing',
                 "Pending tasks for krylov:\n" . join("\n", @todo);
+    my @runs;
     for my $t (@todo) {
-        # take out ys and start from main_args, put the right ones in place if
-        # needed. (note that if both were specified, this is essentially
-        # putting the very same parameters back in place, but with the
-        # benefit of having performed a check inbetween).
+        # take out ys and start from main_args, put the right ones in
+        # place if needed. (note that if both were specified, this is
+        # essentially putting the very same parameters back in place,
+        # but with the benefit of having performed a check inbetween).
         my @args = grep { !/^ys/ && !/^start/ && !/^max_ram/ } @main_args;
         push @args, split(' ', $t);
         task_safety_check_krylov @args, split(' ', $t);
-        task_common_run 'krylov', @args;
+        push @runs, \@args;
     }
+    task_parallel_run $task_prog{'krylov'}, $task_jobs{'krylov'}, @runs;
 } # }}}
 
 # {{{ lingen
@@ -2109,7 +2221,7 @@ sub task_lingen {
     push @args, "split-output-file=1";
     push @args, "afile=$concatenated_A";
     push @args, "ffile=F";
-    push @args, grep { /^(?:mn|m|n|wdir|prime|rhs|lingen_thr|lingen_mpi)=/ || /allow_zero_on_rhs/ || /max_ram/ } @main_args;
+    push @args, grep { /^(?:mn|m|n|wdir|prime|rhs|lingen_thr|lingen_mpi|lingen_ft_impl|glingen_threshold)=/ || /allow_zero_on_rhs/ || /max_ram/ } @main_args;
     if (!$mpi_needed && ($lingen_mpi_split[0]*$lingen_mpi_split[1] != 1)) {
         print "## non-MPI build, avoiding multi-node lingen\n";
         # We keep thr=
@@ -2119,7 +2231,7 @@ sub task_lingen {
     if (! -f "$wdir/$concatenated_A.gen") {
         if ($prime == 2) {
             push @args, "tuning_thresholds=recursive:128,ternary:6400,cantor:6400,notiming:0";
-            task_common_run("lingen_b64", @args);
+            task_common_run($task_prog{'lingen'}, @args);
         } else {
             push @args, "tuning_thresholds=recursive:10,flint:10,notiming:0";
             task_common_run("lingen_pz", @args);
@@ -2249,15 +2361,16 @@ sub task_mksol {
                     "Pending tasks for $current_task:\n" . join("\n", @todo);
     }
 
+    my @runs;
     for my $t (@todo) {
         # take out ys from main_args, put the right one in place if
         # needed.
         # print "main_args: @main_args\n";
         my @args = grep { !/^(ys|n?rhs|start|max_ram)/ } @main_args;
         push @args, split(' ', $t);
-
-        task_common_run 'mksol', @args;
+        push @runs, \@args;
     }
+    task_parallel_run $task_prog{'mksol'}, $task_jobs{'mksol'}, @runs;
 }
 # }}}
 
@@ -2420,9 +2533,7 @@ sub task_gather {
     task_check_message 'ok', "All required files for gather seem to be present, good.";
 
     my @args = grep { !/^ys/ } @main_args;
-    for my $t (@todo) {
-        task_common_run 'gather', @args, $t;
-    }
+    task_parallel_run 'gather', $task_jobs{'gather'}, map { [@args, $_] } @todo;
 }
 # }}}
 

@@ -5,6 +5,7 @@
 
 #include "macros.h"
 #include "parallelizing_info.hpp"
+#include "timing.h"
 
 /* How long do we typically accept to wait for asynchronous output (=
  * signals) to be checked ? */
@@ -51,5 +52,21 @@ void timing_check(parallelizing_info & pi, struct timing_data * t, int iter, int
 void timing_update_ticks(struct timing_data * t, int iter);
 void timing_disp_collective_oneline(parallelizing_info & pi, struct timing_data * timing, int iter, int print, const char * stage);
 void timing_final_tally(parallelizing_info & pi, struct timing_data * timing, int print, const char * stage);
+
+/* lap() is the wall time since the construction or the previous lap */
+struct epoch_timer {
+    double t = wct_seconds();
+    double lap() {
+        double const t0 = t;
+        t = wct_seconds();
+        return t - t0;
+    }
+};
+
+/* One line per epoch of n iterations ending at iter: the wall time per
+ * iteration of the iterations alone, and the wall time of the rest of
+ * the epoch (checkpoint loads and saves, checks), so that a rate read
+ * from the log does not carry the file system. */
+void epoch_report(int print, const char * stage, unsigned int iter, unsigned int n, double iter_s, double other_s);
 
 #endif	/* CADO_ASYNC_HPP */

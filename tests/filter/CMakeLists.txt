@@ -2,6 +2,20 @@ cado_define_test(SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/testsm.sh
     PROVIDE_TEMPORARY_WDIR
     TARGET_DEPENDENCIES sm)
 
+cado_define_test(test_merge_direct
+    SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test_merge_direct.sh -skip 8
+    -purged ${CMAKE_CURRENT_SOURCE_DIR}/testsm.p59.purged.gz
+    -target_density 50
+    PROVIDE_TEMPORARY_WDIR
+    TARGET_DEPENDENCIES merge replay)
+
+cado_define_test(test_merge_direct_dl
+    SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test_merge_direct.sh -dl
+    -purged ${CMAKE_CURRENT_SOURCE_DIR}/testsm.p59.purged.gz
+    -target_density 50
+    PROVIDE_TEMPORARY_WDIR
+    TARGET_DEPENDENCIES merge-dl replay-dl)
+
 cado_define_test(SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test_filter_galois.sh
     PROVIDE_TEMPORARY_WDIR
     TARGET_DEPENDENCIES filter_galois)
@@ -89,6 +103,7 @@ cado_define_test(test_purge_heavy_torture
     PROGRAM
     ${CMAKE_CURRENT_SOURCE_DIR}/heavy_torture_test_purge.sh
     TARGET_DEPENDENCIES purge
+    TIMEOUT 120
 )
 endif()
 

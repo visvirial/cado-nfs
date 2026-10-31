@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <type_traits>
 
 #include <gmp.h>
 
@@ -15,6 +16,7 @@
 #include "arith-hard.hpp"
 #include "lingen_call_companion.hpp"
 #include "lingen_fft_select.hpp"
+#include "lingen_ft_plugin.hpp"
 #include "lingen_matpoly_select.hpp"
 #include "lingen_memory_pool.hpp"
 #include "macros.h"
@@ -43,6 +45,7 @@ public:
     unsigned int n = 0;
     std::array<size_t, 3> fft_alloc_sizes;
     ptr data = NULL;
+    void * dev = NULL;  /* the plugin's matrix, in place of data */
     unsigned int nrows() const { return m; }
     unsigned int ncols() const { return n; }
 
@@ -52,11 +55,16 @@ public:
         : fti(fti)
         , fft_alloc_sizes(fti.get_alloc_sizes())
     { }
+    static constexpr bool plugin_able = has_lingen_ft_plugin_v<fft_type>;
     matpoly_ft(unsigned int m, unsigned int n, fft_type const & fti)
         : matpoly_ft(fti)
     {
         this->m = m;
         this->n = n;
+        if constexpr (plugin_able) if (bwc_lingen_ft_plugin) {
+            dev = bwc_lingen_ft_plugin->alloc(m, n, cantor().k);
+            return;
+        }
         data = memory.alloc(m * n * fft_alloc_sizes[0]);
         memset(data, 0, m * n * fft_alloc_sizes[0]);
 #ifdef HAVE_OPENMP
@@ -78,22 +86,48 @@ public:
         , fft_alloc_sizes(a.fft_alloc_sizes)
     {
         data=a.data;
+        dev=a.dev;
         a.m=a.n=0;
         a.data=NULL;
+        a.dev=NULL;
     }
     matpoly_ft& operator=(matpoly_ft && a) {
-        if (data) memory.free(data, m * n * fft_alloc_sizes[0]);
+        release();
         fft_alloc_sizes = a.fft_alloc_sizes;
         fti = a.fti;
         m=a.m;
         n=a.n;
         data=a.data;
+        dev=a.dev;
         a.m=a.n=0;
         a.data=NULL;
+        a.dev=NULL;
         return *this;
     }
-    ~matpoly_ft() {
+    ~matpoly_ft() { release(); }
+    void release() {
         if (data) memory.free(data, m * n * fft_alloc_sizes[0]);
+        if (dev) bwc_lingen_ft_plugin->free(dev);
+        data = NULL;
+        dev = NULL;
+    }
+    /* }}} */
+    /* {{{ the plugin's view of things (lingen_ft_plugin.hpp): a
+     * matpoly_ft of Cantor transforms lives in the plugin's memory when
+     * one is loaded, and its dft, product and ift run there */
+    bwc_lingen_ft_cantor cantor() const {
+        if constexpr (plugin_able)
+            return { fti.k, fti.n, fti.mp_shift };
+        else
+            return {};
+    }
+    static bwc_lingen_ft_sub sub(submatrix_range const & R) {
+        return { R.i0, R.j0, R.nrows(), R.ncols() };
+    }
+    template<typename V>
+    static bwc_lingen_ft_polys polys(V a) {
+        return { (uint64_t *) a.part(0, 0), a.M.ncols(),
+            a.M.data_entry_alloc_size_in_words(), a.M.get_size() };
     }
     /* }}} */
     /* {{{ direct access interface */
@@ -116,6 +150,10 @@ public:
             return M.part(i0+i, j0+j);
         }
         void zero() { /*{{{*/
+            if constexpr (plugin_able) if (M.dev) {
+                bwc_lingen_ft_plugin->zero(M.dev, sub(*this));
+                return;
+            }
             unsigned int nrows = this->nrows();
             unsigned int ncols = this->ncols();
 #ifdef HAVE_OPENMP
@@ -144,6 +182,7 @@ public:
 #endif
 
         void to_export() { /*{{{*/
+            ASSERT_ALWAYS(!M.dev);
             unsigned int nrows = this->nrows();
             unsigned int ncols = this->ncols();
             ASSERT(check());
@@ -157,6 +196,7 @@ public:
             }
         } /*}}}*/
         void to_import() { /*{{{*/
+            ASSERT_ALWAYS(!M.dev);
             unsigned int nrows = this->nrows();
             unsigned int ncols = this->ncols();
 #ifdef HAVE_OPENMP
@@ -180,6 +220,7 @@ public:
             return M.part(i0+i, j0+j);
         }
         bool check() {/*{{{*/
+            if (M.dev) return true;
             for(unsigned int i = 0 ; i < nrows() ; i++) {
                 for(unsigned int j = 0 ; j < ncols() ; j++) {
                     if (!M.fti.check(part(i,j), 1))
@@ -222,6 +263,10 @@ public:
         unsigned int ncols = a.ncols();
         ASSERT_ALWAYS(t.nrows() == nrows);
         ASSERT_ALWAYS(t.ncols() == ncols);
+        if constexpr (plugin_able) if (t.M.dev) {
+            bwc_lingen_ft_plugin->dft(t.M.dev, sub(t), polys(a), t.M.cantor());
+            return;
+        }
 #ifdef HAVE_OPENMP
         unsigned int T = std::min((unsigned int) omp_get_max_threads(), nrows*ncols);
 #pragma omp parallel num_threads(T)
@@ -248,6 +293,10 @@ public:
         unsigned int ncols = a.ncols();
         ASSERT_ALWAYS(t.nrows() == nrows);
         ASSERT_ALWAYS(t.ncols() == ncols);
+        if constexpr (plugin_able) if (t.M.dev) {
+            bwc_lingen_ft_plugin->ift(polys(a), t.M.dev, sub(t), t.M.cantor());
+            return;
+        }
 #ifdef HAVE_OPENMP
         unsigned int T = std::min((unsigned int) omp_get_max_threads(), nrows*ncols);
 #pragma omp parallel num_threads(T)
@@ -280,6 +329,11 @@ public:
         ASSERT(t0.check());
         ASSERT(t1.check());
         ASSERT(t.check());
+        if constexpr (plugin_able) if (t.M.dev) {
+            bwc_lingen_ft_plugin->addcompose(t.M.dev, sub(t),
+                    t0.M.dev, sub(t0), t1.M.dev, sub(t1), t.M.cantor().n);
+            return;
+        }
 #ifdef HAVE_OPENMP
         unsigned int T = std::min((unsigned int) omp_get_max_threads(), nrows*ncols);
 #pragma omp parallel num_threads(T)

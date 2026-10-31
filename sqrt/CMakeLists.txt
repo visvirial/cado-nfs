@@ -3,8 +3,8 @@ if (${WITH_MPI})
 add_definitions(-DWITH_MPI)
 endif()
 
-add_executable(sqrt sqrt.cpp)
-target_link_libraries(sqrt PRIVATE utils_with_io)
+add_executable(sqrt sqrt.cpp par_mul.cpp)
+target_link_libraries(sqrt PRIVATE utils_with_io ${CMAKE_DL_LIBS})
 mark_targets_as_openmp(sqrt)
 install(TARGETS sqrt RUNTIME DESTINATION ${LIBSUFFIX}/sqrt)
 

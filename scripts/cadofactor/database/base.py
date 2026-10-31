@@ -94,18 +94,25 @@ class ConnectionWrapperBase(object, metaclass=abc.ABCMeta):
     def cursor(self):
         pass
 
-    def transaction(self, mode=None):
+    def transaction(self, mode=None, commit=True):
         """
         harness_transaction(mode, <some lambda>) is preferred.
         """
-        return TransactionWrapper(self.cursor(), mode=mode)
+        return TransactionWrapper(self.cursor(), mode=mode, commit=commit)
 
     def harness_transaction(self, mode, transaction,
-                            *args, replay=True, **kwargs):
+                            *args, replay=True, commit=True, **kwargs):
+        """
+        Run transaction(cursor, *args, **kwargs) in a transaction of the
+        given mode. With commit=False, the transaction stays open on
+        this connection; the next harness_transaction() call on this
+        connection joins it, and commits it unless it also passes
+        commit=False.
+        """
         i = 0
         while True:
             try:
-                with self.transaction(mode) as cursor:
+                with self.transaction(mode, commit) as cursor:
                     return transaction(cursor, *args, **kwargs)
             except TransactionAborted as e:
                 if replay:
@@ -503,9 +510,11 @@ class DB_base(object):
 
 
 class TransactionWrapper(object):
-    def __init__(self, cursor, mode=None):
+    def __init__(self, cursor, mode=None, commit=True):
         self.cursor = cursor
         self.mode = mode
+        self.commit = commit
+        self.joined = False
 
     def __enter__(self):
         thr_id = threading.current_thread().ident
@@ -518,7 +527,9 @@ class TransactionWrapper(object):
                            f" opens {what} 0x{id(self):x}"
                            f" on connection 0x{id(conn):x}"
                            f" [in_transaction: {conn.in_transaction}]")
-        if self.mode == READONLY:
+        # A transaction left open by a commit=False call is joined.
+        self.joined = conn.in_transaction
+        if self.mode == READONLY or self.joined:
             return self.cursor
         if self.mode == EXCLUSIVE:
             conn.pending.set(conn, self)
@@ -532,14 +543,15 @@ class TransactionWrapper(object):
             what = "read-only lookup"
         else:
             what = "transaction"
-        if e_type is None:
-            conn.commit()
-        else:
+        if e_type is not None:
             logger.transaction(f"thread 0x{thr_id:x}"
                                f" rolls back {what} 0x{id(self):x}"
                                f" on connection 0x{id(conn):x}")
             conn.rollback()
-        conn.pending.release()
+            conn.pending.release()
+        elif self.commit and not (self.mode == READONLY and self.joined):
+            conn.commit()
+            conn.pending.release()
         self.cursor.close()
         logger.transaction(f"thread 0x{thr_id:x}"
                            f" closed {what} 0x{id(self):x}"
@@ -550,7 +562,7 @@ class TransactionWrapper(object):
 def conn_close(conn):
     try:
         logger.transaction("Closing connection %d", id(conn))
-        if conn.in_transaction():
+        if conn.in_transaction:
             logger.warning("Connection %d being closed while in transaction",
                            id(conn))
         conn.close()

@@ -8,6 +8,7 @@ import random
 import time
 import datetime
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from itertools import zip_longest
 from math import log, sqrt
 import logging
@@ -15,7 +16,9 @@ import pathlib
 import socket
 import gzip
 import heapq
+import hashlib
 import errno
+from collections import deque
 from cadofactor import patterns, wudb, cadoprograms
 from cadofactor import cadoparams, cadocommand, workunit
 from cadofactor.workunit import Workunit
@@ -1720,6 +1723,34 @@ class Task(patterns.Colleague, SimpleStatistics, HasState, DoesLogging,
             self.updateObserver(message)
         return message
 
+    def submit_commands(self, commands, commit=True, log_errors=False):
+        """
+        Run several commands at the same time.
+        Return the list of result tuples, in the order of the commands.
+        """
+        if not commands:
+            return []
+        wuname = self.make_wuname(None)
+        cputime_used = os.times()[2]  # CPU time of child processes
+        realtime_used = time.time()
+        # One thread launches and waits for one process, so every
+        # started process has a waiter even when another launch fails.
+        with ThreadPoolExecutor(len(commands)) as executor:
+            results = list(executor.map(
+                lambda c: cadocommand.Command(c).wait(), commands))
+        cputime_used = os.times()[2] - cputime_used
+        realtime_used = time.time() - realtime_used
+        self.update_cpu_real_time(commands[0].name,
+                                  cputime_used, realtime_used, commit)
+        messages = []
+        for (command, (rc, stdout, stderr)) in zip(commands, results):
+            message = Task.ResultInfo(wuname, rc, stdout, stderr, command,
+                                      command.make_command_line(), "server")
+            if rc != 0 and log_errors:
+                self.log_failed_command_error(message, 0)
+            messages.append(message)
+        return messages
+
     def filter_notification(self, message):
         wuid = message.get_wu_id()
         rc = message.get_exitcode(0)
@@ -1892,6 +1923,20 @@ class ClientServerTask(Task, wudb.UsesWorkunitDb, patterns.Observer):
         self.send_notification(Notification.SUBSCRIBE_WU_NOTIFICATIONS, None)
         self.clients = None
 
+    def free_wuname(self, identifier):
+        """
+        The wuname of the identifier under the first attempt number the
+        workunits table does not hold yet. A table row with the plain
+        name is an earlier, not verified workunit of the same range
+        (the task issues a range again after its state was reset).
+        """
+        wuid = self.make_wuname(identifier)
+        attempt = 1
+        while self.wuar.query(eq={"wuid": wuid}):
+            attempt += 1
+            wuid = self.make_wuname(identifier, attempt)
+        return wuid
+
     def submit_wu(self, wu, commit=True):
         """
         Submit a WU and update wu_submitted counter
@@ -1990,7 +2035,7 @@ class ClientServerTask(Task, wudb.UsesWorkunitDb, patterns.Observer):
 
         self.send_request(Request.GET_WU_RESULT)
 
-        wuid = self.make_wuname(identifier)
+        wuid = self.free_wuname(identifier)
 
         # ...and we want to be sure that the range size can be extracted
         # from the identifier.
@@ -2153,18 +2198,17 @@ class ClientServerTask(Task, wudb.UsesWorkunitDb, patterns.Observer):
         results = self.wuar.query(eq={"status": wudb.WuStatus.ASSIGNED},
                                   lt={"timeassigned": cutoff})
         results += self.wuar.query(eq={"status": wudb.WuStatus.NEED_RESUBMIT})
-        if not results:
-            # self.logger.debug("Found no timed-out workunits")
-            pass
+        # The workunits table is shared by all tasks. A workunit of
+        # another task (say, a root optimization workunit found by the
+        # size optimization task after a restart) is that task's to
+        # time out; counting it here corrupts wu_timedout.
+        results = [entry for entry in results
+                   if self.split_wuname(entry["wuid"])[1] == self.name]
         self.logger.debug("Timeout check took %f s, found %d WUs",
                           time.time() - now, len(results))
         for entry in results:
-            # XXX we would like to do this atomically, but the current db
-            # access methods ignore the commit argument, which is a huge
-            # pain. In fact, it's not that much of a problem, though. We
-            # can live with the wu disappearing for a jiffy or two.
-            self.cancel_wu(entry["wuid"], commit=False)
-            self.resubmit_one_wu(Workunit(entry["wu"]), commit=True)
+            self.resubmit_one_wu(Workunit(entry["wu"]), commit=False)
+            self.cancel_wu(entry["wuid"], commit=True)
 
     def handle_error_result(self, message):
         """
@@ -2196,9 +2240,9 @@ class ClientServerTask(Task, wudb.UsesWorkunitDb, patterns.Observer):
             raise Exception("Too many failed work units")
         assert results[0]["status"] == wudb.WuStatus.RECEIVED_ERROR
         wu = workunit.Workunit(results[0]["wu"])
+        self.resubmit_one_wu(wu, commit=False, maxresubmit=maxwuerror)
         self.state.update({key: self.state[key] + 1}, commit=False)
-        self.verification(message.get_wu_id(), False, commit=False)
-        self.resubmit_one_wu(wu, commit=True, maxresubmit=maxwuerror)
+        self.verification(message.get_wu_id(), False, commit=True)
         return True
 
 
@@ -2331,6 +2375,11 @@ class Polysel1Task(ClientServerTask,
         self._check_best_polynomials()
 
         self.poly_heap = []
+        # The (f, g) coefficient tuples of the polynomials in the heap.
+        # A polynomial that is already in the heap is not added again,
+        # so a candidate file that is imported twice, or a candidate
+        # that two runs of the same search both found, holds one slot.
+        self.poly_heap_ids = set()
         # If we have "import", discard any existing polynomials
         if "import" in self.params and self.best_polynomials:
             self.logger.warning('Have "import" parameter, discarding '
@@ -2359,41 +2408,26 @@ class Polysel1Task(ClientServerTask,
             assert self.best_polynomials[key] == str(poly)
 
     def import_existing_polynomials(self):
-        debug = False
-        oldkeys = list(self.best_polynomials.keys())
-        oldkeys.sort(key=int)  # Sort by numerical value
+        """
+        Fill the heap from the DB, then write the DB back if the heap
+        differs from it (nrkeep was lowered, or the DB holds a polynomial
+        twice or one without exp_E).
+        """
+        oldkeys = sorted(self.best_polynomials.keys(), key=int)
         for oldkey in oldkeys:
-            if debug:
-                print("Adding old polynomial at DB index %s: %s" %
-                      (oldkey, self.best_polynomials[oldkey]))
             poly = Polynomials(self.best_polynomials[oldkey].splitlines())
             if not poly.exp_E:
                 self.logger.error("Polynomial at DB index %s has no exp_E",
                                   oldkey)
                 continue
-            newkey = self._add_poly_heap(poly)
-            if newkey is None:
-                # Heap is full, and the poly was worse than the worst one on
-                # the heap. Thus it did not get added and must be removed from
-                # the DB
-                if debug:
-                    print("Deleting polynomial exp_E=%f, key=%s" %
-                          (poly.exp_E, oldkey))
-                del self.best_polynomials[oldkey]
-            elif newkey != oldkey:
-                # Heap is full, worst one in heap (with key=newkey) was
-                # overwritten and its DB entry gets replaced with poly from
-                # key=oldkey
-                if debug:
-                    print("Overwriting poly exp_E=%f, key=%s with poly "
-                          "exp_E=%f, key=%s" %
-                          (self.poly_heap[0][0], newkey, poly, oldkey))
-                self.best_polynomials.clear(oldkey, commit=False)
-                self.best_polynomials.update({newkey: poly}, commit=True)
-            else:
-                # Last case newkey == oldkey: nothing to do
-                if debug:
-                    print("Adding exp_E=%f, key=%s" % (poly.exp_E, oldkey))
+            self._add_poly_heap(poly)
+        newdb = {key: str(poly) for exp_E, (key, poly) in self.poly_heap}
+        if newdb == dict(self.best_polynomials):
+            return
+        self.logger.info("Keeping %d of the %d polynomials read from the DB",
+                         len(newdb), len(oldkeys))
+        self.best_polynomials.clear(commit=False)
+        self.best_polynomials.update(newdb, commit=True)
 
     def run(self):
         if self.send_request(Request.GET_WILL_IMPORT_FINAL_POLYNOMIAL):
@@ -2425,6 +2459,14 @@ class Polysel1Task(ClientServerTask,
         if self.is_done():
             self.logger.info("Already finished - nothing to do")
             return True
+
+        command = self.make_polyselect(0, 1, "probe").make_wu("probe")
+        self.search = self.search_key(command["commands"][0])
+        self.search_tag = hashlib.sha1(self.search.encode()).hexdigest()[:8]
+        self.done_ranges = self.get_done_ranges()
+        self.logger.info("Search %s is %s; %d of its ad ranges are already"
+                         " done and are skipped", self.search_tag,
+                         self.search, len(self.done_ranges))
 
         # Submit all the WUs we need to reach admax
         while self.need_more_wus():
@@ -2571,6 +2613,10 @@ class Polysel1Task(ClientServerTask,
         self.best_polynomials[key] = str(poly)
         return True
 
+    @staticmethod
+    def _poly_id(poly):
+        return (tuple(poly.polyf), tuple(poly.polyg))
+
     def _add_poly_heap(self, poly):
         """
         Add a polynomial to the heap
@@ -2578,10 +2624,19 @@ class Polysel1Task(ClientServerTask,
         If the heap is full (nrkeep), the worst polynomial (i.e., with
         the largest exp_E) is replaced if the new one is better.  Returns
         the key (as a str) under which the polynomial was added, or None
-        if it was not added.
+        if it was not added. A polynomial that is already in the heap
+        is not added.
         """
         assert len(self.poly_heap) <= self.params["nrkeep"]
         debug = False
+
+        poly_id = self._poly_id(poly)
+        if poly_id in self.poly_heap_ids:
+            if debug:
+                self.logger.debug("_add_poly_heap(): poly with exp_E %f"
+                                  " is already in the heap. Not adding",
+                                  poly.exp_E)
+            return None
 
         # Find DB index under which to store this new poly. If the heap
         # is not full, use the next bigger index.
@@ -2598,7 +2653,8 @@ class Polysel1Task(ClientServerTask,
                                       poly.exp_E, worst_exp_E)
                 return None
             # Pop the worst poly from heap and re-use its DB index
-            key = heapq.heappop(self.poly_heap)[1][0]
+            key, worst = heapq.heappop(self.poly_heap)[1]
+            self.poly_heap_ids.discard(self._poly_id(worst))
             if debug:
                 self.logger.debug("_add_poly_heap(): new poly exp_E %f,"
                                   " worst in heap has %f."
@@ -2620,6 +2676,7 @@ class Polysel1Task(ClientServerTask,
         # -exp_E as the heap key
         new_entry = (-poly.exp_E, (key, poly))
         heapq.heappush(self.poly_heap, new_entry)
+        self.poly_heap_ids.add(poly_id)
         return key
 
     def parse_poly(self, text, filename):
@@ -2680,23 +2737,85 @@ class Polysel1Task(ClientServerTask,
     def need_more_wus(self):
         return self.state["adnext"] < self.params["admax"]
 
+    def make_polyselect(self, adstart, adend, identifier):
+        outputfile = self.workdir.make_filename(identifier, prefix=self.name)
+        return cadoprograms.Polyselect(admin=adstart, admax=adend,
+                                       stdout=str(outputfile),
+                                       skip_check_binary_exists=True,
+                                       **self.progparams[0])
+
+    @staticmethod
+    def search_key(command):
+        """
+        The command of a stage-1 workunit without its ad range and
+        thread count. Two workunits with equal keys are the same search
+        over different ad ranges.
+
+        >>> Polysel1Task.search_key('${EXECFILE0} -P 5 -N 42 -degree 4'
+        ...                         ' -t 2 -admin 100 -admax 200 -incr 60')
+        '${EXECFILE0} -P 5 -N 42 -degree 4 -incr 60'
+        """
+        return re.sub(r" -(admin|admax|t) \d+", "", command)
+
+    @staticmethod
+    def identifier_range(identifier):
+        """
+        The (adstart, adend) of a stage-1 workunit identifier, with or
+        without a search tag.
+
+        >>> Polysel1Task.identifier_range("100-200")
+        (100, 200)
+        >>> Polysel1Task.identifier_range("100-200.1a2b3c4d")
+        (100, 200)
+        """
+        m = re.match(r"(\d+)-(\d+)", identifier)
+        assert m, identifier
+        return int(m.group(1)), int(m.group(2))
+
+    def get_done_ranges(self):
+        """
+        The ad ranges of the verified workunits of this search, as a
+        deque of disjoint (adstart, adend) pairs in increasing order.
+        """
+        ranges = []
+        for row in self.wuar.query(eq={"status": wudb.WuStatus.VERIFIED_OK}):
+            command = Workunit(row["wu"])["commands"][0]
+            if self.search_key(command) != self.search:
+                continue
+            identifier = self.split_wuname(row["wuid"])[2]
+            ranges.append(self.identifier_range(identifier))
+        ranges.sort()
+        merged = deque()
+        for adstart, adend in ranges:
+            if merged and adstart <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], adend))
+            else:
+                merged.append((adstart, adend))
+        return merged
+
     def submit_one_wu(self):
         adstart = self.state["adnext"]
         adend = adstart + self.params["adrange"]
         adend = adend - (adend % self.params["adrange"])
         assert adend > adstart
         adend = min(adend, self.params["admax"])
-        outputfile = self.workdir.make_filename("%d-%d" % (adstart, adend),
-                                                prefix=self.name)
-        if self.test_outputfile_exists(outputfile):
-            self.logger.info("%s already exists, won't generate again",
-                             outputfile)
-        else:
-            p = cadoprograms.Polyselect(admin=adstart, admax=adend,
-                                        stdout=str(outputfile),
-                                        skip_check_binary_exists=True,
-                                        **self.progparams[0])
-            self.submit_command(p, "%d-%d" % (adstart, adend), commit=False)
+        while self.done_ranges and self.done_ranges[0][1] <= adstart:
+            self.done_ranges.popleft()
+        if self.done_ranges:
+            done_start, done_end = self.done_ranges[0]
+            if done_start <= adstart:
+                self.logger.info("Skipping ad range %d-%d: already done",
+                                 adstart, done_end)
+                self.state.update({"adnext": done_end}, commit=True)
+                return
+            adend = min(adend, done_start)
+        # The tag keeps the workunit and its result file apart from
+        # those of an earlier search over the same range (another P or
+        # incr): the wuid is unique, and the server does not overwrite
+        # an upload file.
+        identifier = "%d-%d.%s" % (adstart, adend, self.search_tag)
+        p = self.make_polyselect(adstart, adend, identifier)
+        self.submit_command(p, identifier, commit=False)
         self.state.update({"adnext": adend}, commit=True)
 
     def get_total_cpu_or_real_time(self, is_cpu):
@@ -4338,7 +4457,8 @@ class Duplicates1Task(Task, FilesCreator, HasStatistics):
     @property
     def paramnames(self):
         return self.join_params(super().paramnames,
-                                {"nslices_log": 1, "algo": str})
+                                {"nslices_log": 1, "algo": str,
+                                 "nshards": 1})
 
     @property
     def stat_conversions(self):
@@ -4447,46 +4567,67 @@ class Duplicates1Task(Task, FilesCreator, HasStatistics):
                     # self.logger.info("Creating directory %s", subdir)
                     subdir.mkdir(parent=True)
                 run_counter = self.state.get("run_counter", 0)
-                prefix = "dup1.%s" % run_counter
-                (stdoutpath, stderrpath) = self.make_std_paths(
-                    cadoprograms.Duplicates1.name)
-
-                if len(newfiles) <= 10:
-                    p = cadoprograms.Duplicates1(*newfiles,
-                                                 prefix=prefix,
-                                                 out=outputdir,
-                                                 stdout=str(stdoutpath),
-                                                 stderr=str(stderrpath),
-                                                 **self.progparams[0])
-                else:
-                    filelistname = self.make_filelist(newfiles, prefix="dup1")
-                    p = cadoprograms.Duplicates1(filelist=filelistname,
-                                                 prefix=prefix,
-                                                 out=outputdir,
-                                                 stdout=str(stdoutpath),
-                                                 stderr=str(stderrpath),
-                                                 **self.progparams[0])
-                message = self.submit_command(p, None, log_errors=True)
-                if message.get_exitcode(0) != 0:
-                    raise Exception("Program failed")
-                    # Check that the output files exist now
-                    # TODO: How to recover from error? Presumably a dup1
-                    # process failed, but that should raise a return code
-                    # exception
-                with stderrpath.open("r") as stderrfile:
-                    stderr = stderrfile.read()
-                outfilenames = self.parse_output_files(stderr)
+                # Each shard gets its own output file prefix, so several
+                # dup1 processes can write distinct files into the same
+                # slice directories. The slice of a relation depends only
+                # on the relation, so the shard count does not change
+                # which slice a relation goes to.
+                nshards = min(self.params["nshards"], len(newfiles))
+                programs = []
+                stdiopaths = []
+                for s in range(nshards):
+                    shardfiles = newfiles[s::nshards]
+                    if nshards == 1:
+                        prefix = "dup1.%s" % run_counter
+                        progname = cadoprograms.Duplicates1.name
+                    else:
+                        prefix = "dup1.%s.%s" % (run_counter, s)
+                        progname = "%s.shard%d" % \
+                            (cadoprograms.Duplicates1.name, s)
+                    (stdoutpath, stderrpath) = self.make_std_paths(
+                        progname, do_increment=(s == 0))
+                    stdiopaths.append((stdoutpath, stderrpath))
+                    if len(shardfiles) <= 10:
+                        p = cadoprograms.Duplicates1(*shardfiles,
+                                                     prefix=prefix,
+                                                     out=outputdir,
+                                                     stdout=str(stdoutpath),
+                                                     stderr=str(stderrpath),
+                                                     **self.progparams[0])
+                    else:
+                        filelistname = self.make_filelist(shardfiles,
+                                                          prefix="dup1")
+                        p = cadoprograms.Duplicates1(filelist=filelistname,
+                                                     prefix=prefix,
+                                                     out=outputdir,
+                                                     stdout=str(stdoutpath),
+                                                     stderr=str(stderrpath),
+                                                     **self.progparams[0])
+                    programs.append(p)
+                for message in self.submit_commands(programs,
+                                                    log_errors=True):
+                    if message.get_exitcode(0) != 0:
+                        raise Exception("Program failed")
+                outfilenames = {}
+                current_counts = [0] * self.nr_slices
+                for (stdoutpath, stderrpath) in stdiopaths:
+                    with stderrpath.open("r") as stderrfile:
+                        stderr = stderrfile.read()
+                    outfilenames.update(self.parse_output_files(stderr))
+                    counts = self.parse_slice_counts(stderr)
+                    current_counts = [a + b for (a, b)
+                                      in zip(current_counts, counts)]
                 if not outfilenames:
                     self.logger.critical("No output files produced by %s",
-                                         p.name)
+                                         cadoprograms.Duplicates1.name)
                     return False
+                for (stdoutpath, stderrpath) in stdiopaths:
+                    self.parse_stats(stdoutpath, commit=False)
                 self.logger.debug("Output file names: %s", outfilenames)
                 self.check_files_exist(outfilenames.keys(), "output",
                                        shouldexist=True)
                 self.state.update({"run_counter": run_counter + 1},
                                   commit=False)
-                current_counts = self.parse_slice_counts(stderr)
-                self.parse_stats(stdoutpath, commit=False)
                 # Add relation count from the newly processed files to the
                 # relations-per-slice dict
                 update1 = {str(idx):
@@ -4572,7 +4713,8 @@ class Duplicates2Task(Task, FilesCreator, HasStatistics):
         return self.join_params(super().paramnames,
                                 {"computation": str,
                                  "algo": str,
-                                 "nslices_log": 1})
+                                 "nslices_log": 1,
+                                 "concurrent": False})
 
     @property
     def stat_conversions(self):
@@ -4614,6 +4756,7 @@ class Duplicates2Task(Task, FilesCreator, HasStatistics):
         super().run()
 
         input_nrel = 0
+        slice_jobs = []
         for i in range(0, self.nr_slices):
             files = self.send_request(Request.GET_DUP1_FILENAMES, i.__eq__)
             rel_count = self.send_request(Request.GET_DUP1_RELCOUNT, i)
@@ -4648,7 +4791,24 @@ class Duplicates2Task(Task, FilesCreator, HasStatistics):
                                              stdout=str(stdoutpath),
                                              stderr=str(stderrpath),
                                              **self.merged_args[0])
-            message = self.submit_command(p, None, log_errors=True)
+            slice_jobs.append((i, files, p, stdoutpath, stderrpath))
+        if slice_jobs:
+            self.read_renumber_table_once()
+        # The slices hold disjoint file sets, so their dup2 processes can
+        # run at the same time. Each process holds a hash table of the
+        # relations of its slice in memory.
+        if self.params["concurrent"]:
+            messages = self.submit_commands(
+                [p for (i, files, p, so, se) in slice_jobs], log_errors=True)
+        else:
+            messages = []
+            for (i, files, p, so, se) in slice_jobs:
+                message = self.submit_command(p, None, log_errors=True)
+                if message.get_exitcode(0) != 0:
+                    raise Exception("Program failed")
+                messages.append(message)
+        for ((i, files, p, stdoutpath, stderrpath), message) \
+                in zip(slice_jobs, messages):
             if message.get_exitcode(0) != 0:
                 raise Exception("Program failed")
             with stderrpath.open("r") as stderrfile:
@@ -4668,6 +4828,21 @@ class Duplicates2Task(Task, FilesCreator, HasStatistics):
                          self.get_nrels())
         self.logger.debug("Exit Duplicates2Task.run(" + self.name + ")")
         return True
+
+    def read_renumber_table_once(self):
+        """
+        Reads the renumber table into the page cache of this node, so
+        that the dup2 processes map it from memory instead of each
+        reading it from the shared filesystem
+        """
+        filename = self.send_request(Request.GET_RENUMBER_FILENAME)
+        start = time.time()
+        buf = bytearray(1 << 24)
+        with open(str(filename), "rb", buffering=0) as f:
+            while f.readinto(buf):
+                pass
+        self.logger.info("Read the renumber table %s in %.1f s",
+                         filename, time.time() - start)
 
     @staticmethod
     def parse_remaining(text):
@@ -4739,7 +4914,8 @@ class PurgeTask(Task):
 
     @property
     def programs(self):
-        override = ("nrels", "out", "outdel", "filelist", "required_excess")
+        override = ("nrels", "out", "outdel",
+                    "nprimes", "filelist", "required_excess")
         return ((cadoprograms.Purge, override,
                  {"_freerel": Request.GET_FREEREL_FILENAME}),)
 
@@ -4783,6 +4959,21 @@ class PurgeTask(Task):
                 self.logger.critical(
                     "No Galois unique relation count received")
                 return False
+
+        nprimes = self.send_request(Request.GET_RENUMBER_PRIMECOUNT)
+        # If the user didn't give col_min_index, let's compute it.
+        col_min_index = int(self.progparams[0].get("col_min_index", -1))
+        if col_min_index == -1:
+            # Note: on RSA-120, reducing col_min_index from nprimes/20 to
+            # nprimes/40 decreases the matrix size after purge by 3.1%,
+            # and the final matrix by 1.4%, while not increasing the memory
+            # usage of purge, and increasing the cpu time of purge by only 13%.
+            col_min_index = int(nprimes / 40.0)
+            # For small cases, we want to avoid degenerated cases, so let's
+            # keep most of the ideals: memory is not an issue in that case.
+            if (col_min_index < 10000):
+                col_min_index = min(500, nprimes-1)
+            self.progparams[0].setdefault("col_min_index", col_min_index)
 
         if "purgedfile" in self.state and not self.have_new_input_files() and \
                 input_nrels == self.state["input_nrels"]:
@@ -4836,6 +5027,7 @@ class PurgeTask(Task):
             p = cadoprograms.Purge(*files,
                                    out=purgedfile,
                                    outdel=relsdelfile, keep=keep,
+                                   nprimes=nprimes,
                                    stdout=str(stdoutpath),
                                    stderr=str(stderrpath),
                                    **self.progparams[0])
@@ -4843,6 +5035,7 @@ class PurgeTask(Task):
             filelistname = self.make_filelist(files, prefix=self.name)
             p = cadoprograms.Purge(out=purgedfile,
                                    outdel=relsdelfile, keep=keep,
+                                   nprimes=nprimes,
                                    filelist=filelistname,
                                    stdout=str(stdoutpath),
                                    stderr=str(stderrpath),
@@ -5114,11 +5307,8 @@ class MergeDLPTask(Task):
     @property
     def programs(self):
         input = {"purged": Request.GET_PURGED_FILENAME}
-        return ((cadoprograms.MergeDLP, ("out"), input),
-                (cadoprograms.ReplayDLP, ("ideals",
-                                          "history",
-                                          "index",
-                                          "out"), input))
+        return ((cadoprograms.MergeDLP, ("out", "matrix", "index", "ideals"),
+                 input),)
 
     @property
     def paramnames(self):
@@ -5147,9 +5337,13 @@ class MergeDLPTask(Task):
             # We use .gzip by default, unless set to no in parameters
             use_gz = ".gz" if self.params["gzip"] else ""
             historyfile = self.workdir.make_filename("history" + use_gz)
+            indexfile = self.workdir.make_filename("index" + use_gz)
+            mergedfile = self.workdir.make_filename("sparse.bin")
+            idealfile = self.workdir.make_filename("ideal")
             (stdoutpath, stderrpath) = self.make_std_paths(
                 cadoprograms.MergeDLP.name)
-            p = cadoprograms.MergeDLP(out=historyfile,
+            p = cadoprograms.MergeDLP(out=historyfile, matrix=mergedfile,
+                                      index=indexfile, ideals=idealfile,
                                       stdout=str(stdoutpath),
                                       stderr=str(stderrpath),
                                       **self.merged_args[0])
@@ -5172,20 +5366,6 @@ class MergeDLPTask(Task):
                              " (%.1f entries per row on average)"
                              % (matsize, matweight,
                                 float(matweight)/float(matsize)))
-
-            indexfile = self.workdir.make_filename("index" + use_gz)
-            mergedfile = self.workdir.make_filename("sparse.bin")
-            (stdoutpath, stderrpath) = self.make_std_paths(
-                cadoprograms.Replay.name)
-            idealfile = self.workdir.make_filename("ideal")
-            p = cadoprograms.ReplayDLP(ideals=idealfile,
-                                       history=historyfile, index=indexfile,
-                                       out=mergedfile, stdout=str(stdoutpath),
-                                       stderr=str(stderrpath),
-                                       **self.merged_args[1])
-            message = self.submit_command(p, None, log_errors=True)
-            if message.get_exitcode(0) != 0:
-                raise Exception("Program failed")
 
             if not idealfile.isfile():
                 raise Exception("Output file %s does not exist" % idealfile)
@@ -5235,8 +5415,7 @@ class MergeTask(Task):
     @property
     def programs(self):
         input = {"purged": Request.GET_PURGED_FILENAME}
-        return ((cadoprograms.Merge, ("out",), input),
-                (cadoprograms.Replay, ("out", "history", "index"), input))
+        return ((cadoprograms.Merge, ("out", "matrix", "index"), input),)
 
     @property
     def paramnames(self):
@@ -5267,9 +5446,12 @@ class MergeTask(Task):
             # We use .gzip by default, unless set to no in parameters
             use_gz = ".gz" if self.params["gzip"] else ""
             historyfile = self.workdir.make_filename("history" + use_gz)
+            indexfile = self.workdir.make_filename("index" + use_gz)
+            mergedfile = self.workdir.make_filename("sparse.bin")
             (stdoutpath, stderrpath) = self.make_std_paths(
                 cadoprograms.Merge.name)
-            p = cadoprograms.Merge(out=historyfile,
+            p = cadoprograms.Merge(out=historyfile, matrix=mergedfile,
+                                   index=indexfile,
                                    stdout=str(stdoutpath),
                                    stderr=str(stderrpath),
                                    **self.merged_args[0])
@@ -5293,18 +5475,6 @@ class MergeTask(Task):
                              % (matsize,
                                 matweight,
                                 float(matweight)/float(matsize)))
-
-            indexfile = self.workdir.make_filename("index" + use_gz)
-            mergedfile = self.workdir.make_filename("sparse.bin")
-            (stdoutpath, stderrpath) = self.make_std_paths(
-                cadoprograms.Replay.name)
-            p = cadoprograms.Replay(history=historyfile, index=indexfile,
-                                    out=mergedfile, stdout=str(stdoutpath),
-                                    stderr=str(stderrpath),
-                                    **self.merged_args[1])
-            message = self.submit_command(p, None, log_errors=True)
-            if message.get_exitcode(0) != 0:
-                raise Exception("Program failed")
 
             if not indexfile.isfile():
                 raise Exception("Output file %s does not exist" % indexfile)
@@ -6848,6 +7018,7 @@ class StartServerTask(DoesLogging, cadoparams.UseParameters, HasState):
     def paramnames(self):
         return {"name": str, "workdir": None, "address": None, "port": 0,
                 "threaded": False, "ssl": True, "whitelist": None,
+                "alternate_names": "",
                 "only_registered": True, "forgetport": False,
                 "timeout_hint": None, "nrsubdir": 0,
                 "linger_before_quit": 0}
@@ -6890,6 +7061,12 @@ class StartServerTask(DoesLogging, cadoparams.UseParameters, HasState):
             cafilename = None
 
         servertimeout_hint = self.params.get("timeout_hint")
+
+        # Names that clients dial but the server cannot see, for example
+        # the public name of a tunnel. They go into the certificate.
+        alternate_names = [n.strip()
+                           for n in self.params["alternate_names"].split(",")
+                           if n.strip()]
 
         server_whitelist = []
         if whitelist is not None:
@@ -6949,6 +7126,7 @@ class StartServerTask(DoesLogging, cadoparams.UseParameters, HasState):
             nrsubdir=nrsubdir,
             only_registered=only_registered,
             cafile=cafilename,
+            alternate_names=alternate_names,
             whitelist=server_whitelist,
             timeout_hint=servertimeout_hint,
             # linger_before_quit=lbq

@@ -57,12 +57,15 @@ typedef struct {
 #endif
 } multirel_t;
 
-typedef struct {
-    unsigned int n;
-    multirel_t * rels;
-} relset_t;
+/* A relation set is a row of the merge heap (heap_alloc_relset): cell 1
+   holds the number of relations, the multirel_t array follows. In merge a
+   NULL set holds only the row itself; in replay every set is allocated. */
+typedef typerow_t * relset_t;
 
 typedef relset_t * index_data_t;
+
+static inline uint32_t relset_n(relset_t r) { return rowCell(r, 1); }
+static inline multirel_t * relset_rels(relset_t r) { return (multirel_t *) (r + 2); }
 
 
 // Protos.
@@ -74,13 +77,18 @@ extern void fprintRow(FILE *file, typerow_t *row);
 
 extern int parse_hisfile_line (index_signed_t *ind, const char *t, index_t *j);
 
+/* The relation set of row i that holds row i alone, allocated in the heap. */
+extern relset_t relset_singleton(index_t i);
+
+/* index_data[i1] = e2 * index_data[i1] + e1 * index_data[i2] (FOR_DL), or
+   the symmetric difference of the two sets. */
+extern void addRelsets(index_data_t index_data, index_t i1, index_t i2,
+        int32_t e1, int32_t e2);
+
 extern void addRowsUpdateIndex(typerow_t **rows, index_data_t index_data_t,
         index_t i1, index_t i2, index_t j);
 
 CADO_INLINE void addRows(typerow_t **rows, index_t i1, index_t i2, index_t j);
-
-typerow_t* mallocRow (uint32_t nb);
-typerow_t* reallocRow (typerow_t* row, uint32_t nb);
 #ifdef __cplusplus
 }
 #endif

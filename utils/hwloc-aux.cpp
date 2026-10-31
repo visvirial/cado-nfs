@@ -1,7 +1,19 @@
 #include "cado.h" // IWYU pragma: keep
 #include <cstddef>  // for NULL
+#include <cstdlib>  // for setenv
 #include <hwloc.h>   // for hwloc_type_sscanf_as_depth, HWLOC_API_VERSION
 #include "hwloc-aux.hpp"
+
+/* Load the topology with the hwloc x86 discovery component disabled by
+ * default. The x86 component divides by zero (SIGFPE) on some
+ * hypervisors that report incomplete CPUID cache data. A
+ * HWLOC_COMPONENTS value that is already in the environment takes
+ * precedence. */
+int hwloc_aux_topology_load(hwloc_topology_t topology)
+{
+    setenv("HWLOC_COMPONENTS", "-x86", 0);
+    return hwloc_topology_load(topology);
+}
 
 /* missing api calls in hwloc */
 /* Part of this code is derived from hwloc-calc.h in hwloc-1.11.0,

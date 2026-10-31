@@ -37,6 +37,7 @@ typedef int MPI_Request;
 #define MPI_Type_size(x, s)     *(s)=fakempi_sizeof_type(x)
 
 #define MPI_COMM_WORLD 0
+#define MPI_COMM_NULL -1
 
 #define MPI_THREAD_SINGLE       0
 #define MPI_THREAD_FUNNELED     1

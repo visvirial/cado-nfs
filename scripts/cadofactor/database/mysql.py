@@ -144,6 +144,7 @@ class DB_MySQL(DB_base):
         def commit(self):
             self._conn.commit()
 
+        @property
         def in_transaction(self):
             return self._conn.in_transaction
 

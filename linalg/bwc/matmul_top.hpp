@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <array>
@@ -14,6 +15,23 @@
 #include "matmul.hpp"
 #include "params.hpp"
 #include "balancing.hpp"
+#include "bwc_device_arena.hpp"
+
+/* The item indices of one application of a local permutation excerpt,
+ * between two vectors in opposite directions: dst item di[k] receives
+ * src item si[k]. Built once per thread and kept for the run, with a
+ * device mirror when dst has one. */
+struct mmt_perm_index {
+    bool built = false;
+    std::vector<uint32_t> di, si;
+    mmt_perm_index() = default;
+    mmt_perm_index(mmt_perm_index const &) = delete;
+    mmt_perm_index(mmt_perm_index &&) = default;
+    ~mmt_perm_index() {
+        bwc_dev_unregister(di.data());
+        bwc_dev_unregister(si.data());
+    }
+};
 
 struct matmul_top_matrix {
     // global stuff.
@@ -69,7 +87,14 @@ struct matmul_top_matrix {
      * ptr actually hides a call to a custom deleter.
      */
     std::shared_ptr<matmul_interface> mm;
+
+    /* indexed by the permutation direction and the dst direction. The
+     * mirrors belong to the library behind mm, so this comes after mm
+     * (destroyed before it). */
+    mmt_perm_index perm_index[2][2];
 };
+
+struct mmt_vec;
 
 struct matmul_top_data {
     arith_generic * abase;
@@ -97,6 +122,11 @@ struct matmul_top_data {
      * and then nothing of the sort happens. */
     std::string heatmap_file;
 
+    /* the temporary of the permutations, one per direction, kept for
+     * the run so that its buffer and its mirror are allocated once.
+     * The mirror belongs to the library behind the matrices, so this
+     * comes after them. */
+    std::unique_ptr<mmt_vec> scratch[2];
     matmul_top_data(
         arith_generic * abase,
         parallelizing_info & pi,
@@ -104,9 +134,6 @@ struct matmul_top_data {
         int optimized_direction);
     ~matmul_top_data();
 };
-
-struct mmt_vec;
-
 
 extern void matmul_top_decl_usage(cxx_param_list & pl);
 extern void matmul_top_lookup_parameters(cxx_param_list & pl);
@@ -125,8 +152,14 @@ extern void matmul_top_mul_comm(mmt_vec & w, mmt_vec & v);
 /* v is both input and output. w is temporary */
 extern void matmul_top_mul(matmul_top_data & mmt, mmt_vec *w, struct timing_data * tt);
 
+/* the same, with the result in out instead of w[0] */
+extern void matmul_top_mul_to(matmul_top_data & mmt, mmt_vec *w, mmt_vec & out, struct timing_data * tt);
+
 extern void mmt_vec_twist(matmul_top_data & mmt, mmt_vec & y);
 extern void mmt_vec_untwist(matmul_top_data & mmt, mmt_vec & y);
+/* the untwist as a permutation of the items in gather order, at the
+ * leader: untwisted item j is twisted item perm[j] */
+extern std::vector<uint32_t> mmt_untwist_perm(matmul_top_data & mmt, mmt_vec const & like);
 extern void mmt_vec_apply_T(matmul_top_data & mmt, mmt_vec & y);
 extern void mmt_vec_unapply_T(matmul_top_data & mmt, mmt_vec & y);
 extern void mmt_vec_apply_S(matmul_top_data & mmt, int midx, mmt_vec & y);

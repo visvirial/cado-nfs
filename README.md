@@ -1,3 +1,33 @@
+(The following is primarily LLM-generated and lightly edited.)
+
+# cado-nfs with GPU programs
+
+This is CADO-NFS (forked from upstream commit `9bb8fc0799bbaaf0b47a1edf573ecf5e0cf8e46a`)
+with new GPU siever code under `gpu-siever`.
+The script `gpu-siever/build.sh` should build everything.
+See `gpu-siever/README.md` for description of the GPU programs and the pipeline.
+
+Changes include:
+- `linalg/bwc`: plugin hooks for loading other implementations of matrix product
+  (`mm_impl`), vector exchange (`comm_impl`), and
+  lingen transform products (`lingen_ft_impl`); the
+  GPU programs `gkrylov`, `gmksol` and `glingen`; `bwc.pl`
+  runs several Krylov sequences and mksol ranges at the same time
+  (`krylov_jobs`, `mksol_jobs`, `gather_jobs`) and resumes from a
+  common checkpoint.
+- `sqrt`: multi-threaded and GPU multiplication
+  (`par_mul`, `gpu_mul`), and handling numbers bigger than the `mpz_t` limit.
+- `filter`: 8-byte column indices and merge cells, parallel duplicate
+  removal (`duplicates1.nshards`, `duplicates2.concurrent`), a
+  streaming replay with lower peak memory, and `purge.nsteps` and
+  `merge.incr` parameters.
+- `scripts/cadofactor`, `cado-nfs-client.py`: parameters for the
+  above and for the GPU siever, and server and client fixes for many
+  concurrent clients (upload handling, timeouts, download locking).
+- `misc/check_matrix`: a checker for the merged matrix.
+
+The upstream README follows.
+
 
 The main page of the Cado-NFS source code is
 [https://gitlab.com/cado-nfs/cado-nfs](https://gitlab.com/cado-nfs/cado-nfs).
@@ -110,7 +140,7 @@ Required software tools
    - Apple Clang: the minimal required version is >= 16.0.0
    - Intel ICX: the minimal required version is >= 2023
  * GNU make and CMake (`cmake 3.18` or later) for building.
- * Python 3.8 or later is required, as well as a few fairly common
+ * Python 3.10 or later is required, as well as a few fairly common
    packages such as python3-requests and python3-flask. These are
    packaged with most software distributions, or alternatively you can
    install them via pip.  As a convenience means, we also provide the script

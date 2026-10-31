@@ -20,6 +20,7 @@
 #ifdef FOR_DL
 #include "gcd.h" // gcd_uint64
 #endif
+#include "merge_heap.h"
 #include "merge_replay_matrix.h"
 #include "sparse.h"
 #include "typedefs.h"
@@ -34,10 +35,115 @@ void fprintRow(FILE * file, typerow_t * row)
     for (i = 1; i <= row[0].id; i++)
         fprintf(file, " %" PRid "(%" PRId32 ")", row[i].id, row[i].e);
 #else
-    fprintf(file, "[%" PRid "]", rowCell(row, 0));
+    fprintf(file, "[%" PRid "]", (index_t) rowCell(row, 0));
     for (i = 1; i <= rowCell(row, 0); i++)
-        fprintf(file, " %" PRid "", rowCell(row, i));
+        fprintf(file, " %" PRid "", (index_t) rowCell(row, i));
 #endif
+}
+
+static multirel_t
+singleton_rel(index_t i)
+{
+    multirel_t r;
+    r.ind_row = i;
+#ifdef FOR_DL
+    r.e = 1;
+#endif
+    return r;
+}
+
+/* heap cells that hold n relations after the count cell */
+static size_t relset_cells(uint32_t n)
+{
+    return 1 + (n * sizeof(multirel_t) + sizeof(typerow_t) - 1) / sizeof(typerow_t);
+}
+
+static relset_t relset_alloc(index_t i, uint32_t n)
+{
+    relset_t r = heap_alloc_relset(i, relset_cells(n));
+    rowCell(r, 1) = n;
+    return r;
+}
+
+relset_t relset_singleton(index_t i)
+{
+    relset_t r = relset_alloc(i, 1);
+    relset_rels(r)[0] = singleton_rel(i);
+    return r;
+}
+
+/* view of a relation set; a NULL set holds the row alone, in *one */
+struct relset_view { uint32_t n; multirel_t * rels; };
+
+static struct relset_view view(relset_t r, multirel_t * one)
+{
+    if (r == NULL)
+        return (struct relset_view) { 1, one };
+    return (struct relset_view) { relset_n(r), relset_rels(r) };
+}
+
+/* The sum is built in this per-thread buffer, then copied to a heap row of
+   its exact size. */
+static __thread multirel_t * sum_buf = NULL;
+static __thread uint32_t sum_buf_n = 0;
+
+void addRelsets(index_data_t index_data, index_t i1, index_t i2,
+                MAYBE_UNUSED int32_t e1, MAYBE_UNUSED int32_t e2)
+{
+    uint32_t k = 0, k1 = 0, k2 = 0;
+    multirel_t one1 = singleton_rel(i1);
+    multirel_t one2 = singleton_rel(i2);
+    struct relset_view r1 = view(index_data[i1], &one1);
+    struct relset_view r2 = view(index_data[i2], &one2);
+
+    if (sum_buf_n < r1.n + r2.n) {
+        sum_buf_n = r1.n + r2.n;
+        CHECKED_REALLOC(sum_buf, sum_buf_n, multirel_t);
+    }
+    multirel_t * tmp = sum_buf;
+    while ((k1 < r1.n) && (k2 < r2.n)) {
+        if (r1.rels[k1].ind_row < r2.rels[k2].ind_row) {
+#ifdef FOR_DL
+            tmp[k].e = e2 * r1.rels[k1].e;
+#endif
+            tmp[k++].ind_row = r1.rels[k1++].ind_row;
+        } else if (r1.rels[k1].ind_row > r2.rels[k2].ind_row) {
+#ifdef FOR_DL
+            tmp[k].e = e1 * r2.rels[k2].e;
+#endif
+            tmp[k++].ind_row = r2.rels[k2++].ind_row;
+        } else {
+#ifdef FOR_DL
+            int32_t e = e2 * r1.rels[k1].e + e1 * r2.rels[k2].e;
+            if (e != 0) {
+                tmp[k].ind_row = r1.rels[k1].ind_row;
+                tmp[k++].e = e;
+            }
+#endif
+            k1++;
+            k2++;
+        }
+    }
+    // finish with k1 and k2
+    for (; k1 < r1.n;) {
+#ifdef FOR_DL
+        tmp[k].e = e2 * r1.rels[k1].e;
+#endif
+        tmp[k++].ind_row = r1.rels[k1++].ind_row;
+    }
+    for (; k2 < r2.n;) {
+#ifdef FOR_DL
+        tmp[k].e = e1 * r2.rels[k2].e;
+#endif
+        tmp[k++].ind_row = r2.rels[k2++].ind_row;
+    }
+    ASSERT(k <= r1.n + r2.n);
+
+    relset_t sum = relset_alloc(i1, k);
+    memcpy(relset_rels(sum), tmp, k * sizeof(multirel_t));
+    if (index_data[i1] != NULL)
+        heap_destroy_row(index_data[i1]);
+    index_data[i1] = sum;
 }
 
 // i1 += i2
@@ -60,6 +166,13 @@ void addRowsUpdateIndex(typerow_t ** rows, index_data_t index_data, index_t i1,
     typerow_t * tmp;
 
     ASSERT(i1 != i2);
+
+#ifndef FOR_DL
+    if (rows == NULL) {
+        addRelsets(index_data, i1, i2, 0, 0);
+        return;
+    }
+#endif
 
     ASSERT(rows[i1] != NULL);
     ASSERT(rows[i2] != NULL);
@@ -102,7 +215,7 @@ void addRowsUpdateIndex(typerow_t ** rows, index_data_t index_data, index_t i1,
 #endif
 
     len = 1 + rowLength(rows, i1) + rowLength(rows, i2);
-    tmp = (typerow_t *)malloc(len * sizeof(typerow_t));
+    tmp = heap_alloc_row(i1, len - 1);
 
     // loop while everybody is here
     k = k1 = k2 = 1;
@@ -136,81 +249,21 @@ void addRowsUpdateIndex(typerow_t ** rows, index_data_t index_data, index_t i1,
         tmp[k++] = rowFullCell(rows[i2], k2);
     ASSERT(k <= len);
 
-    setRawCell(tmp, 0, k - 1, 1);
-
-    // copy back
-#if defined(FOR_DL) || SIZEOF_INDEX == 4 || SIZEOF_INDEX == 8
-    free(rows[i1]);
-    if (k == len)
-        rows[i1] = tmp;
-    else
-        rows[i1] = reallocRow(tmp, k);
-#else
-    if (k - 1 != rowLength(rows, i1))
-        rows[i1] = reallocRow(rows[i1], k);
-    compressRow(rows[i1], tmp, k - 1);
-    free(tmp);
-#endif
+    heap_resize_last_row(tmp, k - 1);
+    heap_destroy_row(rows[i1]);
+    rows[i1] = tmp;
 #ifdef FOR_DL
     /* restore old coeff for row i2 */
     for (l = 1; l <= rowLength(rows, i2); l++)
         rows[i2][l].e /= e1;
 #endif
 
-    // Now, deal with the index_data.
-    if (index_data != NULL) {
-        k = k1 = k2 = 0; // in index_data_t, we count from 0...
-
-        relset_t r1 = index_data[i1];
-        relset_t r2 = index_data[i2];
-        relset_t tmp;
-        tmp.n = 0;
-        tmp.rels = (multirel_t *)malloc((r1.n + r2.n) * sizeof(multirel_t));
-        while ((k1 < r1.n) && (k2 < r2.n)) {
-            if (r1.rels[k1].ind_row < r2.rels[k2].ind_row) {
+    if (index_data != NULL)
 #ifdef FOR_DL
-                tmp.rels[k].e = e2 * r1.rels[k1].e;
+        addRelsets(index_data, i1, i2, e1, e2);
+#else
+        addRelsets(index_data, i1, i2, 0, 0);
 #endif
-                tmp.rels[k++].ind_row = r1.rels[k1++].ind_row;
-            } else if (r1.rels[k1].ind_row > r2.rels[k2].ind_row) {
-#ifdef FOR_DL
-                tmp.rels[k].e = e1 * r2.rels[k2].e;
-#endif
-                tmp.rels[k++].ind_row = r2.rels[k2++].ind_row;
-            } else {
-#ifdef FOR_DL
-                int32_t e = e2 * r1.rels[k1].e + e1 * r2.rels[k2].e;
-                if (e != 0) {
-                    tmp.rels[k].ind_row = r1.rels[k1].ind_row;
-                    tmp.rels[k++].e = e;
-                }
-#endif
-                k1++;
-                k2++;
-            }
-        }
-        // finish with k1 and k2
-        for (; k1 < r1.n;) {
-#ifdef FOR_DL
-            tmp.rels[k].e = e2 * r1.rels[k1].e;
-#endif
-            tmp.rels[k++].ind_row = r1.rels[k1++].ind_row;
-        }
-        for (; k2 < r2.n;) {
-#ifdef FOR_DL
-            tmp.rels[k].e = e1 * r2.rels[k2].e;
-#endif
-            tmp.rels[k++].ind_row = r2.rels[k2++].ind_row;
-        }
-        ASSERT(k <= r1.n + r2.n);
-        tmp.n = k;
-        if (k < r1.n + r2.n) /* reallocate to save memory */
-            CHECKED_REALLOC(tmp.rels, k, multirel_t);
-
-        // copy back to i1
-        free(index_data[i1].rels);
-        index_data[i1] = tmp;
-    }
 
 #if DEBUG >= 1
     fprintf(stderr, "row[%d]+row[%d] =", i1, i2);
@@ -255,35 +308,6 @@ int parse_hisfile_line(index_signed_t * ind, char const * t, index_t * j)
     }
 
     return ni;
-}
-
-/* allocates memory for a row of n elements (including the length which is
-   element 0) */
-typerow_t * mallocRow(uint32_t n)
-{
-    typerow_t * row;
-
-#if defined(FOR_DL) || SIZEOF_INDEX == 4 || SIZEOF_INDEX == 8
-    row = (typerow_t *)malloc(n * sizeof(typerow_t));
-#else
-    /* for 5 <= SIZEOF_INDEX <= 7, we need n*SIZEOF_INDEX bytes */
-    row = (typerow_t *)malloc(n * SIZEOF_INDEX);
-#endif
-    FATAL_ERROR_CHECK(row == NULL, "Cannot allocate memory");
-    return row;
-}
-
-/* reallocates memory for a row of n elements */
-typerow_t * reallocRow(typerow_t * row, uint32_t n)
-{
-#if defined(FOR_DL) || SIZEOF_INDEX == 4 || SIZEOF_INDEX == 8
-    CHECKED_REALLOC(row, n, typerow_t);
-#else
-    /* for 5 <= SIZEOF_INDEX <= 7, we need n*SIZEOF_INDEX bytes */
-    row = (typerow_t *)realloc(row, n * SIZEOF_INDEX);
-#endif
-    FATAL_ERROR_CHECK(row == NULL, "Cannot allocate memory");
-    return row;
 }
 
 /* experimental code for factorization with 5 <= SIZEOF_INDEX <= 7 */

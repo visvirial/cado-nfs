@@ -680,8 +680,10 @@ Using bwc.pl
 
     bwc.pl is a perl script which tries to be intelligent, and runs the
     programs above in the correct order. It does cope with multi-node MPI
-    environment, but does not yet handle several independent sequences
-    (except for interleaved jobs).
+    environment. The krylov_jobs parameter makes it run several
+    independent sequences at the same time, each on its own group of
+    hosts. The mksol_jobs and gather_jobs parameters do the same for
+    the solution ranges of mksol and gather.
 
     The spirit is that all parameters listed above are to be given to
     bwc.pl ; the _first_ provided argument must be either the basename of
@@ -800,10 +802,11 @@ Using bwc.pl with MPI (updated 20160201)
     Note: see also cpu binding below.
 
 If you intend to only use one sequence (n == 64), it's not very
-difficult. If you want to do several sequences, you have to split the
-:complete meta-step into several, and run them at the appropriate
-moments. This also works, but requires you to know a bit what you're
-doing.
+difficult. If you want to do several sequences, either pass
+krylov_jobs=<s> so that the :complete meta-step runs s sequences at the
+same time on s equal groups of hosts, or split the :complete meta-step
+into several, and run them at the appropriate moments. The latter also
+works, but requires you to know a bit what you're doing.
 
 Cpu binding (updated 20191106)
 ==============================

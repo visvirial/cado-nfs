@@ -67,3 +67,9 @@ cado_define_test(test_sqrt_c30_dep01
     FIXTURES_REQUIRED
     test_sqrt_c30.ab
 )
+
+cado_define_test(test_par_mul
+    SOURCES test_par_mul.cpp ${CADO_NFS_SOURCE_DIR}/sqrt/par_mul.cpp
+    LIBRARIES utils tests ${CMAKE_DL_LIBS}
+    ENVIRONMENT PAR_MUL_DEPTH=12 OMP_NUM_THREADS=64)
+mark_targets_as_openmp(test_par_mul)

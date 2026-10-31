@@ -7,6 +7,10 @@ from cadofactor.database.base import pending_transactions
 from cadofactor.database.base import TransactionAborted
 from cadofactor.database.base import logger
 
+# Seconds that sqlite itself waits for a lock before it reports
+# "database is locked".
+BUSY_TIMEOUT = 30.0
+
 
 class DB_SQLite(DB_base):
     class CursorWrapper(CursorWrapperBase):
@@ -49,9 +53,16 @@ class DB_SQLite(DB_base):
                 ac['autocommit'] = sqlite3.LEGACY_TRANSACTION_CONTROL
             super().__init__(path, *args,
                              # isolation_level=None,
+                             timeout=BUSY_TIMEOUT,
                              **ac,
                              **kwargs)
             self.pending = pending_transactions.new_db(self)
+            # WAL lets readers (e.g. an online backup) and the single
+            # writer proceed concurrently. Without it, a reader holds
+            # the writer off for the whole duration of its read.
+            mode, = self.execute("PRAGMA journal_mode=WAL").fetchone()
+            assert mode in ("wal", "memory"), mode
+            self.execute("PRAGMA synchronous=NORMAL")
 
     def connect(self):
         c = self.ConnectionWrapper(self.path)

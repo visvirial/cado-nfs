@@ -414,11 +414,16 @@ struct pi_file_handle {
         if (f) close();
     }
     int close();
-    size_t write(void * buf, size_t size, size_t sizeondisk);
     size_t read(void * buf, size_t size, size_t sizeondisk);
-    size_t write_chunk(void * buf, size_t size, size_t sizeondisk, size_t chunksize, size_t spos, size_t epos);
     size_t read_chunk(void * buf, size_t size, size_t sizeondisk, size_t chunksize, size_t spos, size_t epos);
 };
+
+/* the gather of a chunked file to the leader, in two halves: the pieces
+ * of the threads of the job, owned by thread 0 (empty elsewhere), and
+ * the exchange over comm that thread 0 of each job runs, in any thread
+ * of its own, to get the outsize bytes of the file at the leader */
+std::vector<char> pi_gather_stage(parallelizing_info & pi, int inner, void * buf, size_t size, size_t chunksize, size_t spos, size_t epos);
+std::vector<char> pi_gather_exchange(parallelizing_info & pi, int inner, MPI_Comm comm, std::vector<char> const & staged, size_t outsize);
 /* }}} */
 
 

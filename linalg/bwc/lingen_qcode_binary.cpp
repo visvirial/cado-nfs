@@ -639,21 +639,24 @@ static bool generator_found(unsigned int t, bpack_view<uint64_t> E_t, std::vecto
         }
     }
 
-    if (!newluck) return false;
+    return newluck && luck_report(t, lucky, n, luck_mini);
+}
 
+bool luck_report(unsigned int t, std::vector<int> const & lucky, unsigned int n, unsigned int luck_mini)
+{
     /* If newluck == n, then we probably have a generator. We add an
      * extra guarantee. newluck==n, for a total of k iterations in a
      * row, means m*n*k coefficients cancelling magically. We would
      * like this to be impossible by mere chance. Thus we want n*k >
      * luck_mini, which can easily be checked */
 
+    unsigned int newluck = 0;
     unsigned int luck_sure = 0;
-    int happy = 0;
 
     printf("t=%d, canceled columns:", t);
     unsigned int last = UINT_MAX;
     unsigned int afterlast = UINT_MAX;
-    for(unsigned int j = 0 ; j < b ; j++) {
+    for(unsigned int j = 0 ; j < lucky.size() ; j++) {
         if (lucky[j] > 0) {
             if (j == afterlast) {
                 afterlast++;
@@ -668,6 +671,7 @@ static bool generator_found(unsigned int t, bpack_view<uint64_t> E_t, std::vecto
                 last = j;
                 afterlast = j + 1;
             }
+            newluck++;
             luck_sure += ((unsigned int) lucky[j]) >= luck_mini;
         }
     }
@@ -679,12 +683,9 @@ static bool generator_found(unsigned int t, bpack_view<uint64_t> E_t, std::vecto
         }
     }
 
-    if (newluck == n && luck_sure == n) {
-        if (!happy) {
-            printf(", complete generator found, for sure");
-        }
-        happy = 1;
-    }
+    bool const happy = newluck == n && luck_sure == n;
+    if (happy)
+        printf(", complete generator found, for sure");
     printf(".\n");
 
     return happy;

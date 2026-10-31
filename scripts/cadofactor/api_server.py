@@ -81,6 +81,15 @@ swagger_template = {
 HAVE_SSL = 'ssl' in sys.modules
 
 
+class TimeoutWSGIRequestHandler(serving.WSGIRequestHandler):
+    # Bounds each read and write on a connection. A client that
+    # connects and then goes silent releases its server thread after
+    # this delay. The value matches the client's NETWORK_TIMEOUT
+    # default, so the server never aborts a transfer the client
+    # still waits for.
+    timeout = 300
+
+
 class ApiServer(flask.Flask):
     """
     This is the cado-nfs api server. Its job is only to handle
@@ -100,6 +109,7 @@ class ApiServer(flask.Flask):
                  # scriptdir=None,
                  only_registered=True,
                  cafile=None,
+                 alternate_names=(),
                  whitelist=None,
                  timeout_hint=None,
                  # linger_before_quit=False
@@ -133,7 +143,10 @@ class ApiServer(flask.Flask):
         a blanket access to all files is offered, which is probably unwise.
 
         TLS is used if cafile is given, in which case an ad hoc certificate
-        is written to this file name.
+        is written to this file name. The certificate names the addresses
+        of this server, plus the names in alternate_names. Give the public
+        name here if the clients reach the server through a reverse proxy
+        or a tunnel, because the clients check the name that they dial.
         """
 
         self.name = "API server"
@@ -177,7 +190,7 @@ recent than 3.1.3) fixes this.
         if self.cafile is not None:
             if 'ssl' not in sys.modules:
                 raise RuntimeError("python ssl module is missing")
-            SAN = get_server_alternate_names(serveraddress)
+            SAN = get_server_alternate_names(serveraddress, alternate_names)
             self._ssl_context = create_certificate(self.cafile,
                                                    self.address,
                                                    SAN)
@@ -306,6 +319,14 @@ recent than 3.1.3) fixes this.
                                                   port=port,
                                                   app=self.application,
                                                   **kwargs)
+                if 'ssl_context' in kwargs:
+                    # accept() runs the TLS handshake inside the
+                    # accept loop, so one client that connects and
+                    # sends nothing blocks every other client. This
+                    # defers the handshake to the first read, which
+                    # runs in the per-request thread under the
+                    # handler timeout.
+                    self.server.socket.do_handshake_on_connect = False
                 self.port = self.server.socket.getsockname()[1]
 
             def load_config(self):
@@ -334,6 +355,7 @@ recent than 3.1.3) fixes this.
 
         if self._ssl_context is not None:
             options['ssl_context'] = self._ssl_context
+            options['request_handler'] = TimeoutWSGIRequestHandler
 
         self._run_object = Foo(self.address, serverport, self, **options)
         self._run_args = []
@@ -447,7 +469,7 @@ recent than 3.1.3) fixes this.
             "description": e.description,
         })
         response.content_type = "application/json"
-        return response, 404
+        return response
 
     def api_limit_remote_addr(self):
         """
@@ -590,7 +612,31 @@ recent than 3.1.3) fixes this.
 
         return flask.json.jsonify(d), 200
 
+    @staticmethod
+    def _same_content(path, stream):
+        with open(path, 'rb') as existing:
+            while True:
+                chunk = existing.read(65536)
+                if chunk != stream.read(65536):
+                    return False
+                if not chunk:
+                    return True
+
     def api_upload_file(self):
+        """
+        Receives the result files of a workunit.
+        ---
+        responses:
+          200:
+            description: The files were stored, or (message "upload
+                         already received") every file had already
+                         been stored with identical content by an
+                         earlier upload whose answer the client missed.
+                         Either way the client is done with this upload.
+          409:
+            description: A file already exists on the server with
+                         different content. Retrying cannot help.
+        """
         clientid = flask.request.form.get('clientid')
         wuid = flask.request.form.get('WUid')
         errorcode = flask.request.form.get('errorcode')
@@ -605,6 +651,7 @@ recent than 3.1.3) fixes this.
         fileinfo = json.loads(flask.request.form.get('fileinfo', "{}"))
 
         uploaded_files = []
+        duplicates = 0
         for fkey, f in flask.request.files.items():
             filename = secure_filename(f.filename)
             path = os.path.join(self.get_upload_folder(), filename)
@@ -616,11 +663,18 @@ recent than 3.1.3) fixes this.
                                   json.dumps(fileinfo, indent=4))
                 flask.abort(400, f"missing fileinfo for file {filename}")
 
-            if os.path.isfile(path):
+            if not os.path.isfile(path):
+                f.save(path)
+            elif self._same_content(path, f.stream):
+                self.logger.info(f"{clientid} re-sent {path}"
+                                 f" for {wuid} with identical content")
+                duplicates += 1
+            else:
                 self.logger.error(f"denied request from {clientid}"
-                                  f" to overwrite existing file {path}")
-                flask.abort(403, "File already exists")
-            f.save(path)
+                                  f" to overwrite existing file {path}"
+                                  " with different content")
+                flask.abort(409, "File already exists"
+                                 " with different content")
             tup = [filename, path, fi["key"]]
             c = fi.get('command')
             if c is not None:
@@ -641,7 +695,10 @@ recent than 3.1.3) fixes this.
             self.logger.debug(f'Workunit {wuid} completed,'
                               f' uploaded files {uploaded_files}')
 
-        resp = {'message': 'upload completed'}
+        if uploaded_files and duplicates == len(uploaded_files):
+            resp = {'message': 'upload already received'}
+        else:
+            resp = {'message': 'upload completed'}
 
         return flask.json.jsonify(resp), 200
 

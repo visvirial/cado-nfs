@@ -221,7 +221,8 @@ class DictDbDirectAccess(MutableMapping):
         """ Delete a key from the dictionary """
         self._conn.harness_transaction(EXCLUSIVE,
                                        self._table.delete,
-                                       eq=dict(kkey=key))
+                                       eq=dict(kkey=key),
+                                       commit=commit)
 
     def setdefault(self, key, default=None, commit=True):
         ''' Setdefault function that allows a mapping as input
@@ -243,7 +244,7 @@ class DictDbDirectAccess(MutableMapping):
         def t(cursor):
             for (key, value) in other.items():
                 self.__setitem_nocommit(cursor, key, value)
-        self._conn.harness_transaction(EXCLUSIVE, t)
+        self._conn.harness_transaction(EXCLUSIVE, t, commit=commit)
 
     def clear(self, args=None, commit=True):
         """ Overridden clear that allows removing several keys atomically """
@@ -254,7 +255,7 @@ class DictDbDirectAccess(MutableMapping):
                 for key in args:
                     self._table.delete(cursor, eq=dict(kkey=key))
 
-        self._conn.harness_transaction(EXCLUSIVE, t)
+        self._conn.harness_transaction(EXCLUSIVE, t, commit=commit)
 
 
 class DictDbCachedAccess(DictDbDirectAccess):
@@ -297,7 +298,7 @@ class DictDbCachedAccess(DictDbDirectAccess):
         self._data[key] = value
 
     def __delitem__(self, key, commit=True):
-        super().__delitem__(key)
+        super().__delitem__(key, commit=commit)
         # Update the in-memory dict
         del self._data[key]
 

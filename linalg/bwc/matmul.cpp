@@ -24,6 +24,7 @@
 
 #include "macros.h"       // for FATAL_ERROR_CHECK, iceildiv
 #include "matmul.hpp"
+#include "random_matrix.hpp"
 #include "verbose.hpp"
 #include "portability.h" // asprintf // IWYU pragma: keep
 #include "params.hpp"
@@ -178,6 +179,10 @@ std::shared_ptr<matmul_interface> matmul_interface::create(arith_generic * x,
         // NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
         auto ctor_getter = (matmul_interface_ctor_t *(*)()) dlsym(handle, "matmul_solib_reach_ctor");
         ctor = (*ctor_getter)();
+        random_matrix_stream =
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
+            (random_matrix_stream_fn) dlsym(handle,
+                    "random_matrix_stream_solib");
         // stem.solib_handle.reset(handle);
         if (ctor == nullptr) {
             fmt::print(stderr, "loading {}: {}\n", solib, dlerror());

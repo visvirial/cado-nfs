@@ -42,6 +42,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
 #include <cstdint>
 #include <cstring>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
 #endif
 #include "gzip.h"
 #include "macros.h"
+#include "matrix_output.hpp"
 #include "memory.h"
 #include "memusage.h"
 #include "merge_bookkeeping.h"
@@ -68,12 +70,20 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA.
 #include "read_purgedfile_in_parallel.hpp"
 #include "runtime_numeric_cast.hpp"
 #include "sparse.h"
+#include "staged_rows.hpp"
 #include "timing.h"
 #include "typedefs.h"
 #include "verbose.hpp"
 
 #include "utils_cxx.hpp"
 #include "cado_main.hpp"
+
+/* State for the direct output of the matrix and the index (-matrix and
+ * -index): the relation set of each row, and (factorization only) the
+ * entries of each row in the buried columns, one bit per column. Both are
+ * NULL when merge writes only the history file. */
+static index_data_t relsets = NULL;
+static uint64_t * buried = NULL;
 
 #ifdef DEBUG
 static void
@@ -143,11 +153,20 @@ static void
 declare_usage(cxx_param_list & pl)
 {
   pl.declare_usage("out", "output history file");
+  pl.declare_usage("matrix", "output matrix file (as -out of replay);"
+                             " needs skip <= 64");
+  pl.declare_usage("index", "output index file (as -index of replay)");
+#ifdef FOR_DL
+  pl.declare_usage("ideals", "output ideals file (as -ideals of replay)");
+#endif
   pl.declare_usage("target_density", "stop when the average row density exceeds this value"
                             " (default " CADO_STRINGIZE(DEFAULT_MERGE_TARGET_DENSITY) ")");
   pl.declare_usage("target_excess", "if given and excess is larger at "
                             "the end of merge, rows will be deleted to reach "
                             "this value (default: no value)");
+  pl.declare_usage("incr", "increment of the merge cost bound between passes;"
+                           " smaller gives a smaller matrix and a longer merge"
+                           " (default " CADO_STRINGIZE(CBOUND_INCR_DEFAULT) ")");
   pl.declare_usage("path_antebuffer", "path to antebuffer program");
   pl.declare_usage("t", "number of threads");
   pl.declare_usage("v", "verbose mode");
@@ -178,27 +197,6 @@ void check_invariant(filter_matrix_t *mat)
     ASSERT_ALWAYS(mat->tot_weight == tot_weight2);
 }
 
-#ifndef FOR_DL
-/* sort row[0], row[1], ..., row[n-1] in non-decreasing order */
-static void
-sort_relation (index_t *row, unsigned int n)
-{
-  unsigned int i, j;
-
-  for (i = 1; i < n; i++)
-    {
-      index_t t = row[i];
-      if (t < row[i-1])
-        {
-          row[i] = row[i-1];
-          for (j = i - 1; j > 0 && t < row[j-1]; j--)
-            row[j] = row[j-1];
-          row[j] = t;
-        }
-    }
-}
-#endif
-
 struct purged_file_reader {
     /* mat: not owned. this structure stinks, but it's for later.
      */
@@ -218,66 +216,72 @@ struct purged_file_reader {
         pl.parse("skip", skip);
     }
 
+#ifdef FOR_DL
     template<typename relation_type>
     void insert_rel_into_table(relation_type & rel)
     {
         unsigned int j = 0;
         typerow_t buf[UMAX(weight_t)]; /* rel->nb is of type weight_t */
 
-        for (auto & pe : rel.primes) {
-            index_t h = pe.h;
-            /* we no longer touch mat->wt, mat->rem_ncols, and mat->tot_weight
-             * from here ; see compute_weights
-             */
-            if (h < mat->skip)
-                continue; /* we skip (bury) the first 'skip' indices */
-#ifdef FOR_DL
-            exponent_t e = pe.e;
-            /* For factorization, there should not be any multiplicity here.
-               For DL we do not want to count multiplicity in mat->wt */
-            buf[++j] = (ideal_merge_t) {.id = h, .e = e};
-#else
-            ASSERT(pe.e == 1);
-            buf[++j] = h;
-#endif
-        }
-
-#ifdef FOR_DL
+        for (auto & pe : rel.primes)
+            buf[++j] = (ideal_merge_t) {.id = pe.h, .e = pe.e};
         buf[0].id = j;
-#else
-        buf[0] = j;
-#endif
 
         /* sort indices to ease row merges */
-#ifndef FOR_DL
-        sort_relation (&(buf[1]), j);
-#else
         qsort (&(buf[1]), j, sizeof(typerow_t), cmp_typerow_t);
-#endif
 
         mat->rows[rel.num] = heap_alloc_row(rel.num, j);
         compressRow (mat->rows[rel.num], buf, j);  /* sparse.c, simple copy loop... */
     }
 
-    /* first check if purgedname is seekable. if yes, we can do multithread
-     * I/O */
-    int can_go_parallel() const
+    void build_rows() {}
+#else
+    staged_rows staged;
+
+    template<typename relation_type>
+    void insert_rel_into_table(relation_type & rel)
     {
-        FILE * f = fopen_maybe_compressed(purgedname.c_str(), "r");
-        ASSERT_ALWAYS(f != NULL);
-        int t = fseek(f, 0, SEEK_END) == 0;
-        fclose_maybe_compressed (f, purgedname.c_str());
-        return t;
+        unsigned int j = 0;
+        index_t buf[UMAX(weight_t)]; /* rel->nb is of type weight_t */
+
+        for (auto & pe : rel.primes) {
+            index_t h = pe.h;
+            /* we no longer touch mat->wt, mat->rem_ncols, and mat->tot_weight
+             * from here ; see compute_weights
+             */
+            if (h < mat->skip) {
+                /* we skip (bury) the first 'skip' indices */
+                if (buried) buried[rel.num] ^= (uint64_t) 1 << h;
+                continue;
+            }
+            ASSERT(pe.e == 1);
+            buf[j++] = h;
+        }
+        std::sort(buf, buf + j);
+        staged.add(rel.num, buf, j);
+    }
+
+    void build_rows() {
+        mat->ncols = ::build_rows(staged, mat->ncols, mat->rows);
+        printf("%" PRIu64 " columns appear in the matrix\n", mat->ncols);
+        /* merge_rows outputs column j as the typerow_t mat->skip + j */
+        ASSERT_ALWAYS(mat->ncols + mat->skip < UINT32_MAX);
+    }
+#endif
+
+    size_t read_in_parallel() {
+#ifdef FOR_DL
+        return read_purgedfile_in_parallel(mat, purgedname.c_str(), buried);
+#else
+        return read_purgedfile_in_parallel(purgedname.c_str(), mat->skip,
+                std::numeric_limits<index_t>::max(), buried, staged);
+#endif
     }
 
     void read() {
         size_t nread;
-        if (can_go_parallel()) {
-            /* read_purgedfile_in_parallel uses a different parsing
-             * mechanism :-(
-             * this should obviously be refactored.
-             */
-            nread = read_purgedfile_in_parallel(mat, purgedname);
+        if (purgedfile_is_seekable(purgedname.c_str())) {
+            nread = read_in_parallel();
         } else {
             using relation_type =
                 cado::relation_building_blocks::primes_block<
@@ -289,6 +293,7 @@ struct purged_file_reader {
         }
         ASSERT_ALWAYS(nread == mat->nrows);
         mat->rem_nrows = nread;
+        build_rows();
     }
 };
 
@@ -779,6 +784,8 @@ add_row (filter_matrix_t *mat, index_t i1, index_t i2, index_t j MAYBE_UNUSED)
     heap_resize_last_row(sum, t);
     heap_destroy_row(mat->rows[i1]);
     mat->rows[i1] = sum;
+    if (buried) buried[i1] ^= buried[i2];
+    if (relsets) addRelsets(relsets, i1, i2, 0, 0);
 #else
 #ifdef CANCEL
 #pragma omp atomic update
@@ -879,6 +886,7 @@ add_row (filter_matrix_t *mat, index_t i1, index_t i2, index_t j MAYBE_UNUSED)
     heap_resize_last_row(sum, t);
     heap_destroy_row(mat->rows[i1]);
     mat->rows[i1] = sum;
+    if (relsets) addRelsets(relsets, i1, i2, e1, e2);
 #endif
 }
 
@@ -891,6 +899,116 @@ remove_row (filter_matrix_t *mat, index_t i)
     decrease_weight (mat, rowCell(mat->rows[i], k));
   heap_destroy_row(mat->rows[i]);
   mat->rows[i] = NULL;
+  if (relsets && relsets[i]) {
+    heap_destroy_row(relsets[i]);
+    relsets[i] = NULL;
+  }
+}
+
+/* Row source for the matrix output: the rows of merge, with the buried
+ * columns first. Column c of a buried entry has index c, column j of a
+ * matrix entry has index mat->skip + j. */
+struct merge_rows {
+    filter_matrix_t * mat;
+    bool empty(index_t i) const { return mat->rows[i] == NULL; }
+    template<typename F>
+    void for_each(index_t i, F && f) const {
+#ifndef FOR_DL
+        for (uint64_t m = buried ? buried[i] : 0; m; m &= m - 1)
+            f((typerow_t) cado_ctzll(m));
+        for (index_t l = 1; l <= matLengthRow(mat, i); l++)
+            f((typerow_t) (mat->rows[i][l] + mat->skip));
+#else
+        for (index_t l = 1; l <= matLengthRow(mat, i); l++)
+            f(mat->rows[i][l]);
+#endif
+    }
+};
+
+/* Moves the remaining rows and their relation sets to the front, in the
+ * order of their indices. Returns the number of remaining rows. */
+static index_t
+compact_rows (filter_matrix_t *mat)
+{
+    index_t n = 0;
+    for (index_t i = 0; i < mat->nrows; i++) {
+        if (mat->rows[i] == NULL)
+            continue;
+        mat->rows[n] = mat->rows[i];
+        if (buried) buried[n] = buried[i];
+        relsets[n] = relsets[i] ? relsets[i] : relset_singleton(i);
+        n++;
+    }
+    return n;
+}
+
+/* Memory that the column-weight count of write_matrix_and_index() can use
+ * for its per-thread counter arrays. A larger budget gives more counting
+ * threads, a smaller budget gives a lower peak memory. */
+#define COLUMN_COUNT_MEMORY_BUDGET ((size_t) 128 << 30)
+
+/* Writes the index file and the matrix files of the final matrix, as
+ * replay does from the history file. */
+static void
+write_matrix_and_index (filter_matrix_t *mat, const char *matrixname,
+                        const char *indexname, const char *idealsfilename)
+{
+    double cpu = seconds (), wct = wct_seconds ();
+    index_t small_nrows = compact_rows (mat);
+    ASSERT_ALWAYS(small_nrows == mat->rem_nrows);
+    index_t skip = mat->skip;
+    index_t ncols = skip + mat->ncols;
+    merge_rows rows { mat };
+
+    /* Weight of each column, buried columns included. Each counting thread
+     * has its own counter array of 4*ncols bytes, so the count uses more
+     * memory than the matrix itself if all threads count a large matrix.
+     * The number of counting threads is thus limited to a memory budget.
+     * A column weight is not more than the number of rows, which merge keeps
+     * below 2^32, so 32-bit counters are large enough. */
+    ASSERT_ALWAYS((uint64_t) small_nrows <= UINT32_MAX);
+    size_t const bytes_per_thread = (size_t) ncols * sizeof(uint32_t);
+    size_t const fits = std::max((size_t) 1,
+            COLUMN_COUNT_MEMORY_BUDGET / bytes_per_thread);
+    int const count_threads =
+        (int) std::min((size_t) omp_get_max_threads(), fits);
+    printf ("Counting the weight of %" PRIu64 " columns with %d threads,"
+            " %.1f GB\n", (uint64_t) ncols, count_threads,
+            (double) count_threads * bytes_per_thread * 1e-9);
+    fflush (stdout);
+    std::vector<std::vector<uint32_t>> tweights(count_threads,
+            std::vector<uint32_t>(ncols, 0));
+#pragma omp parallel num_threads(count_threads)
+    {
+        std::vector<uint32_t> & w = tweights[omp_get_thread_num()];
+#pragma omp for schedule(static)
+        for (index_t i = 0; i < small_nrows; i++)
+            rows.for_each(i, [&](typerow_t const & c) { w[cell_col(c)]++; });
+    }
+    index_t * colweight = (index_t *) malloc(ncols * sizeof(index_t));
+    ASSERT_ALWAYS(colweight != NULL);
+    index_t small_ncols = 0;
+#pragma omp parallel for schedule(static) reduction(+:small_ncols)
+    for (index_t j = 0; j < ncols; j++) {
+        colweight[j] = 0;
+        for (std::vector<uint32_t> const & w : tweights)
+            colweight[j] += w[j];
+        small_ncols += colweight[j] > 0;
+    }
+    tweights.clear();
+
+    /* mat->p sends a column of mat to its index in the purged file */
+    renumber (small_ncols, colweight, ncols, mat->p, idealsfilename);
+    writeIndex (indexname, relsets, small_nrows);
+    unsigned long W = flushSparse (matrixname, rows, small_nrows, small_ncols,
+                                   colweight, skip,
+                                   matrix_name_is_binary (matrixname));
+    printf ("Sparse submatrix: nrows=%" PRIu64 " ncols=%" PRIu64
+            " weight=%lu\n", (uint64_t) small_nrows,
+            (uint64_t) (small_ncols - skip), W);
+    free (colweight);
+    print_timings ("write matrix and index:", seconds () - cpu,
+                   wct_seconds () - wct);
 }
 
 #ifdef DEBUG
@@ -1445,6 +1563,14 @@ output_matrix (filter_matrix_t *mat, char *out)
  */
 void sanity_check_matrix_sizes(filter_matrix_t * mat MAYBE_UNUSED)
 {
+#ifndef FOR_DL
+    /* the heap keeps the row number in a typerow_t cell */
+    if (mat->nrows >> 32)
+    {
+        fprintf (stderr, "Error, nrows = %" PRIu64 " larger than 2^32, the 32-bit typerow_t cannot hold the row numbers\n", mat->nrows);
+        exit (EXIT_FAILURE);
+    }
+#endif
 #if (SIZEOF_INDEX == 4)
     if (mat->nrows >> 32)
     {
@@ -1474,7 +1600,6 @@ static int main_(int argc, char const * argv[])
     FILE * history;
 
     int nthreads = 1, cbound_incr;
-    uint32_t skip = DEFAULT_MERGE_SKIP;
     double target_density = DEFAULT_MERGE_TARGET_DENSITY;
     int64_t target_excess = std::numeric_limits<int64_t>::max();
 
@@ -1498,6 +1623,9 @@ static int main_(int argc, char const * argv[])
     fflush(stdout);
 
     const char *outname = pl.lookup_old("out");
+    const char *matrixname = pl.lookup_old("matrix");
+    const char *indexname = pl.lookup_old("index");
+    const char *idealsfilename = pl.lookup_old("ideals");
     const char *path_antebuffer = pl.lookup_old("path_antebuffer");
 
     pl.parse("t", nthreads);
@@ -1520,6 +1648,17 @@ static int main_(int argc, char const * argv[])
 
     if (outname == NULL)
       pl.fail("Error, missing -out command line argument\n");
+    if ((matrixname == NULL) != (indexname == NULL))
+      pl.fail("Error, -matrix and -index must be given together\n");
+#ifdef FOR_DL
+    if (matrixname != NULL && idealsfilename == NULL)
+      pl.fail("Error, -matrix needs -ideals\n");
+    if (pf.skip != 0)
+      pl.fail("Error, skip must be 0 (replay-dl does not bury columns)\n");
+#else
+    if (matrixname != NULL && pf.skip > 64)
+      pl.fail("Error, -matrix needs skip <= 64\n");
+#endif
 
     heap_setup();
     set_antebuffer_path (argv0, path_antebuffer);
@@ -1543,7 +1682,15 @@ static int main_(int argc, char const * argv[])
     sanity_check_matrix_sizes(mat);
 
     /* initialize the matrix structure */
-    initMat (mat, skip);
+    initMat (mat, pf.skip);
+    if (matrixname != NULL) {
+        relsets = (index_data_t) calloc (mat->nrows, sizeof(relset_t));
+        ASSERT_ALWAYS(relsets != NULL);
+#ifndef FOR_DL
+        buried = (uint64_t *) calloc (mat->nrows, sizeof(uint64_t));
+        ASSERT_ALWAYS(buried != NULL);
+#endif
+    }
 
     /* Read all rels and fill-in the mat structure */
     tt = seconds ();
@@ -1641,7 +1788,7 @@ static int main_(int argc, char const * argv[])
 
         if (merge_pass == 2 || mat->cwmax > 2) {
                 double cpu8 = seconds (), wct8 = wct_seconds ();
-                heap_garbage_collection(mat->rows);
+                heap_garbage_collection(mat->rows, relsets);
                  cpu8 = seconds () - cpu8;
                 wct8 = wct_seconds () - wct8;
                 print_timings ("   GC took", cpu8, wct8);
@@ -1813,10 +1960,15 @@ static int main_(int argc, char const * argv[])
             mat->rem_nrows - mat->rem_ncols, mat->tot_weight);
     fflush (stdout);
 
+    if (matrixname != NULL)
+        write_matrix_and_index (mat, matrixname, indexname, idealsfilename);
+
     printf ("Before cleaning memory:\n");
     print_timing_and_memory (stdout, cpu_after_read, wct_after_read);
 
     heap_clear ();
+    free (relsets);
+    free (buried);
 
 #ifdef FOR_DL
     free (mat->p);

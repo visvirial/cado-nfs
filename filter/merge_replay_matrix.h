@@ -8,10 +8,12 @@
 
 // scan-headers: stop here
 
-#ifndef FOR_DL
-typedef index_t typerow_t;
-#else
+#ifdef FOR_DL
 typedef ideal_merge_t typerow_t;
+#else
+/* merge and replay number the columns below 2^32 when they read the
+   purged file (staged_rows.hpp) */
+typedef uint32_t typerow_t;
 #endif
 
 typedef unsigned char col_weight_t;

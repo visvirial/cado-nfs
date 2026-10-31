@@ -584,6 +584,8 @@ struct prep_object {
         std::set<unsigned int> ret0;
         for (unsigned int i = mmt.n0[bw->dir]; i < unpadded; i++)
             ret0.insert(i);
+        mmt_vec_dev_fetch(my);
+        my.pi.wr[my.d].serialize_threads(__FILE__, __LINE__);
         for (unsigned int i = my.i0; i < my.i1 && i < mmt.n0[bw->dir]; i++) {
             if (A->is_zero(A->vec_item(my.v, i - my.i0)))
                 ret0.insert(i);
@@ -603,6 +605,8 @@ struct prep_object {
             std::set<unsigned int> ret1;
             for (unsigned int i = mmt.n0[bw->dir]; i < unpadded; i++)
                 ret1.insert(i);
+            mmt_vec_dev_fetch(my);
+            my.pi.wr[my.d].serialize_threads(__FILE__, __LINE__);
             for (unsigned int i = my.i0; i < my.i1 && i < mmt.n0[bw->dir]; i++) {
                 if (A->is_zero(A->vec_item(my.v, i - my.i0)))
                     ret1.insert(i);

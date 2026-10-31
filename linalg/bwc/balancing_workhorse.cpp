@@ -20,6 +20,7 @@
 #include "fmt/base.h"
 #include "macros.h"
 #include "misc.h"
+#include "omp_proxy.h" // IWYU pragma: keep
 #include "parallelizing_info.hpp"
 #include "params.hpp"
 #include "select_mpi.h"
@@ -147,6 +148,7 @@ struct dispatcher {/*{{{*/
         }
 
         void endpoint_handle_incoming(std::vector<uint32_t> & Q, int from);
+        void handle_fragment(uint32_t * next);
         void receive();
         void enter_pass_one();
         void enter_pass_two();
@@ -559,11 +561,20 @@ void dispatcher::reader_thread_data::read()/*{{{*/
         ASSERT_ALWAYS(rc == 0);
     }
 
-    std::vector<uint32_t> row;
-    std::vector<std::vector<uint32_t>> nodedata(D.nvjobs);
+    /* Rows are read in blocks of about block_words words, and each
+     * block is permuted and queued by all threads: the column lookups
+     * miss the cache, and one thread alone waits on memory latency.
+     */
+    size_t const block_words = 1 << 24;
+    std::vector<uint32_t> block;
+    std::vector<size_t> starts;
     std::vector<std::vector<uint32_t>> queues(pi.m.njobs);
 
-    size_t const queue_size_per_peer = 1 << 16;
+    auto get = [&](uint32_t * p, size_t n) {
+        if (fread(p, sizeof(uint32_t), n, f.get()) == n) return;
+        fmt::print(stderr, "{}: short read\n", mfile);
+        exit(EXIT_FAILURE);
+    };
 
     std::vector<uint64_t> check_vector;
     if (pass_number == 2 && !check_vector_filename.empty())
@@ -585,62 +596,69 @@ void dispatcher::reader_thread_data::read()/*{{{*/
     int active_peers = int(nreaders-1);
 #endif
 
-    for(unsigned int i = row0 ; i < row1 ; i++) {
+    for(unsigned int i0 = row0 ; i0 < row1 ; i0 += starts.size()) {
 #ifndef RELY_ON_MPI_THREAD_MULTIPLE
         watch_incoming_on_reader(active_peers);
 #endif
-        uint32_t const rr = D.fw_rowperm[i - row0];
         // Readers read full lines from the matrix.
-        uint32_t w;
+        block.clear();
+        starts.clear();
+        for(unsigned int i = i0 ; i < row1 && block.size() < block_words ; i++) {
+            uint32_t w;
+            get(&w, 1);
+            ASSERT_ALWAYS(w <= (1 + withcoeffs) * D.fw_colperm.size());
+            size_t const ww = w * (1 + withcoeffs);
+            starts.push_back(block.size());
+            block.push_back(w);
+            block.resize(block.size() + ww);
+            get(block.data() + starts.back() + 1, ww);
+        }
+        z += block.size() * sizeof(uint32_t);
+
+        // Column indices are transformed, and queues to all nodes are
+        // filled. Each thread queues its own rows, then appends to the
+        // shared queues.
+#pragma omp parallel
         {
-            size_t const rc = fread(&w, sizeof(uint32_t), 1, f.get());
-            if (rc != 1) {
-                throw cado::error("{}: short read", mfile);
+            std::vector<std::vector<uint32_t>> nodedata(D.nvjobs);
+            std::vector<std::vector<uint32_t>> my_queues(pi.m.njobs);
+#pragma omp for schedule(static)
+            for(size_t r = 0 ; r < starts.size() ; r++) {
+                unsigned int const i = i0 + r;
+                uint32_t const rr = D.fw_rowperm[i - row0];
+                uint32_t const * row = block.data() + starts[r] + 1;
+                size_t const ww = row[-1] * (1 + withcoeffs);
+                for(size_t j = 0 ; j < ww ; j += 1 + withcoeffs) {
+                    uint32_t const cc = D.fw_colperm[row[j]];
+                    unsigned int const k = cc / D.cols_chunk_big;
+                    ASSERT_ALWAYS(k < nodedata.size());
+                    nodedata[k].push_back(cc);
+                    if (pass_number == 2 && withcoeffs)
+                        nodedata[k].push_back(row[j+1]);
+                    if (pass_number == 2 && !check_vector_filename.empty()) {
+                        uint32_t const q = balancing_pre_shuffle(bal, row[j]);
+                        check_vector[i - row0] ^= DUMMY_VECTOR_COORD_VALUE(q);
+                    }
+                }
+                for(unsigned int k = 0 ; k < nodedata.size() ; k++) {
+                    auto & C = nodedata[k];
+                    if (C.empty()) continue;
+                    auto & Q = my_queues[rr / D.rows_chunk_big * D.nvjobs + k];
+                    Q.push_back(rr);
+                    Q.push_back(C.size());
+                    Q.insert(Q.end(), C.begin(), C.end());
+                    C.clear();
+                }
             }
-        }
-        ASSERT_ALWAYS(w <= (1 + withcoeffs) * D.fw_colperm.size());
-        z += sizeof(uint32_t);
-
-        row.assign(w * (1 + withcoeffs), 0);
-        size_t const ww = w * (1 + withcoeffs);
-        {
-            size_t const rc = fread(row.data(), sizeof(uint32_t), ww, f.get());
-            if (rc != ww) {
-                throw cado::error("{}: short read", mfile);
-            }
-        }
-        z += ww * sizeof(uint32_t);
-        // Column indices are transformed.
-        for(size_t j = 0 ; j < ww ; j += 1 + withcoeffs) {
-            uint32_t const cc = D.fw_colperm[row[j]];
-            unsigned int const k = cc / D.cols_chunk_big;
-            ASSERT_ALWAYS(k < nodedata.size());
-            nodedata[k].push_back(cc);
-            if (pass_number == 2 && withcoeffs)
-                nodedata[k].push_back(row[j+1]);
-            if (pass_number == 2 && !check_vector_filename.empty()) {
-                uint32_t const q = balancing_pre_shuffle(bal, row[j]);
-                check_vector[i - row0] ^= DUMMY_VECTOR_COORD_VALUE(q);
-            }
+#pragma omp critical
+            for(unsigned int g = 0 ; g < queues.size() ; g++)
+                queues[g].insert(queues[g].end(), my_queues[g].begin(), my_queues[g].end());
         }
 
-        // Queues to all nodes are filled
-        for(unsigned int k = 0 ; k < nodedata.size() ; k++) {
-            auto & C = nodedata[k];
-            if (C.empty()) continue;
-
-            unsigned int const group = rr / D.rows_chunk_big * D.nvjobs + k;
-            auto & Q = queues[group];
-            Q.push_back(rr);
-            Q.push_back(C.size());
-            Q.insert(Q.end(), C.begin(), C.end());
-
-            /* very important */
-            C.clear();
-
-            // and sends are posted every once in a while.
-            if (Q.size() >= queue_size_per_peer)
-                post_send(Q, int(group));
+        // and sends are posted once per block.
+        for(unsigned int g = 0 ; g < queues.size() ; g++) {
+            if (!queues[g].empty())
+                post_send(queues[g], int(g));
         }
         if ((z - last_z) > disp_zx && ridx == 0) {
             double dt = wct_seconds()-t0;
@@ -663,11 +681,6 @@ void dispatcher::reader_thread_data::read()/*{{{*/
                 D.pass_number, pi.m.jrank, nreaders,
                 size_disp(z), dt, size_disp(size_t(double(z)/dt)));
         fflush(stdout);
-    }
-    for(unsigned int kk = 0 ; kk < pi.m.njobs ; kk++) {
-        auto & Q = queues[kk];
-        if (!Q.empty())
-            post_send(Q, int(kk));
     }
     for(auto const & Q : queues)
         ASSERT_ALWAYS(Q.empty());
@@ -901,7 +914,7 @@ void dispatcher::endpoint_thread_data::enter_pass_two()
             for(auto & x : Cint) x = 1 + x * 2;
         else
             for(auto & x : Cint) x++;
-        uint32_t const w = integrate(Cint);
+        size_t const w = integrate(Cint);
 
         args_per_thread[i]->p.assign(w, 0);
         /* place markers for the row weights.  */
@@ -941,115 +954,128 @@ void dispatcher::endpoint_thread_data::endpoint_handle_incoming(std::vector<uint
 {
     std::lock_guard<std::mutex> const dummy(incoming_mutex);
 
-    /* We're receiving data from rank "from" */
+    /* We're receiving data from rank "from": row fragments, each one
+     * "rr rs <rs words>". The fragments are placed by all threads; the
+     * writes that two fragments can share are atomic.
+     */
+    std::vector<size_t> starts;
+    for(size_t next = 0 ; next < Q.size() ; next += 2 + Q[next + 1]) {
+        ASSERT_ALWAYS(next + 2 + Q[next + 1] <= Q.size());
+        starts.push_back(next);
+    }
 
-    for(auto next = Q.begin() ; next != Q.end() ; ) {
-        ASSERT_ALWAYS(next < Q.end());
-        uint32_t const rr = *next++;
-        uint32_t rs = *next++;
-        if (D.pass_number == 2 && D.withcoeffs) rs/=2;
+#pragma omp parallel for schedule(static)
+    for(size_t r = 0 ; r < starts.size() ; r++)
+        handle_fragment(Q.data() + starts[r]);
+}/*}}}*/
 
-        unsigned int const n_row_groups = pi.wr[1].ncores;
-        unsigned int const n_col_groups = pi.wr[0].ncores;
-        unsigned int const row_group = (rr / D.rows_chunk_small) % n_row_groups;
-        unsigned int const row_index = rr % D.rows_chunk_small;
+void dispatcher::endpoint_thread_data::handle_fragment(uint32_t * next)/*{{{*/
+{
+    uint32_t const rr = *next++;
+    uint32_t rs = *next++;
+    if (D.pass_number == 2 && D.withcoeffs) rs/=2;
 
-        /* Does it make sense anyway ? In the transposed case we
-         * don't do this...
-         * When transposing, we're receiving fragments of columns,
-         * which begin with a _column_ index. No real point in sorting
-         * what we put in the rows (if done, it must be at the end).
-         */
+    unsigned int const n_row_groups = pi.wr[1].ncores;
+    unsigned int const n_col_groups = pi.wr[0].ncores;
+    unsigned int const row_group = (rr / D.rows_chunk_small) % n_row_groups;
+    unsigned int const row_index = rr % D.rows_chunk_small;
 
-        if (!D.transpose_while_dispatching && D.pass_number == 2) {
-            if (!D.withcoeffs) {
-                std::ranges::sort(next, next + rs);
-            } else {
-                /* ugly */
-                struct cv {
-                    uint32_t c;
-                    int32_t v;
-                    auto operator<=>(cv const & a) const { return c <=> a.c; }
-                    bool operator==(cv const & a) const { return c == a.c; }
-                };
-                // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
-                auto * Q0 = reinterpret_cast<cv *>(&next[0]);
-                auto * Q1 = reinterpret_cast<cv *>(&next[0] + 2*rs);
-                // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
-                std::ranges::sort(Q0, Q1);
-            }
+    /* Does it make sense anyway ? In the transposed case we
+     * don't do this...
+     * When transposing, we're receiving fragments of columns,
+     * which begin with a _column_ index. No real point in sorting
+     * what we put in the rows (if done, it must be at the end).
+     */
+
+    if (!D.transpose_while_dispatching && D.pass_number == 2) {
+        if (!D.withcoeffs) {
+            std::ranges::sort(next, next + rs);
+        } else {
+            /* ugly */
+            struct cv {
+                uint32_t c;
+                int32_t v;
+                auto operator<=>(cv const & a) const { return c <=> a.c; }
+                bool operator==(cv const & a) const { return c == a.c; }
+            };
+            // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
+            auto * Q0 = reinterpret_cast<cv *>(&next[0]);
+            auto * Q1 = reinterpret_cast<cv *>(&next[0] + 2*rs);
+            // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
+            std::ranges::sort(Q0, Q1);
         }
+    }
 
-        if (D.pass_number == 1) {
+    if (D.pass_number == 1) {
+        for(unsigned int j = 0 ; j < rs ; j ++) {
+            uint32_t const cc = *next++;
+            ASSERT_ALWAYS(cc < D.bal.tcols);
+            unsigned int const col_group = (cc / D.cols_chunk_small) % n_col_groups;
+            unsigned int const col_index = cc % D.cols_chunk_small;
+            unsigned int const group = row_group * n_col_groups + col_group;
+            uint32_t & w = thread_row_weights[group][D.transpose_while_dispatching ? col_index : row_index];
+#pragma omp atomic
+            w++;
+            /* on pass 1 we don't do next++ */
+        }
+    } else if (D.pass_number == 2) {
+        if (!D.transpose_while_dispatching) {
+            std::vector<uint32_t *> pointers;
+            pointers.reserve(n_col_groups);
+            for(unsigned int i = 0 ; i < n_col_groups ; i++) {
+                unsigned int const col_group = i;
+                uint32_t const group = row_group * n_col_groups + col_group;
+                uint32_t * matrix = args_per_thread[group]->p.data();
+                size_t const pos0 = thread_row_positions[group][row_index];
+                uint32_t * p0 = matrix + pos0;
+                pointers.push_back(p0);
+            }
             for(unsigned int j = 0 ; j < rs ; j ++) {
-                ASSERT_ALWAYS(next < Q.end());
                 uint32_t const cc = *next++;
-                ASSERT_ALWAYS(cc < D.bal.tcols);
+                unsigned int const col_group = (cc / D.cols_chunk_small) % n_col_groups;
+                uint32_t * & p = pointers[col_group];
+                ASSERT(*p == 0);
+                *p++ = cc % D.cols_chunk_small;
+                if (D.withcoeffs) {
+                    ASSERT(*p == 0);
+                    if (*next == 0)
+                        fprintf(stderr, "zero coefficient in endpoint_handle_incoming()\n");
+                    *p++ = *next++;
+                }
+            }
+            for(unsigned int i = 0 ; i < n_col_groups ; i++) {
+                unsigned int const col_group = i;
+                uint32_t const group = row_group * n_col_groups + col_group;
+                uint32_t * matrix = args_per_thread[group]->p.data();
+                size_t const pos0 = thread_row_positions[group][row_index];
+                uint32_t * p0 = matrix + pos0;
+                /* verify consistency with the first pass */
+                ASSERT_ALWAYS((pointers[col_group] - p0) == (ptrdiff_t) ((1 + D.withcoeffs) * p0[-1]));
+            }
+        } else {
+            /* It's slightly harder than in the non-transposed case.
+             * We'll adjust the thread_row_positions each time we
+             * receive new stuff, and there's little sanity checking
+             * that we can effectively do.
+             */
+            /* for clarity -- we might as well do a swap() */
+            for(unsigned int j = 0 ; j < rs ; j ++) {
+                uint32_t const cc = *next++;
                 unsigned int const col_group = (cc / D.cols_chunk_small) % n_col_groups;
                 unsigned int const col_index = cc % D.cols_chunk_small;
                 unsigned int const group = row_group * n_col_groups + col_group;
-                if (!D.transpose_while_dispatching)
-                    thread_row_weights[group][row_index]++;
-                else
-                    thread_row_weights[group][col_index]++;
-                /* on pass 1 we don't do next++ */
-            }
-        } else if (D.pass_number == 2) {
-            if (!D.transpose_while_dispatching) {
-                std::vector<uint32_t *> pointers;
-                pointers.reserve(n_col_groups);
-                for(unsigned int i = 0 ; i < n_col_groups ; i++) {
-                    unsigned int const col_group = i;
-                    uint32_t const group = row_group * n_col_groups + col_group;
-                    uint32_t * matrix = args_per_thread[group]->p.data();
-                    size_t const pos0 = thread_row_positions[group][row_index];
-                    uint32_t * p0 = matrix + pos0;
-                    pointers.push_back(p0);
-                }
-                for(unsigned int j = 0 ; j < rs ; j ++) {
-                    uint32_t const cc = *next++;
-                    unsigned int const col_group = (cc / D.cols_chunk_small) % n_col_groups;
-                    uint32_t * & p = pointers[col_group];
-                    ASSERT(*p == 0);
-                    *p++ = cc % D.cols_chunk_small;
-                    if (D.withcoeffs) {
-                        ASSERT(*p == 0);
-                        if (*next == 0)
-                            fprintf(stderr, "zero coefficient in endpoint_handle_incoming()\n");
-                        *p++ = *next++;
-                    }
-                }
-                for(unsigned int i = 0 ; i < n_col_groups ; i++) {
-                    unsigned int const col_group = i;
-                    uint32_t const group = row_group * n_col_groups + col_group;
-                    uint32_t * matrix = args_per_thread[group]->p.data();
-                    size_t const pos0 = thread_row_positions[group][row_index];
-                    uint32_t * p0 = matrix + pos0;
-                    /* verify consistency with the first pass */
-                    ASSERT_ALWAYS((pointers[col_group] - p0) == (ptrdiff_t) ((1 + D.withcoeffs) * p0[-1]));
-                }
-            } else {
-                /* It's slightly harder than in the non-transposed case.
-                 * We'll adjust the thread_row_positions each time we
-                 * receive new stuff, and there's little sanity checking
-                 * that we can effectively do.
-                 */
-                /* for clarity -- we might as well do a swap() */
-                for(unsigned int j = 0 ; j < rs ; j ++) {
-                    uint32_t const cc = *next++;
-                    unsigned int const col_group = (cc / D.cols_chunk_small) % n_col_groups;
-                    unsigned int const col_index = cc % D.cols_chunk_small;
-                    unsigned int const group = row_group * n_col_groups + col_group;
-                    uint32_t * matrix = args_per_thread[group]->p.data();
-                    size_t & x = thread_row_positions[group][col_index];
+                uint32_t * matrix = args_per_thread[group]->p.data();
+                size_t & pos = thread_row_positions[group][col_index];
+                size_t x;
+#pragma omp atomic capture
+                { x = pos; pos += 1 + D.withcoeffs; }
+                ASSERT(matrix[x] == 0);
+                matrix[x++] = row_index;
+                if (D.withcoeffs) {
                     ASSERT(matrix[x] == 0);
-                    matrix[x++] = row_index;
-                    if (D.withcoeffs) {
-                        ASSERT(matrix[x] == 0);
-                        if (*next == 0)
-                            fprintf(stderr, "zero coefficient in endpoint_handle_incoming()\n");
-                        matrix[x++] = *next++;
-                    }
+                    if (*next == 0)
+                        fprintf(stderr, "zero coefficient in endpoint_handle_incoming()\n");
+                    matrix[x] = *next++;
                 }
             }
         }

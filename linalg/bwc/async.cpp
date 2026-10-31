@@ -203,6 +203,11 @@ void timing_check(parallelizing_info & pi, struct timing_data * timing, int iter
     if (print)
         printf("iteration %d\n", iter);
 
+    /* grid_print makes MPI calls. The interleaved sequences call
+     * timing_check from a block that must not make MPI calls. */
+    if (pi.interleaved)
+        return;
+
     pi.grid_print(buf, strlen(buf) + 1, print);
 }
 
@@ -317,4 +322,11 @@ void timing_disp_collective_oneline(parallelizing_info & pi, struct timing_data 
 void timing_final_tally(parallelizing_info & pi, struct timing_data * timing, int print, const char * stage)
 {
     timing_disp_backend(pi, timing, timing->end_mark, print, stage, 1);
+}
+
+void epoch_report(int print, const char * stage, unsigned int iter, unsigned int n, double iter_s, double other_s)
+{
+    if (!print || !n) return;
+    printf("%s epoch %u: iter %.3f ms/iter, other %.3f s\n",
+            stage, iter, 1e3 * iter_s / n, other_s);
 }

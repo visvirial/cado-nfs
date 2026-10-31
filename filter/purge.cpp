@@ -36,9 +36,8 @@
  *   a column of the matrix.
  *
  * This program works in two passes over the relation files:
- * - the first pass loads in memory only indices of columns whose weight is less
- *   than purge_matrix::OVERWEIGHT and keeps a count of the weight of each
- *   column in column_weights.
+ * - the first pass loads in memory only indices of columns >= col_min_index
+ *   and keeps a count of the weight of each column in column_weights.
  *   Then, a first step of singleton removal is performed followed by 'nsteps'
  *   steps of singleton removal and clique removal, in order to obtained the
  *   final excess 'keep'.
@@ -48,9 +47,8 @@
  * This program uses the purge_matrix structure, where most of the stuff
  * happens.
  *
- * M.rows[i] is the list of indices of columns (with weight less than
- * purge_matrix::OVERWEIGHT) of row i, terminated by a sentinel
- * purge_matrix::END_OF_ROW.
+ * M.rows[i] is the list of indices of columns (above col_min_index) of
+ * row i, terminated by a -1 sentinel.
  *
  * M.column_weights[h] is the weight of the column h in current rows
  * (saturates at the max value of weight_t)
@@ -70,17 +68,29 @@
 #include <cstring>
 
 #include <algorithm>
-#include <string>
+#include <atomic>
+#include <exception>
+#include <fstream>
 #include <limits>
+#include <mutex>
+#include <numeric>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <unistd.h>
 
 #include "fmt/base.h"
 #include "fmt/format.h"
 #include "fmt/ostream.h"
 
+#include "cado_main.hpp"
 #include "filelist.hpp"
 #include "filter_config.h"
 #include "filter_io.hpp"
 #include "fstream_maybe_compressed.hpp"
+#include "gzip.h"
 #include "macros.h"
 #include "misc.h"
 #include "params.hpp"
@@ -90,9 +100,54 @@
 #include "typedefs.h"
 #include "utils_cxx.hpp"
 #include "verbose.hpp"
-#include "cado_main.hpp"
 
 // #define TRACE_J 0x5b841 /* trace column J */
+
+/* Output file that pass 2 writes as one part per input file, so that
+ * several threads can write at the same time. The parts have the same
+ * compression as the final file. concatenate() appends the parts to the
+ * final file in the order of the input files: a sequence of gzip members
+ * or of zstd frames is a valid file, and plain parts concatenate as
+ * bytes. */
+struct parted_output { /* {{{ */
+    std::string name;
+    size_t nparts;
+
+    /* Creates the final file with only the header line. */
+    parted_output(std::string const & name, size_t nparts,
+                  std::string const & header)
+        : name(name)
+        , nparts(nparts)
+    {
+        ofstream_maybe_compressed out(name);
+        if (!out.good())
+            throw cado::error("cannot open {} for writing", name);
+        out << header;
+    }
+
+    std::string part_name(size_t i) const
+    {
+        auto const suffix = get_suffix(name);
+        return fmt::format("{}.part{}{}",
+                           name.substr(0, name.size() - suffix.size()), i,
+                           suffix);
+    }
+
+    void concatenate() const
+    {
+        std::vector<char> buf(size_t(1) << 24);
+        std::ofstream out(name, std::ios::binary | std::ios::app);
+        for (size_t i = 0; i < nparts; i++) {
+            std::ifstream in(part_name(i), std::ios::binary);
+            while (in.read(buf.data(), buf.size()), in.gcount() > 0)
+                out.write(buf.data(), in.gcount());
+            unlink(part_name(i).c_str());
+        }
+        if (!out.good())
+            throw cado::error("write error on {}", name);
+    }
+};
+/* }}} */
 
 struct purge_output_specification { /* {{{ */
     parameter<std::string, "out", "outfile for remaining relations">
@@ -115,6 +170,14 @@ struct purge_output_specification { /* {{{ */
 /* }}} */
 struct purge_process : purge_output_specification {
         /* {{{ */
+    parameter_with_default<
+        size_t, "col-min-index",
+        "only take into account columns with indices >= col-min-index", "0">
+        col_min_index;
+    parameter_with_default<
+        size_t, "col-max-index",
+        "only take into account columns with indices < col-max-index", "0">
+        col_max_index;
     parameter_with_default<int64_t, "keep", "wanted excess at the end of purge",
                            CADO_STRINGIZE(DEFAULT_FILTER_EXCESS)>
         keep;
@@ -136,10 +199,15 @@ struct purge_process : purge_output_specification {
 
     purge_matrix M;
 
+    /* row number of the first relation of each input file, set by pass 1 */
+    std::vector<size_t> row_base;
+
     /* }}} */
     static void configure(cxx_param_list & pl) /* {{{ */
     {
         purge_output_specification::configure(pl);
+        decltype(col_min_index)::configure(pl);
+        decltype(col_max_index)::configure(pl);
         decltype(keep)::configure(pl);
         decltype(nsteps)::configure(pl);
         decltype(required_excess)::configure(pl);
@@ -149,14 +217,25 @@ struct purge_process : purge_output_specification {
     /* }}} */
     explicit purge_process(cxx_param_list & pl) /* {{{ */
         : purge_output_specification(pl)
+        , col_min_index(pl)
+        , col_max_index(pl)
         , keep(pl)
         , nsteps(pl)
         , required_excess(pl)
         , nthreads(pl)
         , verbose(pl)
     {
+        if (col_max_index == 0)
+            col_max_index() = std::numeric_limits<index_t>::max();
         if (nthreads == 0)
             pl.fail("cannot have nthreads == 0");
+        if (col_min_index >= col_max_index)
+            pl.fail("cannot have col-min-index >= col-max-index\n");
+        /* If col_max_index > 2^32, then we need index_t to be 64-bit */
+        if (col_max_index > std::numeric_limits<index_t>::max())
+            pl.fail("Error, -col-max-index is too large for a 32-bit "
+                    "program\nSee #define SIZEOF_INDEX in typedefs.h\n");
+        M.set_column_range(col_min_index, col_max_index);
 
         print_information();
     }
@@ -168,6 +247,10 @@ struct purge_process : purge_output_specification {
         purge_matrix::print_clique_removal_weight_function();
 
         fmt::print("# INFO: number of rows: automatic\n");
+        fmt::print("# INFO: maximum possible index of a column: {}\n",
+                   col_max_index());
+        fmt::print("# INFO: bytes per stored column index: {}\n",
+                   M.index_bytes);
         fmt::print("# INFO: number of threads: {}\n", nthreads());
         fmt::print("# INFO: number of clique removal steps: ");
         if (nsteps < 0)
@@ -188,38 +271,87 @@ struct purge_process : purge_output_specification {
         }
     }
     /* }}} */
-    void pass1(filelist const & input) /* {{{ */
+    /* Calls f(i) for each of the nfiles input files, with at most
+     * nthreads calls at the same time. An exception from f stops the
+     * loop and is thrown again in the calling thread. */
+    template <typename F>
+    void for_each_file(size_t nfiles, F const & f) const /* {{{ */
     {
-        fmt::print("\n"
-                   "Pass 1, reading and storing columns with weight < {}\n",
-                   purge_matrix::OVERWEIGHT);
+        std::atomic<size_t> next = 0;
+        std::mutex m;
+        std::exception_ptr error;
+        auto worker = [&]() {
+            try {
+                for (size_t i; (i = next++) < nfiles;)
+                    f(i);
+            } catch (...) {
+                std::scoped_lock const dummy(m);
+                error = std::current_exception();
+                next = nfiles;
+            }
+        };
+        {
+            std::vector<std::jthread> threads;
+            for (size_t k = std::min<size_t>(nthreads(), nfiles); k--;)
+                threads.emplace_back(worker);
+        }
+        if (error)
+            std::rethrow_exception(error);
+    }
+    /* }}} */
 
+    /* Reads the rows and the column weights of the files into M. The
+     * column weight counter and the row builders are freed on return. */
+    void read_rows(std::vector<std::string> const & files) /* {{{ */
+    {
         using relation_type = cado::relation_building_blocks::primes_block<
             prime_type_for_indexed_relations,
             cado::relation_building_blocks::ab_ignore<16>>;
 
-        filter_rels<relation_type>(input.create_file_list(), nullptr, nullptr,
+        std::vector<purge_matrix::row_builder> builders(files.size());
+        purge_matrix::column_weight_counter weights;
+
+        for_each_file(files.size(), [&](size_t i) {
+            filter_rels<relation_type>(files[i], nullptr, nullptr,
                 [&](relation_type & rel) {
-                    M.new_row(rel.num, rel.primes);
+                    builders[i].new_row(weights, M, rel.primes);
+            });
         });
 
-        M.remove_overweight_columns_from_rows();
+        size_t builder_bytes = 0;
+        for (auto const & b: builders)
+            builder_bytes += b.get_allocated_bytes()
+                + b.rows.capacity() * sizeof(uint8_t *);
+        M.print_memory(fmt::format("pass 1 read, builders {}",
+                                   size_disp(builder_bytes)));
+
+        for (auto & b: builders) {
+            row_base.push_back(M.rows.size());
+            M.append(b);
+        }
+        M.take_column_weights(weights);
+    }
+    /* }}} */
+
+    void pass1(filelist const & input) /* {{{ */
+    {
+        fmt::print("\n"
+                   "Pass 1, reading and storing columns with index h >= {}\n",
+                   col_min_index());
+
+        read_rows(input.create_file_list());
+        M.print_memory("pass 1 matrix");
 
 #ifdef TRACE_J
         printf("TRACE: weight of ideal 0x%x is %u\n", TRACE_J,
                M.column_weights[TRACE_J]);
 #endif
 
-        fmt::print("# {} columns were ignored because they have weight >= {}\n",
-                std::ranges::count(M.column_weights, purge_matrix::OVERWEIGHT),
-                purge_matrix::OVERWEIGHT);
-        fmt::print("# MEMORY: Allocated matrix: {}\n",
-                   size_disp(M.get_allocated_bytes()));
-
         print_optional_weight_statistics();
 
         /* MAIN FUNCTIONS: do singletons and cliques removal. */
         singleton_and_clique_removal();
+        M.print_memory("end of pass 1");
 
 #ifdef TRACE_J
         printf("TRACE: weight of ideal 0x%x is %u\n", TRACE_J,
@@ -235,7 +367,7 @@ struct purge_process : purge_output_specification {
             print_final_values(0);
             exit(2);
         }
-        if (M.remaining_rows == 0 || M.remaining_rows == 0) {
+        if (M.remaining_rows == 0 || M.remaining_columns == 0) {
             fmt::print("number of rows or number of columns is 0\n");
             print_final_values(0);
             exit(2);
@@ -249,54 +381,67 @@ struct purge_process : purge_output_specification {
                    "Pass 2, reading and writing output file{}...\n",
                    deletedname().empty() ? "" : "s");
 
-        ofstream_maybe_compressed out;
-        ofstream_maybe_compressed outdel;
+        auto const files = input.create_file_list();
+        std::optional<parted_output> out;
+        std::optional<parted_output> outdel;
 
-        if (purgedname.is_provided())
-            if (out.open(purgedname); !out.good())
-                throw cado::error("cannot open {} for writing", purgedname());
-
-        if (deletedname.is_provided())
-            if (outdel.open(deletedname); !outdel.good())
-                throw cado::error("cannot open {} for writing", deletedname());
-
-        if (outdel.is_open())
-            /* Write the header line for the file of deleted relations. */
-            fmt::print(outdel, "# {}\n", M.rows.size() - M.remaining_rows);
-
-        /* Write the header line for the file of remaining relations:
-         * compute bound B such that all non empty columns have indices
-         * j such that j < B
+        /* The header line for the file of remaining relations has a
+         * bound B such that all non empty columns have indices j < B
          */
-        if (out.is_open()) {
+        if (purgedname.is_provided()) {
             size_t bound = M.column_weights.size();
             for (; bound && M.column_weights[bound - 1] == 0; bound--)
                 ;
-
-            fmt::print(out, "# {} {} {}\n", M.remaining_rows, bound,
-                       M.remaining_columns);
+            out.emplace(purgedname, files.size(),
+                        fmt::format("# {} {} {}\n", M.remaining_rows, bound,
+                                    M.remaining_columns));
         }
+
+        if (deletedname.is_provided())
+            outdel.emplace(deletedname, files.size(),
+                           fmt::format("# {}\n",
+                                       M.rows.size() - M.remaining_rows));
 
         /* second pass over relations in files */
         using relation_type = cado::relation_building_blocks::line_block<
             cado::relation_building_blocks::primecount_block<
                 cado::relation_building_blocks::ab_ignore<16>>>;
-        double W = 0;
+        std::vector<double> W(files.size(), 0);
 
-        filter_rels<relation_type>(input.create_file_list(), nullptr, nullptr,
-            [&](relation_type & rel) {
-                if (M.is_active(rel.num)) {
-                    W += static_cast<double>(rel.weight);
-                    if (out.is_open())
-                    fmt::print(out, "{}\n", rel.line);
-                } else if (outdel.is_open()) {
-                    fmt::print(outdel, "{}\n", rel.line);
-                }
-            });
+        for_each_file(files.size(), [&](size_t i) {
+            ofstream_maybe_compressed out_i;
+            ofstream_maybe_compressed outdel_i;
+            if (out)
+                if (out_i.open(out->part_name(i)); !out_i.good())
+                    throw cado::error("cannot open {} for writing",
+                                      out->part_name(i));
+            if (outdel)
+                if (outdel_i.open(outdel->part_name(i)); !outdel_i.good())
+                    throw cado::error("cannot open {} for writing",
+                                      outdel->part_name(i));
+
+            size_t const base = row_base[i];
+            filter_rels<relation_type>(files[i], nullptr, nullptr,
+                [&](relation_type & rel) {
+                    if (M.is_active(base + rel.num)) {
+                        W[i] += static_cast<double>(rel.weight);
+                        if (out_i.is_open())
+                            fmt::print(out_i, "{}\n", rel.line);
+                    } else if (outdel_i.is_open()) {
+                        fmt::print(outdel_i, "{}\n", rel.line);
+                    }
+                });
+        });
+
+        if (out)
+            out->concatenate();
+        if (outdel)
+            outdel->concatenate();
+        M.print_memory("end of pass 2");
 
         /* write final values to stdout */
         /* This output, incl. "Final values:", is required by the script */
-        print_final_values(W);
+        print_final_values(std::accumulate(W.begin(), W.end(), 0.0));
     }
 /* }}} */
 
@@ -320,6 +465,7 @@ struct purge_process : purge_output_specification {
         /* First step of singletons removal */
         fmt::print("\nStep 0: only singleton removal\n");
         M.singleton_removal(nthreads, verbose);
+        M.print_memory("step 0");
 
 #ifdef TRACE_J
         printf("# TRACE: weight of ideal 0x%x is %u\n", TRACE_J,
@@ -384,8 +530,11 @@ struct purge_process : purge_output_specification {
 
             print_optional_weight_statistics();
 
+            double const wct0 = wct_seconds();
             M.clique_removal(target_excess, nthreads, verbose);
+            double const wct1 = wct_seconds();
             M.singleton_removal(nthreads, verbose);
+            double const wct2 = wct_seconds();
 
 #ifdef TRACE_J
             printf("TRACE: weight of ideal 0x%x is %u\n", TRACE_J,
@@ -394,6 +543,9 @@ struct purge_process : purge_output_specification {
 
             fmt::print("This step removed {} rows and decreased excess by {}\n",
                        oldnrows - M.remaining_rows, oldexcess - M.excess());
+            fmt::print("This step took {:.2f}s wall: clique removal {:.2f}s,"
+                       " singleton removal {:.2f}s\n",
+                       wct2 - wct0, wct1 - wct0, wct2 - wct1);
             if (oldexcess > M.excess())
                 fmt::print("Each excess row deleted {:2.2f} rows\n",
                            double_ratio(oldnrows - M.remaining_rows,

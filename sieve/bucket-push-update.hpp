@@ -25,7 +25,20 @@ bucket_array_t<LEVEL, HINT>::push_update(int const i, update_t const & update,
 #ifdef TRACE_K
     log_this_update(update, i, w);
 #endif
-    *bucket_write[i]++ = update;
+    if constexpr (is_delta_coded) {
+        /* unsigned, so that this would remain correct, albeit costly, for
+         * hints that do not come in increasing order */
+        slice_offset_t delta = update.hint - last_hint[i];
+        last_hint[i] = update.hint;
+        if (UNLIKELY(delta >= delta_coded_update_t::escape)) {
+            *bucket_write[i]++ =
+                delta_coded_update_t(delta, delta_coded_update_t::escape);
+            delta = 0;
+        }
+        *bucket_write[i]++ = delta_coded_update_t(update.x, delta);
+    } else {
+        *bucket_write[i]++ = update;
+    }
 }
 
 template <int LEVEL, hint_type_general HINT>

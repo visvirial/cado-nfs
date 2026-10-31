@@ -308,8 +308,8 @@ static_assert(sizeof(bucket_update_t<1, emptyhint_t>) == 2, "wrong size");
 
 #if MAX_TOPLEVEL >= 2
 /* A position in a level-2 bucket region is 24 bits (LOG_BUCKET_REGION is
- * at most 16), which is all we store in these updates. There can be
- * billions of them, and they are only ever copied and read by downsort.
+ * at most 16). This is the update as the fill code and downsort see it;
+ * what the bucket array stores is delta_coded_update_t below.
  */
 class packed_uint24_t
 {
@@ -359,6 +359,69 @@ FORCE_BU_ALIGNMENT(2, emptyhint_t, 4);
 static_assert(sizeof(bucket_update_t<2, shorthint_t>) == 5, "wrong size");
 static_assert(sizeof(bucket_update_t<2, emptyhint_t>) == 4, "wrong size");
 
+/* There can be billions of level-2 short-hint updates, and they are only
+ * ever written in slice order by the fill code and read in that same order
+ * by downsort. Within a slice and a bucket the hints therefore come in
+ * increasing order, close to each other, and we store only the difference
+ * with the previous one, in the top byte of a 32-bit word.
+ *
+ * Differences that do not fit are stored in an additional word that has
+ * the escape value in its top byte, and the difference in its low bits.
+ * That word is followed by a regular one with a zero difference.
+ */
+struct delta_coded_update_t {
+    static constexpr uint32_t escape = 255;
+    uint32_t v = 0;
+    delta_coded_update_t() = default;
+    delta_coded_update_t(uint32_t const x, uint32_t const delta)
+        : v(x | (delta << 24))
+    {
+        ASSERT_EXPENSIVE(x < (UINT32_C(1) << 24));
+    }
+    uint32_t low() const { return v & ((UINT32_C(1) << 24) - 1); }
+    uint32_t delta() const { return v >> 24; }
+};
+static_assert(sizeof(delta_coded_update_t) == 4, "wrong size");
+
+/* Rebuilds the hints from the differences. Only "!=" is needed, by
+ * range-based for loops. */
+class delta_decoder
+{
+    delta_coded_update_t const * p;
+    delta_coded_update_t const * e;
+    slice_offset_t hint = 0;
+
+    void load()
+    {
+        if (p == e)
+            return;
+        if (UNLIKELY(p->delta() == delta_coded_update_t::escape)) {
+            hint += p->low();
+            ++p;
+        }
+        hint += p->delta();
+    }
+
+  public:
+    delta_decoder(delta_coded_update_t const * p, delta_coded_update_t const * e)
+        : p(p)
+        , e(e)
+    {
+        load();
+    }
+    bucket_update_t<2, shorthint_t> operator*() const
+    {
+        return { p->low(), shorthint_t(hint) };
+    }
+    delta_decoder & operator++()
+    {
+        ++p;
+        load();
+        return *this;
+    }
+    bool operator!=(delta_decoder const & o) const { return p != o.p; }
+};
+
 /* 4-byte slice index, 2-byte slice offset, and then 2 bytes of position
  * (bucket_update_size_per_level<1> is 16-bits).
  */
@@ -384,6 +447,16 @@ static_assert(sizeof(bucket_update_t<2, logphint_t>) == 8, "wrong size");
 FORCE_BU_ALIGNMENT(1, primehint_t, 8);
 static_assert(sizeof(bucket_update_t<1, primehint_t>) == 8, "wrong size");
 
+
+/* What a bucket array actually stores, per update. */
+template <int LEVEL, hint_type_general HINT> struct bucket_stored_update {
+    using type = bucket_update_t<LEVEL, HINT>;
+};
+#if MAX_TOPLEVEL >= 2
+template <> struct bucket_stored_update<2, shorthint_t> {
+    using type = delta_coded_update_t;
+};
+#endif
 
 /******** Bucket array typedef **************/
 /******** Bucket array implementation **************/
@@ -456,18 +529,25 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
     static constexpr int const level = LEVEL;
     using update_t = bucket_update_t<LEVEL, HINT>;
     using row_update_t = bucket_row_update_t<LEVEL, HINT>;
+    using stored_update_t = typename bucket_stored_update<LEVEL, HINT>::type;
 
   private:
-    las_memory_accessor::unique_physical_array<update_t> big_data;
+    static constexpr bool is_delta_coded =
+        std::is_same_v<stored_update_t, delta_coded_update_t>;
+
+    las_memory_accessor::unique_physical_array<stored_update_t> big_data;
 
     // Contains pointers to first empty location in each bucket
-    unique_aligned_array<update_t *> bucket_write;
+    unique_aligned_array<stored_update_t *> bucket_write;
 
     // Contains pointers to beginning of buckets
-    unique_aligned_array<update_t *> bucket_start;
+    unique_aligned_array<stored_update_t *> bucket_start;
 
     // Contains pointers to first unread location in each bucket
-    unique_aligned_array<update_t *> bucket_read;
+    unique_aligned_array<stored_update_t *> bucket_read;
+
+    // Delta-coded arrays only: hint of the latest update in each bucket
+    unique_aligned_array<slice_offset_t> last_hint;
 
     // For each slice that gets sieved, new index is added here
     std::vector<slice_index_t> slice_index;
@@ -475,7 +555,7 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
     // For each slice there are n_bucket pointers, each pointer tells
     // where in the corresponding bucket the updates from that slice
     // start
-    std::vector<update_t *> slice_start;
+    std::vector<stored_update_t *> slice_start;
 
   public:
     slice_index_t get_nr_slices() const { return slice_index.size(); }
@@ -498,7 +578,7 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
         bucket_slice_alloc_defaults<LEVEL, HINT>::increase;
 
     /* Get a pointer to the pointer-set for the i-th slice */
-    update_t const * const * get_slice_pointers(slice_index_t const i) const
+    stored_update_t const * const * get_slice_pointers(slice_index_t const i) const
     {
         return slice_start.data() + i * pointer_pack;
     }
@@ -528,19 +608,19 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
                     slice_index_t prealloc_slices = initial_slice_alloc);
 
   private:
-    /* Return a begin iterator over the update_t entries in i_bucket-th
-       bucket, generated by the i_slice-th slice */
-    update_t const * begin(size_t i_bucket, slice_index_t i_slice) const
+    /* Return a begin iterator over the entries in i_bucket-th bucket,
+       generated by the i_slice-th slice */
+    stored_update_t const * begin(size_t i_bucket, slice_index_t i_slice) const
     {
         ASSERT_ALWAYS(i_slice < get_nr_slices());
-        update_t const * const p = get_slice_pointers(i_slice)[i_bucket];
+        stored_update_t const * const p = get_slice_pointers(i_slice)[i_bucket];
         /* The first slice we wrote must start at the bucket start */
         ASSERT_ALWAYS(i_slice != 0 || p == bucket_start[i_bucket]);
         return p;
     }
-    /* Return an end iterator over the update_t entries in i_bucket-th
-       bucket, generated by the i_slice-th slice */
-    update_t const * end(size_t i_bucket, slice_index_t i_slice) const
+    /* Return an end iterator over the entries in i_bucket-th bucket,
+       generated by the i_slice-th slice */
+    stored_update_t const * end(size_t i_bucket, slice_index_t i_slice) const
     {
         ASSERT_ALWAYS(i_slice < get_nr_slices());
         return (i_slice + 1 < get_nr_slices())
@@ -554,11 +634,22 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
         bucket_array_t<LEVEL, HINT> const * parent;
         size_t i_bucket;
         slice_index_t i_slice;
-        update_t const * begin() const
+        auto begin() const
         {
-            return parent->begin(i_bucket, i_slice);
+            if constexpr (is_delta_coded)
+                return delta_decoder(parent->begin(i_bucket, i_slice),
+                                     parent->end(i_bucket, i_slice));
+            else
+                return parent->begin(i_bucket, i_slice);
         }
-        update_t const * end() const { return parent->end(i_bucket, i_slice); }
+        auto end() const
+        {
+            if constexpr (is_delta_coded)
+                return delta_decoder(parent->end(i_bucket, i_slice),
+                                     parent->end(i_bucket, i_slice));
+            else
+                return parent->end(i_bucket, i_slice);
+        }
     };
 
     friend struct slice_range_accessor;
@@ -580,6 +671,8 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
         slice_start.insert(slice_start.end(),
                 bucket_write.get(), bucket_write.get() + pointer_pack);
         slice_index.push_back(new_slice_index);
+        if constexpr (is_delta_coded)
+            std::fill_n(last_hint.get(), n_bucket, slice_offset_t(0));
     }
     double max_full(unsigned int * fullest_index = nullptr) const;
     double average_full() const;

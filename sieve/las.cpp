@@ -379,7 +379,7 @@ static size_t expected_memory_usage_per_subjob(siever_config const & sc,/*{{{*/
 #if MAX_TOPLEVEL >= 2
         using T2s = bucket_update_t<2, shorthint_t>;
         using T1l = bucket_update_t<1, longhint_t>;
-        ss[2] = sizeof(T2s);
+        ss[2] = sizeof(bucket_stored_update<2, shorthint_t>::type);
         ms[2] = bkmult.get<T2s>();
         rs[2] = round_me::from(bucket_slice_alloc_defaults<2, shorthint_t>());
         sl[1] = sizeof(T1l);

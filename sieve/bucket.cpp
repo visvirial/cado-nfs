@@ -123,14 +123,14 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
     uint32_t bitmask_line_ordinate = 0;
 #ifdef SIQS_SIEVE
     bs_even = bs_odd = 4 * Q + ndev * sqrt(4 * Q);
-    bs_even = bucket_misalignment(bs_even, sizeof(update_t));
-    bs_odd = bucket_misalignment(bs_odd, sizeof(update_t));
+    bs_even = bucket_misalignment(bs_even, sizeof(stored_update_t));
+    bs_odd = bucket_misalignment(bs_odd, sizeof(stored_update_t));
     new_big_size = bs_odd * new_n_bucket;
 #else
     if (!parity_skip) {
         bs_even = bs_odd = 4 * Q + ndev * sqrt(4 * Q);
-        bs_even = bucket_misalignment(bs_even, sizeof(update_t));
-        bs_odd = bucket_misalignment(bs_odd, sizeof(update_t));
+        bs_even = bucket_misalignment(bs_even, sizeof(stored_update_t));
+        bs_odd = bucket_misalignment(bs_odd, sizeof(stored_update_t));
         new_big_size = bs_odd * new_n_bucket;
     } else if (LOG_BUCKET_REGIONS[LEVEL] <= logI) {
         bitmask_line_ordinate = UINT32_C(1)
@@ -138,25 +138,25 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
         ASSERT_ALWAYS(new_n_bucket % 2 == 0);
         bs_even = 2 * Q + ndev * sqrt(2 * Q);
         bs_odd = 4 * Q + ndev * sqrt(4 * Q);
-        bs_even = bucket_misalignment(bs_even, sizeof(update_t));
-        bs_odd = bucket_misalignment(bs_odd, sizeof(update_t));
+        bs_even = bucket_misalignment(bs_even, sizeof(stored_update_t));
+        bs_odd = bucket_misalignment(bs_odd, sizeof(stored_update_t));
         new_big_size =
             (bs_even + bs_odd) * (new_n_bucket / 2);
     } else {
         bs_even = bs_odd = 3 * Q + ndev * sqrt(3 * Q);
-        bs_even = bucket_misalignment(bs_even, sizeof(update_t));
-        bs_odd = bucket_misalignment(bs_odd, sizeof(update_t));
+        bs_even = bucket_misalignment(bs_even, sizeof(stored_update_t));
+        bs_odd = bucket_misalignment(bs_odd, sizeof(stored_update_t));
         new_big_size = bs_odd * new_n_bucket;
     }
 #endif
 
     /* add 1 megabyte to each bucket array, so as to deal with overflowing
      * buckets */
-    new_big_size += (1 << 20) / sizeof(update_t);
+    new_big_size += (1 << 20) / sizeof(stored_update_t);
 
     size_t const new_size_b_align =
         ((sizeof(void *) * new_n_bucket + 0x3F) & ~((size_t)0x3F));
-    size_t const new_pointer_pack = new_size_b_align / sizeof(update_t *);
+    size_t const new_pointer_pack = new_size_b_align / sizeof(stored_update_t *);
 
     if (new_big_size > big_data.get_deleter().size) {
         if (bitmask_line_ordinate) {
@@ -164,21 +164,21 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
                 0, 3,
                 "# [{}{}] Allocating {} bytes for {} buckets"
                 " of {} to {} update entries of {} bytes each\n",
-                LEVEL, HINT::rtti[0], new_big_size * sizeof(update_t),
-                new_n_bucket, bs_even, bs_odd, sizeof(update_t));
+                LEVEL, HINT::rtti[0], new_big_size * sizeof(stored_update_t),
+                new_n_bucket, bs_even, bs_odd, sizeof(stored_update_t));
         } else {
             verbose_fmt_print(
                 0, 3,
                 "# [{}{}] Allocating {} bytes for {} buckets"
                 " of {} update entries of {} bytes each\n",
-                LEVEL, HINT::rtti[0], new_big_size * sizeof(update_t),
-                new_n_bucket, bs_even, sizeof(update_t));
+                LEVEL, HINT::rtti[0], new_big_size * sizeof(stored_update_t),
+                new_n_bucket, bs_even, sizeof(stored_update_t));
         }
         /* Nothing in the old array is kept, and holding on to it while we
          * get the new one is what would set the peak of the whole process.
          */
         big_data.reset();
-        big_data = memory.make_unique_physical_array<update_t>(new_big_size, true);
+        big_data = memory.make_unique_physical_array<stored_update_t>(new_big_size, true);
     }
 
     if (!big_data)
@@ -199,10 +199,10 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
 
         /* bucket_start is allocated as an array of n_bucket+1 pointers */
         size_t const alloc_bstart = std::max(pointer_pack, n_bucket + 1);
-        bucket_start = make_unique_aligned_array<update_t *>(alloc_bstart, 0x40);
+        bucket_start = make_unique_aligned_array<stored_update_t *>(alloc_bstart, 0x40);
         std::fill_n(bucket_start.get(), alloc_bstart, nullptr);
 
-        bucket_read = make_unique_aligned_array<update_t *>(pointer_pack, 0x40);
+        bucket_read = make_unique_aligned_array<stored_update_t *>(pointer_pack, 0x40);
         std::fill_n(bucket_read.get(), pointer_pack, nullptr);
 
         /* there is probably _some_ sense in making bucket_write
@@ -212,8 +212,11 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
          * fill-in-buckets, and it would be embarrassing if it had to
          * span several pages.
          */
-        bucket_write = make_unique_aligned_array<update_t *>(pointer_pack, pagesize());
+        bucket_write = make_unique_aligned_array<stored_update_t *>(pointer_pack, pagesize());
         std::fill_n(bucket_write.get(), pointer_pack, nullptr);
+
+        if constexpr (is_delta_coded)
+            last_hint = make_unique_aligned_array<slice_offset_t>(pointer_pack, 0x40);
     }
 
     if (prealloc_slices) {
@@ -222,7 +225,7 @@ void bucket_array_t<LEVEL, HINT>::allocate_memory(
     }
 
     /* Spread bucket_start pointers equidistantly over the big_data array */
-    update_t * cur = big_data.get();
+    stored_update_t * cur = big_data.get();
     bucket_start[0] = cur;
     for (uint32_t i = 0; bucket_start[i] = cur, i < n_bucket; i++) {
         cur += ((i & bitmask_line_ordinate) != 0) ? bs_odd : bs_even;
@@ -272,9 +275,9 @@ bucket_array_t<LEVEL, HINT>::slice_statistics(int side, int idx, fb_factorbase::
     ASSERT_ALWAYS(side >= 0);
     std::vector<size_t> nupdates_per_slice(get_nr_slices(), 0);
 
-    update_t const * const * fence = bucket_write.get();
+    stored_update_t const * const * fence = bucket_write.get();
     for(size_t i = get_nr_slices() ; i-- ; ) {
-        update_t const * const * previous = get_slice_pointers(i);
+        stored_update_t const * const * previous = get_slice_pointers(i);
         for(unsigned int j = 0 ; j < n_bucket ; j++) {
             nupdates_per_slice[i] += fence[j] - previous[j];
         }

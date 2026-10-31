@@ -49,7 +49,7 @@ reservation_array_base<T>::allocate_buckets(las_memory_accessor & memory, int n_
     const size_t n = BAs.size();
     for (size_t i = 0; i < n; i++) {
         /* Arrange so that the largest allocations are done first ! */
-        const auto cost = (double) (ratio/n * BUCKET_REGIONS[T::level] * n_bucket * sizeof(typename T::update_t));
+        const auto cost = (double) (ratio/n * BUCKET_REGIONS[T::level] * n_bucket * sizeof(typename T::stored_update_t));
         pool.add_task(
                 thread_pool::QUEUE_MISC, cost,
                 run_allocate_buckets<T>,

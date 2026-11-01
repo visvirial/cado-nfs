@@ -127,7 +127,8 @@ found elsewhere is imported with `tasks.polyselect.import=<poly>`.
 ## Vast.ai
 
 Rent an A100 with 80 GB (`gpu_name=A100_SXM4 num_gpus=1 gpu_ram>=70`, in
-GB; `A=33` used 60 GB there, and a 40 GB card is untested) and the image
+GB; `A=33` takes 13.5 GB per slot at the 2^30 chunk plus 5 GB of tables,
+so a 40 GB card should hold two slots but is untested) and the image
 `nvidia/cuda:12.4.1-devel-ubuntu22.04`. Keep that CUDA version: on the
 same machine, `glas` built with 12.8 takes 20% longer per special-q.
 
@@ -149,8 +150,8 @@ the `tasks.*` settings after it:
       tasks.sieve.las.execbin=las-glas
 
 `glas` sizes its chunks and slots from the device memory: the largest chunk up
-to 2^30 that still leaves two slots. `GLAS_GPU_CHUNK` and `GLAS_GPU_SLOTS`
-override this.
+to 2^30 that still leaves two slots, then two slots at 2^30 and as many as fit
+below it. `GLAS_GPU_CHUNK` and `GLAS_GPU_SLOTS` override this.
 
 `glas` needs `I >= 12`: below `c120`, add `tasks.I=12`. Parameters
 tuned for `las` with a large `mfb0`, such as `parameters/factor/params.c270`,

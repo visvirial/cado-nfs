@@ -66,21 +66,43 @@ constexpr uint32_t SKIP_ROOT = UINT32_MAX;
  * primality test dropped; the pack step leaves it out of the chunk. */
 constexpr uint32_t FMETA_REJECT = 1u << 30;
 
-/* per-entry walk cursor sentinels */
-constexpr uint64_t WALK_SKIP = UINT64_MAX;    /* entry never hits */
-constexpr uint64_t WALK_PROJ = 0;             /* projective: row indexed */
+/* Walk record of one entry, 16 bytes: word x holds the cursor (40 bits,
+ * a position below 2^36 with logI <= 17 and J <= 2^16, plus the step
+ * past the end) and j0 (17 bits); word y holds mi0, i1 and j1 (17 bits
+ * each) of the reduced FK basis (mi0, j0), (i1, j1).  A row step of
+ * 2^17 or more leaves every sieve region, so j0 and j1 are clamped
+ * there: the clamped walk ends past the region like the exact one.
+ * The fill reads the record and writes back word x, 24 bytes per
+ * walked entry instead of the 40 of separate cursor and basis arrays.
+ * x = WALKX_SKIP marks an entry that never hits, x = WALKX_PROJ a
+ * projective root, which the proj walk handles row by row. */
+constexpr int WALKX_BITS = 40;
+constexpr uint64_t WALKX_MASK = (1ull << WALKX_BITS) - 1;
+constexpr uint64_t WALKX_SKIP = WALKX_MASK;
+constexpr uint64_t WALKX_PROJ = 0;
+constexpr uint32_t WALKJ_MAX = (1u << 17) - 1;
 
-/* GLAS_FILL_CARRY: the walk state of one large entry (index >= n_band)
- * in one 24-byte record.  A companion byte per entry holds the chunk
- * of its next hit; the fill kernel walks only the entries due in the
- * current chunk, so an entry with no hit in a chunk costs one byte
- * read. */
-struct carry_state {
-    uint2 L0, L1;      /* reduced FK basis (uint4 would pad to 32 bytes) */
-    uint64_t x;        /* walk cursor, or WALK_SKIP / WALK_PROJ */
-};
-static_assert(sizeof(carry_state) == 24, "carry_state is 24 bytes");
-constexpr uint8_t CARRY_DONE = 255;   /* no hit in any later chunk */
+__host__ __device__ inline ulonglong2 make_walk(uint64_t x, uint4 L)
+{
+    return make_ulonglong2(
+        x | (uint64_t)min(L.y, WALKJ_MAX) << WALKX_BITS,
+        (uint64_t)L.x | (uint64_t)L.z << 17 | (uint64_t)min(L.w, WALKJ_MAX) << 34);
+}
+
+__device__ __forceinline__ uint4 dev_walk_basis(ulonglong2 const & w)
+{
+    return make_uint4((uint32_t)(w.y & WALKJ_MAX),
+                      (uint32_t)(w.x >> WALKX_BITS & WALKJ_MAX),
+                      (uint32_t)(w.y >> 17 & WALKJ_MAX),
+                      (uint32_t)(w.y >> 34 & WALKJ_MAX));
+}
+
+/* stores the new cursor: word x only */
+__device__ __forceinline__ void dev_walk_store(ulonglong2 * walk, uint32_t idx,
+                                               ulonglong2 const & w, uint64_t x)
+{
+    reinterpret_cast<uint64_t *>(walk + idx)[0] = (w.x & ~WALKX_MASK) | x;
+}
 
 /* Sieve cells are 16-bit: BIAS keeps them positive, NORM_CAP keeps
  * BIAS + norm + the survivor test inside 16 bits. */
@@ -96,30 +118,20 @@ constexpr uint32_t BK_W_MASK = (1u << (BK_RESIEVE_SHIFT - BK_W_SHIFT)) - 1;
 static_assert(BK_Q_SHIFT + 32 <= 64);
 
 constexpr int FILL_THREADS = 256;
-/* blocks per SM the fill kernel is compiled to fit (register cap
- * 65536 / (256 * N)); 0 leaves the register count to ptxas */
-#ifndef GLAS_FILL_MINBLOCKS
-#define GLAS_FILL_MINBLOCKS 0
-#endif
-#if GLAS_FILL_MINBLOCKS > 0
-#define FILL_BOUNDS __launch_bounds__(FILL_THREADS, GLAS_FILL_MINBLOCKS)
-#else
-#define FILL_BOUNDS
-#endif
-/* GLAS_FILL_STAGE: threads per block of the exchange-staged fill */
-constexpr int FILL_STAGE_THREADS = 256;
-
 /* Each region's bucket counter gets its own 128-byte L2 line.  The L2
  * serializes atomics that share a line, so packed counters queue each
  * fill atomic behind atomics for 31 unrelated regions, which inflates
  * the latency of the returned slot index that the bucket store needs. */
 constexpr uint32_t BK_CNT_STRIDE = 32;
 
-struct gpu_fb_entry {
+/* the transform kernel's view of an entry: q, its root and the
+ * reduction multiplier (2^64 - 1) / q; the fill kernels read the packed
+ * bucket form (fbp: q, resieve and weight in the bucket entry layout,
+ * 8 bytes) instead */
+struct __align__(16) gpu_fb_entry {
     uint32_t q;
     uint32_t r;
-    uint32_t weight;
-    uint32_t resieve;
+    uint64_t magic;
 };
 
 /* what the region and resieve kernels read of a small entry; one
@@ -146,8 +158,8 @@ struct gpu_task {
     int degree[2];
     double fijd[2][GLAS_MAX_DEGREE + 1];
     int32_t bound[2];
-    int skip;   /* probe bits: 1 norms, 2 small walk, 4 bucket apply,
-                   8 bucket stores, 64 index-derived stores */
+    int skip;   /* region probe bits: 1 norms, 2 small walk, 4 bucket
+                   apply, 16 dense walk, 32 sparse walk */
 };
 
 enum { PH_TRANSFORM, PH_FILL, PH_REGION, PH_TINY, PH_RESIEVE, N_PHASES };
@@ -222,12 +234,7 @@ struct gpu_slot {
     cudaStream_t stream;      /* chunk kernels */
     cudaStream_t out_stream;  /* filter kernel and D2H copies */
     uint32_t * roots[2];
-    uint64_t * walk_x[2];     /* FK walk resume position per entry */
-    uint4 * lattice[2];       /* reduced FK basis per large entry */
-    carry_state * carry[2];   /* GLAS_FILL_CARRY: [entry - n_band] */
-    uint8_t * nextc[2];       /* GLAS_FILL_CARRY: next hit chunk per entry */
-    uint32_t * active[2];     /* GLAS_FILL_CARRY: entries due this chunk */
-    uint32_t * n_active;      /* [side] */
+    ulonglong2 * walk[2];     /* walk record (cursor + basis) per entry */
     uint64_t * buckets[2];    /* [region][bucket_cap] packed hits */
     uint32_t * bucket_cnt[2]; /* [region * BK_CNT_STRIDE] */
     uint32_t * bitmask;       /* survivor bits, 1 bit per position */
@@ -244,7 +251,6 @@ struct gpu_slot {
                                  overflow-tail count */
     uint64_t * hits_sorted;   /* hits ordered by position, filter input */
     void * sort_temp;
-    void * select_temp;       /* GLAS_FILL_CARRY: cub::DeviceSelect scratch */
     uint32_t * fcnt;          /* filter output: kept survivors, host hits */
     cudaEvent_t fev[2];
     uint32_t * h_counters;
@@ -265,26 +271,29 @@ struct gpu_slot {
 
 struct gpu_context {
     gpu_fb_entry * fb[2];
+    uint64_t * fbp[2];        /* packed bucket form of each entry */
     gpu_small_entry * small[2];
     std::vector<gpu_fb_entry> h_fb[2];        /* gpu_prepare builds, gpu_init uploads */
+    std::vector<uint64_t> h_fbp[2];
     std::vector<gpu_small_entry> h_small[2];
     uint32_t n_fb[2];
     uint32_t n_band[2];       /* entries with q < fill_bands * I come first */
-    uint32_t n_owned[2];
-    uint32_t n_local[2];
+    uint32_t n_local[2];      /* entries with q < local_bound: the row kernel's */
     uint32_t n_small[2];      /* entries with q < I come before those */
     uint32_t n_dense[2];      /* entries with q < I/128 come before those */
     uint32_t n_skip[2];       /* leading entries with q < skip bound, not sieved */
     uint32_t n_pat[2];        /* the pattern entries come first in the dense tier */
     int32_t skip_comp[2];     /* bound compensation for skipped entries */
+    int32_t bound_adj = 0;    /* GLAS_BOUND_ADJ: sieve units added to the
+                                 survivor bound of both sides (negative
+                                 tightens it) */
     uint32_t bucket_cap[2];   /* hits per region per side */
     uint64_t chunk_area;      /* positions sieved per kernel pass */
     uint32_t max_regions;
     uint32_t max_survivors;
     uint32_t max_hits;
     int n_slots;
-    uint32_t fill_bands = 2;  /* fill threads per entry in [n_small, n_band) */
-    bool carry = false;       /* GLAS_FILL_CARRY */
+    uint32_t fill_bands = 2;  /* GLAS_FILL_BANDS: scales the row kernel's bound */
     bool bucket_slab = true;  /* GLAS_BUCKET_SLAB=0 selects the plain layout */
     bool norm_reg = true;     /* GLAS_NORM_REG=0 selects the shared-memory path */
     uint32_t norm_stride = 4; /* GLAS_NORM_STRIDE: cells per lane run */
@@ -293,23 +302,14 @@ struct gpu_context {
     uint32_t gate_shift = 3;  /* GLAS_FILL_GATE_SHIFT=0 reads the survivor mask */
     bool fill_tail0 = true;   /* GLAS_FILL_TAIL0=0 walks the side-0 tail in the row kernel */
     bool region_cand = true;  /* GLAS_REGION_CAND=0 computes all side-0 cells */
-    uint32_t carry_grid = 0;
-    bool fill_stage = false;  /* GLAS_FILL_STAGE */
-    uint32_t fill_owners = 1;
-    uint32_t fill_pair_slots = 0;
-    bool fill_pair_fused = true;
-    uint32_t fill_row_bands = 0;
+    uint32_t fill_row_bands = 32;
     bool fill_row_group = true;
-    bool fill_row_fused = true;
     uint32_t fill_row_window = 0;
     int fill_row_window_side = -1;
     bool fill_row_window_lean = false;
     uint32_t fill_row_window_blocks = 2;
     uint32_t fill_row_cluster = 1;
-    uint32_t fill_ahead = 0;
-    bool fill_owner_pairs = true;
-    uint32_t fill_stage_grid = 0;
-    uint32_t fill_stage_regions = 0;  /* regions with a slot in shared memory */
+    uint32_t fill_ahead = 1;
     gpu_slot slot[MAX_SLOTS];
     std::mutex lock;
     std::condition_variable cv;
@@ -325,7 +325,6 @@ struct gpu_context {
      * blocks on this device */
     uint32_t filter_grid = 0, tiny_grid = 0, rs_grid = 0;
     size_t sort_temp_bytes = 0;
-    size_t select_temp_bytes = 0;
     double filter_ms = 0;
     double ecm_ms = 0;        /* cofactor batches, classify to last round */
     int skip = 0;
@@ -340,6 +339,25 @@ struct gpu_context {
 
 char const * const PHASE_NAMES[N_PHASES] = {"transform", "fill", "region",
                                             "tiny", "resieve_s"};
+
+/* Survivor and resieve-hit list capacities per chunk: fractions of the
+ * area up to a limit, since candidates get rarer as the numbers grow.
+ * The peaks were 9636 survivors and 59111 hits at c100 and c120, in
+ * chunks of 2^23 positions, and 22925 and 186885 at c150, in chunks of
+ * 2^27.  The RSA-270 polynomial at q = 1e9 averages about 2500 survivors
+ * per chunk of 2^30, where the fractions alone would cost 2.6 GB per
+ * slot.  An overflow falls back to the CPU, which took 80 times as long
+ * at c120. */
+constexpr uint64_t MAX_SURVIVORS = 1ull << 20;
+constexpr uint64_t MAX_HITS = 1ull << 22;
+static uint32_t survivor_cap(uint64_t area)
+{
+    return (uint32_t)std::min(area / 64, MAX_SURVIVORS);
+}
+static uint32_t hit_cap(uint64_t area)
+{
+    return (uint32_t)std::min(area / 8, MAX_HITS);
+}
 
 gpu_context ctx;
 
@@ -590,12 +608,53 @@ void report_idle()
 
 /* ---------------- device helpers ---------------- */
 
+/* a / b from a float quotient and one fixup, for the Euclid steps of
+ * the transform.  The float quotient is within 0.875 of the real one
+ * when it is below 2^21, which b >= 2048 guarantees; a smaller b takes
+ * the exact division.  A double quotient took 3% less of the transform
+ * on an A100, but 9 times longer on an RTX 3080 Ti, which has few double
+ * units, and it pushed the region kernel, which inlines the inverse,
+ * past its 32-register budget into spills (nvcc -arch=sm_80 -Xptxas -v
+ * reports registers and spills). */
+__device__ __forceinline__ uint32_t dev_udiv(uint32_t a, uint32_t b)
+{
+    if (b < 2048u)
+        return a / b;
+    uint32_t q = (uint32_t)__fdividef(__uint2float_rz(a), __uint2float_rn(b));
+    int64_t const r = (int64_t)a - (int64_t)q * b;
+    if (r < 0)
+        q--;
+    else if (r >= (int64_t)b)
+        q++;
+    return q;
+}
+
+/* m mod q with M = (2^64 - 1) / q, for any 64-bit m: the quotient
+ * estimate is at most two short, so two fixups make it exact. */
+__device__ __forceinline__ uint32_t dev_mod_u64(uint64_t m, uint32_t q,
+                                                uint64_t M)
+{
+    uint64_t r = m - __umul64hi(m, M) * q;
+    if (r >= q)
+        r -= q;
+    if (r >= q)
+        r -= q;
+    return (uint32_t)r;
+}
+
+__device__ __forceinline__ uint32_t dev_mod_s64(int64_t v, uint32_t q,
+                                                uint64_t M)
+{
+    uint32_t const r = dev_mod_u64(v < 0 ? -(uint64_t)v : (uint64_t)v, q, M);
+    return v < 0 && r ? q - r : r;
+}
+
 __device__ uint32_t dev_invmod(uint32_t a, uint32_t m)
 {
     int64_t t = 0, newt = 1;
-    uint32_t r = m, newr = a % m;
+    uint32_t r = m, newr = a < m ? a : a % m;
     while (newr != 0) {
-        uint32_t const qq = r / newr;
+        uint32_t const qq = dev_udiv(r, newr);
         int64_t const t2 = t - (int64_t)qq * newt;
         t = newt; newt = t2;
         uint32_t const r2 = r - qq * newr;
@@ -642,18 +701,20 @@ __device__ uint32_t dev_gcd(uint32_t a, uint32_t b)
 }
 
 __device__ uint32_t dev_transform_root(gpu_task const & t, uint32_t q,
-                                       uint32_t r_enc)
+                                       uint32_t r_enc, uint64_t M)
 {
     if ((q & 1) == 0) {
+        /* q is a power of two, so the arithmetic modulo 2^32 of the
+         * uint32 casts is exact modulo q */
         bool const proj = r_enc >= q;
         uint32_t const R = proj ? r_enc - q : r_enc;
         uint32_t u, v;
         if (!proj) {
-            u = (uint32_t)((int64_t)R * (t.b1 % (int64_t)q) - t.a1);
-            v = (uint32_t)(t.a0 - (int64_t)R * (t.b0 % (int64_t)q));
+            u = R * (uint32_t)t.b1 - (uint32_t)t.a1;
+            v = (uint32_t)t.a0 - R * (uint32_t)t.b0;
         } else {
-            u = (uint32_t)(t.b1 - (int64_t)R * (t.a1 % (int64_t)q));
-            v = (uint32_t)((int64_t)R * (t.a0 % (int64_t)q) - t.b0);
+            u = (uint32_t)t.b1 - R * (uint32_t)t.a1;
+            v = R * (uint32_t)t.a0 - (uint32_t)t.b0;
         }
         if (v & 1)
             return (u * dev_invmod_po2(v)) & (q - 1);
@@ -671,8 +732,8 @@ __device__ uint32_t dev_transform_root(gpu_task const & t, uint32_t q,
     if (cmax < (1u << 30)) {
         int64_t const num = proj ? t.b1 - R * t.a1 : R * t.b1 - t.a1;
         int64_t const den = proj ? R * t.a0 - t.b0 : t.a0 - R * t.b0;
-        u = dev_mod_i64(num, q);
-        v = dev_mod_i64(den, q);
+        u = dev_mod_s64(num, q, M);
+        v = dev_mod_s64(den, q, M);
     } else {
         __int128 const num = proj ? (__int128)t.b1 - (__int128)R * t.a1
                                   : (__int128)R * t.b1 - t.a1;
@@ -683,11 +744,11 @@ __device__ uint32_t dev_transform_root(gpu_task const & t, uint32_t q,
     }
     uint32_t const vinv = dev_invmod(v, q);
     if (vinv)
-        return (uint32_t)((uint64_t)u * vinv % q);
+        return dev_mod_u64((uint64_t)u * vinv, q, M);
     uint32_t const uinv = dev_invmod(u, q);
     if (!uinv)
         return SKIP_ROOT;
-    return q + (uint32_t)((uint64_t)v * uinv % q);
+    return q + dev_mod_u64((uint64_t)v * uinv, q, M);
 }
 
 /* Franke-Kleinjung reduction, identical to the CPU core. */
@@ -708,12 +769,12 @@ struct dev_plattice {
                     reduce_with_vertical_vector(I);
                     return;
                 }
-                uint32_t const a = (mi0 + i1 - I) / i1;
+                uint32_t const a = dev_udiv(mi0 + i1 - I, i1);
                 mi0 -= a * i1;
                 j0 += a * j1;
                 return;
             }
-            { uint32_t const k = mi0 / i1; mi0 -= k * i1; j0 += k * j1; }
+            { uint32_t const k = dev_udiv(mi0, i1); mi0 -= k * i1; j0 += k * j1; }
             if (mi0 < I) {
                 if (mi0 == 0) {
                     mi0 = i1;
@@ -722,12 +783,12 @@ struct dev_plattice {
                     reduce_with_vertical_vector(I);
                     return;
                 }
-                uint32_t const a = (mi0 + i1 - I) / mi0;
+                uint32_t const a = dev_udiv(mi0 + i1 - I, mi0);
                 i1 -= a * mi0;
                 j1 += a * j0;
                 return;
             }
-            { uint32_t const k = i1 / mi0; i1 -= k * mi0; j1 += k * j0; }
+            { uint32_t const k = dev_udiv(i1, mi0); i1 -= k * mi0; j1 += k * j0; }
         }
     }
 
@@ -898,33 +959,24 @@ __device__ uint32_t dev_small_walk_start(gpu_task const & t, uint32_t q,
 
 /* ---------------- kernels ---------------- */
 
-__device__ uint64_t dev_pack_entry(gpu_fb_entry const & e)
-{
-    return (uint64_t)e.q << BK_Q_SHIFT | (uint64_t)e.resieve << BK_RESIEVE_SHIFT |
-           e.weight << BK_W_SHIFT;
-}
-
-/* With carry (GLAS_FILL_CARRY) the entries from n_band on get a
- * carry_state record and a nextc byte instead of walk_x and lattice. */
+/* Roots to the q-lattice and the walk record of every entry. */
 __global__ void transform_kernel(gpu_task t, gpu_fb_entry const * fb,
                                  uint32_t n, uint32_t * roots,
-                                 uint64_t * walk_x, uint4 * lattice, int side,
-                                 uint32_t n_band, carry_state * carry,
-                                 uint8_t * nextc)
+                                 ulonglong2 * walk, int side)
 {
     uint32_t const idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n)
         return;
+    uint32_t const I = 1u << t.logI;
     gpu_fb_entry const e = fb[idx];
     uint32_t const root = (side == t.sq_side && e.q == t.q && e.r == t.rho)
                               ? SKIP_ROOT
-                              : dev_transform_root(t, e.q, e.r);
+                              : dev_transform_root(t, e.q, e.r, e.magic);
     roots[idx] = root;
-    uint32_t const I = 1u << t.logI;
-    uint64_t x = WALK_SKIP;
+    uint64_t x = WALKX_SKIP;
     uint4 L = make_uint4(0, 0, 0, 0);
     if (root != SKIP_ROOT && root >= e.q) {
-        x = WALK_PROJ;
+        x = WALKX_PROJ;
     } else if (root != SKIP_ROOT) {
         dev_plattice const P(e.q, root, I);
         if (!(P.i1 >> t.logI)) {
@@ -932,14 +984,7 @@ __global__ void transform_kernel(gpu_task t, gpu_fb_entry const * fb,
             x = I / 2;
         }
     }
-    if (carry && idx >= n_band) {
-        carry[idx - n_band] = {{L.x, L.y}, {L.z, L.w}, x};
-        nextc[idx - n_band] = x == WALK_SKIP ? CARRY_DONE : 0;
-        return;
-    }
-    walk_x[idx] = x;
-    if (x != WALK_SKIP && x != WALK_PROJ)
-        lattice[idx] = L;
+    walk[idx] = make_walk(x, L);
 }
 
 /* Appends entry to the region's bucket: one global atomic for the slot
@@ -992,103 +1037,27 @@ __device__ void dev_hit_emit(uint32_t x, uint64_t rec, uint32_t max_hits,
     hit_cnt[1] = 1;   /* the chunk's overflow flag */
 }
 
-/* Runs walk(emit) with the emit the probe bits in t.skip select: 8
- * walks without stores, 64 stores without the counter atomics; the
- * default appends the gated packed | offset to the region's bucket. */
-template <typename W>
-__device__ void dev_fill_emit(gpu_task const & t, W walk, uint64_t packed,
-                              uint32_t const * gate,
-                              uint32_t bucket_cap, uint64_t * buckets,
-                              uint32_t * bucket_cnt, uint32_t * overflow)
-{
-    if (t.skip & 8) {
-        /* walk without stores; measures the enumeration cost alone */
-        uint32_t acc = 0;
-        walk([&](uint32_t x) { acc ^= x; });
-        if (acc == 0xdeadbeef)
-            *overflow = 2;
-        return;
-    }
-    if (t.skip & 64) {
-        /* stores without the counter atomics; wrong results, timing only */
-        walk([&](uint32_t x) {
-            uint32_t const region = x >> SREG_LOG;
-            uint32_t const q = (uint32_t)(packed >> BK_Q_SHIFT);
-            buckets[dev_bucket_idx(region, q & (bucket_cap - 1), bucket_cap)] =
-                packed | (x & (SREG - 1));
-        });
-        return;
-    }
-    walk([&](uint32_t x) {
-        if (dev_gate_drops(gate, x))
-            return;
-        dev_bucket_append(x >> SREG_LOG, packed | (x & (SREG - 1)),
-                          bucket_cap, buckets, bucket_cnt, overflow);
-    });
-}
-
-/* One thread walks one large entry over the chunk, except the entries
- * [n_small, n_band): each of those gets nbands threads, and thread k
- * walks its own band of chunk rows.  A band thread starts from the
- * first strip point of its band instead of the walk cursor, so the
- * cursor stays at the transform kernel's value for those entries. */
-__global__ void FILL_BOUNDS fill_kernel(gpu_task t, gpu_fb_entry const * fb,
-                            uint32_t n_small, uint32_t n_band,
-                            uint32_t nbands, uint32_t n,
-                            uint32_t const * roots, uint64_t * walk_x,
-                            uint4 const * lattice, uint32_t bucket_cap,
-                            uint64_t * buckets, uint32_t * bucket_cnt,
-                            uint32_t * overflow, uint32_t const * gate)
-{
-    uint32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t const nbt = (n_band - n_small) * nbands;
-    bool const banded = tid < nbt;
-    uint32_t const nb = banded ? nbands : 1;
-    uint32_t const idx = banded ? n_small + tid / nb : n_band + tid - nbt;
-    if (idx >= n)
-        return;
-    uint64_t const x0 = walk_x[idx];
-    if (x0 == WALK_SKIP)
-        return;
-    uint32_t const band = tid % nb;
-    uint32_t const jb = t.j0 + band * t.rows / nb;
-    uint32_t const je = t.j0 + (band + 1) * t.rows / nb;
-    uint64_t const xend = (uint64_t)je << t.logI;
-    if (x0 >= xend)
-        return;
-    auto walk = [&](auto emit) {
-        if (x0 == WALK_PROJ)
-            dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, jb, je, emit);
-        else if (banded)
-            dev_affine_walk(t, lattice[idx],
-                            dev_band_start(t, fb[idx].q, roots[idx], jb, je),
-                            xend, emit);
-        else
-            walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, emit);
-    };
-    dev_fill_emit(t, walk, dev_pack_entry(fb[idx]), gate, bucket_cap, buckets,
-                  bucket_cnt, overflow);
-}
-
-/* With GATED (GLAS_FILL_TAIL0) the kernel walks the side-0 tail of one
+/* One thread walks one large entry (q >= local_bound) over the chunk.
+ * With GATED (GLAS_FILL_TAIL0) the kernel walks the side-0 tail of one
  * chunk and stores only the hits under the gate. */
 template <bool GATED>
-__global__ void FILL_BOUNDS
-fill_ahead_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t first,
-                  uint32_t n, uint32_t const * roots, uint64_t * walk_x,
-                  uint4 const * lattice, uint32_t regions, uint32_t cap,
-                  uint64_t * buckets, uint32_t * cnt, uint32_t * overflow,
-                  uint32_t const * gate)
+__global__ void fill_ahead_kernel(gpu_task t, uint64_t const * fbp,
+                                  uint32_t first, uint32_t n,
+                                  uint32_t const * roots, ulonglong2 * walk,
+                                  uint32_t regions, uint32_t cap,
+                                  uint64_t * buckets, uint32_t * cnt,
+                                  uint32_t * overflow, uint32_t const * gate)
 {
     uint32_t const idx = first + blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n)
         return;
-    uint64_t const x0 = walk_x[idx];
+    ulonglong2 const rec = walk[idx];
+    uint64_t const x0 = rec.x & WALKX_MASK;
     uint32_t const je = t.j0 + t.rows;
     uint64_t const xend = (uint64_t)je << t.logI;
-    if (x0 == WALK_SKIP || x0 >= xend)
+    if (x0 == WALKX_SKIP || x0 >= xend)
         return;
-    uint64_t const packed = dev_pack_entry(fb[idx]);
+    uint64_t const packed = fbp[idx];
     auto emit = [&](uint32_t x) {
         if constexpr (GATED)
             if (dev_gate_drops(gate, x))
@@ -1099,132 +1068,12 @@ fill_ahead_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t first,
             buckets + (uint64_t)bank * cap, cnt + bank * BK_CNT_STRIDE,
             overflow);
     };
-    if (x0 == WALK_PROJ)
-        dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, t.j0, je, emit);
-    else
-        walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, emit);
-}
-
-__device__ void dev_bucket_append_pair(uint32_t region, uint64_t a, uint64_t b,
-                                       uint32_t cap, uint64_t * buckets,
-                                       uint32_t * cnt, uint32_t * overflow)
-{
-    uint32_t const slot = atomicAdd(&cnt[region * BK_CNT_STRIDE], 2);
-    if (slot >= cap || cap - slot < 2) {
-        *overflow = 1;
-        return;
-    }
-    if (slot & 1) {
-        buckets[dev_bucket_idx(region, slot, cap)] = a;
-        buckets[dev_bucket_idx(region, slot + 1, cap)] = b;
+    if (x0 == WALKX_PROJ) {
+        uint32_t const q = (uint32_t)(packed >> BK_Q_SHIFT);
+        dev_proj_walk(t, q, roots[idx] - q, t.j0, je, emit);
     } else {
-        *(ulonglong2 *)(buckets + dev_bucket_idx(region, slot, cap)) =
-            make_ulonglong2(a, b);
-    }
-}
-
-template <int LOG_SLOTS>
-__global__ void __launch_bounds__(FILL_THREADS, 6)
-fill_local_pair_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
-                       uint32_t n_band, uint32_t nbands, uint32_t n,
-                       uint32_t n_local,
-                       uint32_t const * roots, uint64_t * walk_x,
-                       uint4 const * lattice, uint32_t cap, uint64_t * buckets,
-                       uint32_t * cnt, uint32_t * overflow,
-                       uint32_t const * gate)
-{
-    constexpr uint32_t SLOTS = 1u << LOG_SLOTS;
-    constexpr uint32_t OWNER_SHIFT = 31 - LOG_SLOTS;
-    constexpr uint32_t POS_MASK = (1u << OWNER_SHIFT) - 1;
-    constexpr uint32_t EMPTY = ~0u;
-    static_assert(LOG_SLOTS >= 10 && FILL_THREADS == 256);
-    __shared__ uint32_t pending[SLOTS];
-    __shared__ uint64_t packed[FILL_THREADS];
-    uint32_t const tid = blockIdx.x * FILL_THREADS + threadIdx.x;
-    uint32_t const nbt = (n_band - n_small) * nbands;
-    bool const banded = tid < nbt;
-    uint32_t const nb = banded ? nbands : 1;
-    uint32_t const idx = banded ? n_small + tid / nb : n_band + tid - nbt;
-    bool const cache_block = blockIdx.x * FILL_THREADS <
-        n_local - n_small + (n_band - n_small) * (nbands - 1);
-    if (cache_block) {
-        packed[threadIdx.x] = idx < n ? dev_pack_entry(fb[idx]) : 0;
-        for (uint32_t k = threadIdx.x; k < SLOTS; k += FILL_THREADS)
-            pending[k] = EMPTY;
-        __syncthreads();
-    }
-    auto position = [&](uint32_t held, uint32_t k) {
-        return (((held & POS_MASK) >> SREG_LOG) << (SREG_LOG + LOG_SLOTS)) |
-               (k << SREG_LOG) | (held & (SREG - 1));
-    };
-    auto emit = [&](uint32_t x) {
-        uint32_t const region = x >> SREG_LOG;
-        uint32_t const k = region & (SLOTS - 1);
-        uint32_t const token = (threadIdx.x << OWNER_SHIFT) |
-            ((x >> (SREG_LOG + LOG_SLOTS)) << SREG_LOG) | (x & (SREG - 1));
-        cuda::atomic_ref<uint32_t, cuda::thread_scope_block> cell(pending[k]);
-        uint32_t held = cell.load(cuda::memory_order_relaxed);
-        bool pair;
-        for (;;) {
-            pair = held != EMPTY &&
-                   ((held ^ token) & (POS_MASK & ~(SREG - 1))) == 0;
-            uint32_t const seen = atomicCAS(&pending[k], held, pair ? EMPTY : token);
-            if (seen == held)
-                break;
-            held = seen;
-        }
-        if (held == EMPTY)
-            return;
-        uint32_t const old_x = position(held, k);
-        uint64_t const old = packed[held >> OWNER_SHIFT] | (old_x & (SREG - 1));
-        if (pair)
-            dev_bucket_append_pair(region, old, packed[threadIdx.x] |
-                (x & (SREG - 1)), cap, buckets, cnt, overflow);
-        else
-            dev_bucket_append(old_x >> SREG_LOG, old, cap, buckets, cnt, overflow);
-    };
-    auto walk = [&](auto store) {
-        if (idx >= n)
-            return;
-        auto hit = [&](uint32_t x) {
-            if (dev_gate_drops(gate, x))
-                return;
-            store(x);
-        };
-        uint64_t const x0 = walk_x[idx];
-        uint32_t const band = tid % nb;
-        uint32_t const jb = t.j0 + band * t.rows / nb;
-        uint32_t const je = t.j0 + (band + 1) * t.rows / nb;
-        uint64_t const xend = (uint64_t)je << t.logI;
-        if (x0 != WALK_SKIP && x0 < xend) {
-            if (x0 == WALK_PROJ)
-                dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, jb, je, hit);
-            else if (banded)
-                dev_affine_walk(t, lattice[idx],
-                    dev_band_start(t, fb[idx].q, roots[idx], jb, je), xend, hit);
-            else
-                walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, hit);
-        }
-    };
-    if (idx < n_local) {
-        walk(emit);
-    } else {
-        uint64_t const entry = idx < n ? dev_pack_entry(fb[idx]) : 0;
-        walk([&](uint32_t x) {
-            dev_bucket_append(x >> SREG_LOG, entry | (x & (SREG - 1)),
-                              cap, buckets, cnt, overflow);
-        });
-    }
-    if (!cache_block)
-        return;
-    __syncthreads();
-    for (uint32_t k = threadIdx.x; k < SLOTS; k += FILL_THREADS) {
-        uint32_t const held = pending[k];
-        if (held != EMPTY) {
-            uint32_t const x = position(held, k);
-            dev_bucket_append(x >> SREG_LOG, packed[held >> OWNER_SHIFT] |
-                (x & (SREG - 1)), cap, buckets, cnt, overflow);
-        }
+        dev_walk_store(walk, idx, rec,
+            dev_affine_walk(t, dev_walk_basis(rec), x0, xend, emit));
     }
 }
 
@@ -1240,339 +1089,190 @@ struct no_cluster {
 template <bool GROUP, uint32_t ROWS = 0, uint32_t C = 1, bool LEAN = false,
           uint32_t BLOCKS = 2>
 __global__ void __launch_bounds__(FILL_THREADS, ROWS ? BLOCKS : 6)
-fill_row_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
+fill_row_kernel(gpu_task t, uint64_t const * fbp, uint32_t n_small,
                 uint32_t n, uint32_t n_all, uint32_t bands, uint32_t const * roots,
-                uint64_t * walk_x, uint4 const * lattice, uint32_t cap, uint64_t * buckets,
+                ulonglong2 * walk, uint32_t cap, uint64_t * buckets,
                 uint32_t * cnt, uint32_t * overflow, uint32_t const * gate)
 {
-    uint32_t const tid = blockIdx.x * FILL_THREADS + threadIdx.x;
     constexpr uint32_t WIDTH = ROWS ? FILL_THREADS * C : 32;
     uint32_t const row_threads =
         (((n - n_small + WIDTH - 1) / WIDTH * WIDTH * bands + FILL_THREADS - 1) / FILL_THREADS) *
         FILL_THREADS;
-    if (tid >= row_threads) {
-        uint32_t const idx = n + tid - row_threads;
-        if (idx >= n_all)
-            return;
-        uint64_t const x0 = walk_x[idx];
-        uint32_t const je = t.j0 + t.rows;
-        uint64_t const xend = (uint64_t)je << t.logI;
-        if (x0 == WALK_SKIP || x0 >= xend)
-            return;
-        uint64_t const packed = dev_pack_entry(fb[idx]);
-        auto hit = [&](uint32_t x) {
-            if (dev_gate_drops(gate, x))
-                return;
-            dev_bucket_append(x >> SREG_LOG, packed | (x & (SREG - 1)),
-                              cap, buckets, cnt, overflow);
-        };
-        if (x0 == WALK_PROJ)
-            dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, t.j0, je, hit);
-        else
-            walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, hit);
-        return;
-    }
-    uint32_t const lane = threadIdx.x & 31;
-    uint32_t const band = (tid / WIDTH) % bands;
-    uint32_t const idx = n_small + (tid / WIDTH / bands) * WIDTH + tid % WIDTH;
-    uint32_t const jb = t.j0 + band * t.rows / bands;
-    uint32_t const je = t.j0 + (band + 1) * t.rows / bands;
-    uint64_t const x0 = idx < n ? walk_x[idx] : WALK_SKIP;
-    bool const active = x0 != WALK_SKIP && x0 != WALK_PROJ;
-    uint32_t const q = active ? fb[idx].q : 1;
-    uint32_t const r = active ? roots[idx] : 0;
-    uint64_t const packed = active ? dev_pack_entry(fb[idx]) : 0;
-    uint32_t const I = 1u << t.logI;
-    uint32_t off = ((uint64_t)r * jb + I / 2) % q;
-    if constexpr (ROWS) {
-        static_assert(FILL_THREADS * ROWS < (1u << (32 - 17)));
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
-        no_cluster const cluster;
-#else
-        auto const cluster = cooperative_groups::this_cluster();
-#endif
-        auto sync = [&] {
-            if constexpr (C == 1) __syncthreads();
-            else cluster.sync();
-        };
-        auto map = [&](uint32_t * p, uint32_t rank) {
-            if constexpr (C == 1) return p;
-            else return cluster.map_shared_rank(p, rank);
-        };
-        uint32_t const rank = blockIdx.x % C;
-        uint32_t const regions = ROWS << max((int)t.logI - SREG_LOG, 0);
-        extern __shared__ uint32_t row_window_storage[];
-        uint32_t * used = row_window_storage, * base = used + regions;
-        for (uint32_t row = jb; row < je; row += ROWS) {
-            for (uint32_t k = threadIdx.x; k < regions; k += FILL_THREADS)
-                used[k] = 0;
-            __syncthreads();
-            uint32_t const first = ((row - t.j0) << t.logI) >> SREG_LOG;
-            uint32_t held[LEAN ? 1 : ROWS];
-            uint32_t hits = 0, o = off;
-            #pragma unroll
-            for (uint32_t k = 0; k < ROWS; k++) {
-                uint32_t const x = ((row + k - t.j0) << t.logI) + o;
-                bool const hit = active && row + k < je && o < I &&
-                                 dev_fill_keeps(t, row + k, o) &&
-                                 !dev_gate_drops(gate, x);
-                if constexpr (LEAN) {
-                    if (hit) {
-                        atomicAdd(used + ((x >> SREG_LOG) - first), 1);
-                        hits |= 1u << k;
-                    }
-                } else {
-                    held[k] = 0;
-                    if (hit) {
-                        uint32_t const ticket = atomicAdd(used + ((x >> SREG_LOG) - first), 1);
-                        held[k] = ((ticket + 1) << t.logI) | o;
-                    }
-                }
-                uint64_t const next = (uint64_t)o + r;
-                o = next >= q ? next - q : next;
-            }
-            if constexpr (!LEAN)
-                off = o;
-            sync();
-            for (uint32_t k = threadIdx.x * C + rank; k < regions; k += FILL_THREADS * C) {
-                uint32_t sizes[C], total = 0;
-                #pragma unroll
-                for (uint32_t c = 0; c < C; c++) {
-                    sizes[c] = map(used, c)[k];
-                    total += sizes[c];
-                }
-                uint32_t offset = total ? atomicAdd(cnt + (first + k) * BK_CNT_STRIDE, total) : 0;
-                #pragma unroll
-                for (uint32_t c = 0; c < C; c++) {
-                    map(base, c)[k] = offset;
-                    offset += sizes[c];
-                }
-            }
-            sync();
-            if constexpr (LEAN) {
-                #pragma unroll
-                for (uint32_t k = 0; k < ROWS; k++) {
-                    if (hits >> k & 1) {
-                        uint32_t const x = ((row + k - t.j0) << t.logI) + off;
-                        uint32_t const region = x >> SREG_LOG;
-                        uint32_t const slot = atomicAdd(base + (region - first), 1);
-                        if (slot < cap)
-                            buckets[dev_bucket_idx(region, slot, cap)] = packed | (x & (SREG - 1));
-                        else
-                            *overflow = 1;
-                    }
-                    uint64_t const next = (uint64_t)off + r;
-                    off = next >= q ? next - q : next;
-                }
-            } else {
-                #pragma unroll
-                for (uint32_t k = 0; k < ROWS; k++) {
-                    uint32_t const ticket = held[k] >> t.logI;
-                    if (ticket) {
-                        uint32_t const x = ((row + k - t.j0) << t.logI) + (held[k] & (I - 1));
-                        uint32_t const region = x >> SREG_LOG;
-                        uint32_t const slot = base[region - first] + ticket - 1;
-                        if (slot < cap)
-                            buckets[dev_bucket_idx(region, slot, cap)] = packed | (x & (SREG - 1));
-                        else
-                            *overflow = 1;
-                    }
-                }
-            }
-        }
-        sync();
-    } else for (uint32_t j = jb; j < je; j++) {
-        uint32_t const x = ((j - t.j0) << t.logI) + off;
-        bool const hit = active && off < I && dev_fill_keeps(t, j, off) &&
-                         !dev_gate_drops(gate, x);
-        uint32_t const mask = __ballot_sync(~0u, hit);
-        if (hit) {
-            uint32_t const region = x >> SREG_LOG;
-            uint64_t const entry = packed | (x & (SREG - 1));
-            if (GROUP) {
-                uint32_t const peers = __match_any_sync(mask, region);
-                uint32_t const leader = __ffs(peers) - 1;
-                uint32_t slot = 0;
-                if (lane == leader)
-                    slot = atomicAdd(&cnt[region * BK_CNT_STRIDE], __popc(peers));
-                slot = __shfl_sync(peers, slot, leader) +
-                       __popc(peers & ((1u << lane) - 1));
-                if (slot < cap)
-                    buckets[dev_bucket_idx(region, slot, cap)] = entry;
-                else
-                    *overflow = 1;
-            } else {
-                dev_bucket_append(region, entry, cap, buckets, cnt, overflow);
-            }
-        }
-        uint64_t const next = (uint64_t)off + r;
-        off = next >= q ? next - q : next;
-    }
-    if (idx < n && x0 == WALK_PROJ)
-        dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, jb, je,
-            [&](uint32_t x) {
+    /* row_threads is a multiple of the block size, so a block's threads
+     * take the same branch and the warps stay whole for the ballots */
+    for (uint32_t tid = blockIdx.x * FILL_THREADS + threadIdx.x;
+         tid < row_threads + (n_all - n); tid += gridDim.x * FILL_THREADS) {
+        if (tid >= row_threads) {
+            uint32_t const idx = n + tid - row_threads;
+            ulonglong2 const rec = walk[idx];
+            uint64_t const x0 = rec.x & WALKX_MASK;
+            uint32_t const je = t.j0 + t.rows;
+            uint64_t const xend = (uint64_t)je << t.logI;
+            if (x0 == WALKX_SKIP || x0 >= xend)
+                continue;
+            uint64_t const packed = fbp[idx];
+            auto hit = [&](uint32_t x) {
                 if (dev_gate_drops(gate, x))
                     return;
-                dev_bucket_append(x >> SREG_LOG, dev_pack_entry(fb[idx]) |
-                    (x & (SREG - 1)), cap, buckets, cnt, overflow);
-            });
-}
-
-/* GLAS_FILL_STAGE: the staged fill.  One resident block per SM keeps
- * one 8-byte slot per region of the chunk in shared memory, and its
- * threads take the fill items of fill_kernel in a static stride.  A hit
- * puts its entry into the empty slot of its region, or takes the entry
- * the slot holds and appends both to the bucket with one reservation
- * and one 16-byte store, so the global operations per hit halve.  Put
- * and take are one compare-and-swap each; a swap that loses a race
- * sees the new slot value and tries again.  After the walk the block
- * flushes the slots that still hold an entry.  The bucket contents
- * equal the direct fill's in another order inside each bucket.  A
- * packed entry is never 0 (q is not 0), so 0 marks an empty slot.
- * The first n_staged regions have a slot; a hit in a later region
- * takes the direct path. */
-__global__ void __launch_bounds__(FILL_STAGE_THREADS, 1)
-fill_stage_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
-                  uint32_t n_band, uint32_t nbands, uint32_t n,
-                  uint32_t const * roots, uint64_t * walk_x,
-                  uint4 const * lattice, uint32_t n_staged,
-                  uint32_t bucket_cap, uint64_t * buckets,
-                  uint32_t * bucket_cnt, uint32_t * overflow,
-                  uint32_t owners, uint32_t const * gate)
-{
-    bool const owned = owners > 1;
-    uint32_t const unit = 1u << max((int)t.logI - SREG_LOG, 0);
-    uint32_t const units = t.nregions / unit;
-    uint32_t const rank = blockIdx.x % owners;
-    uint32_t const first = units * rank / owners * unit;
-    uint32_t const last = units * (rank + 1) / owners * unit;
-    extern __shared__ unsigned long long slot[];   /* [n_staged] */
-    for (uint32_t r = threadIdx.x; r < n_staged; r += FILL_STAGE_THREADS)
-        slot[r] = 0;
-    __syncthreads();
-    auto hit = [&](uint32_t x, uint64_t packed) {
-        if (dev_gate_drops(gate, x))
-            return;
-        uint32_t const region = x >> SREG_LOG;
-        uint32_t const local = region - first;
-        uint64_t const entry = packed | (x & (SREG - 1));
-        if (local >= n_staged) {
-            dev_bucket_append(region, entry, bucket_cap, buckets, bucket_cnt,
-                              overflow);
-            return;
-        }
-        unsigned long long held = slot[local];
-        for (;;) {
-            unsigned long long const seen =
-                atomicCAS(&slot[local], held, held ? 0 : entry);
-            if (seen == held)
-                break;
-            held = seen;
-        }
-        if (held == 0)
-            return;
-        uint32_t const b = atomicAdd(&bucket_cnt[region * BK_CNT_STRIDE], 2);
-        if (b + 2 > bucket_cap) {
-            *overflow = 1;
-            return;
-        }
-        /* the count is odd after another block flushed a single entry;
-         * slots b and b + 1 are then not adjacent in the slab layout */
-        if (b & 1) {
-            buckets[dev_bucket_idx(region, b, bucket_cap)] = held;
-            buckets[dev_bucket_idx(region, b + 1, bucket_cap)] = entry;
-            return;
-        }
-        *(ulonglong2 *)(buckets + dev_bucket_idx(region, b, bucket_cap)) =
-            make_ulonglong2(held, entry);
-    };
-    uint32_t const nbt = (n_band - n_small) * nbands;
-    uint32_t const n_item = nbt + n - n_band;
-    /* the loop is warp-uniform and the warp converges before each item,
-     * so the item loads coalesce and the walks of one item run in one
-     * warp pass as in fill_kernel */
-    for (uint32_t base = blockIdx.x / owners * FILL_STAGE_THREADS +
-                             (threadIdx.x & ~31u);
-         base < n_item; base += gridDim.x / owners * FILL_STAGE_THREADS) {
-        __syncwarp();
-        uint32_t const tid = base + (threadIdx.x & 31);
-        if (tid >= n_item)
-            continue;
-        /* the item decode of fill_kernel */
-        bool const banded = tid < nbt;
-        uint32_t const nb = banded ? nbands : 1;
-        uint32_t const idx = banded ? n_small + tid / nb : n_band + tid - nbt;
-        uint64_t const x0 = walk_x[idx];
-        if (x0 == WALK_SKIP)
-            continue;
-        uint32_t const band = tid % nb;
-        uint32_t const jb = t.j0 + (owned ? (first << SREG_LOG) >> t.logI
-                                        : band * t.rows / nb);
-        uint32_t const je = t.j0 + (owned ? (last << SREG_LOG) >> t.logI
-                                        : (band + 1) * t.rows / nb);
-        uint64_t const xend = (uint64_t)je << t.logI;
-        if (x0 >= xend)
-            continue;
-        uint64_t const packed = dev_pack_entry(fb[idx]);
-        auto emit = [&](uint32_t x) { hit(x, packed); };
-        if (x0 == WALK_PROJ)
-            dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, jb, je, emit);
-        else if (banded || owned)
-            dev_affine_walk(t, lattice[idx],
-                            dev_band_start(t, fb[idx].q, roots[idx], jb, je),
-                            xend, emit);
-        else
-            walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, emit);
-    }
-    __syncthreads();
-    for (uint32_t r = threadIdx.x; r < n_staged; r += FILL_STAGE_THREADS)
-        if (slot[r])
-            dev_bucket_append(first + r, slot[r], bucket_cap, buckets, bucket_cnt,
-                              overflow);
-}
-
-/* GLAS_FILL_CARRY: cub::DeviceSelect::If predicate; selects the large
- * entries whose next hit is in chunk cur. */
-struct carry_due {
-    uint8_t const * nextc;
-    uint32_t cur;
-    __device__ bool operator()(uint32_t li) const { return nextc[li] == cur; }
-};
-
-/* GLAS_FILL_CARRY: walks the listed large entries over the whole
- * chunk, one thread per entry, and files each under the chunk of its
- * next hit.  A projective entry is due in every chunk. */
-__global__ void fill_carry_kernel(gpu_task t, uint32_t chunk_log,
-                                  gpu_fb_entry const * fb,
-                                  uint32_t const * roots, uint32_t n_band,
-                                  uint32_t const * active,
-                                  uint32_t const * n_active,
-                                  carry_state * carry, uint8_t * nextc,
-                                  uint32_t bucket_cap, uint64_t * buckets,
-                                  uint32_t * bucket_cnt, uint32_t * overflow)
-{
-    uint32_t const je = t.j0 + t.rows;
-    uint64_t const xend = (uint64_t)je << t.logI;
-    uint32_t const n = *n_active;
-    for (uint32_t k = blockIdx.x * blockDim.x + threadIdx.x; k < n;
-         k += gridDim.x * blockDim.x) {
-        uint32_t const li = active[k];
-        uint32_t const idx = n_band + li;
-        carry_state const s = carry[li];
-        auto walk = [&](auto emit) {
-            uint64_t x = xend;
-            if (s.x == WALK_PROJ) {
-                dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, t.j0, je,
-                              emit);
+                dev_bucket_append(x >> SREG_LOG, packed | (x & (SREG - 1)),
+                                  cap, buckets, cnt, overflow);
+            };
+            if (x0 == WALKX_PROJ) {
+                uint32_t const q = (uint32_t)(packed >> BK_Q_SHIFT);
+                dev_proj_walk(t, q, roots[idx] - q, t.j0, je, hit);
             } else {
-                uint4 const L = make_uint4(s.L0.x, s.L0.y, s.L1.x, s.L1.y);
-                x = dev_affine_walk(t, L, s.x, xend, emit);
-                carry[li].x = x;
+                dev_walk_store(walk, idx, rec,
+                    dev_affine_walk(t, dev_walk_basis(rec), x0, xend, hit));
             }
-            nextc[li] = (uint8_t)min(x >> chunk_log, (uint64_t)CARRY_DONE);
-        };
-        dev_fill_emit(t, walk, dev_pack_entry(fb[idx]), nullptr, bucket_cap,
-                      buckets, bucket_cnt, overflow);
+            continue;
+        }
+        uint32_t const lane = threadIdx.x & 31;
+        uint32_t const band = (tid / WIDTH) % bands;
+        uint32_t const idx = n_small + (tid / WIDTH / bands) * WIDTH + tid % WIDTH;
+        uint32_t const jb = t.j0 + band * t.rows / bands;
+        uint32_t const je = t.j0 + (band + 1) * t.rows / bands;
+        uint64_t const x0 = idx < n ? walk[idx].x & WALKX_MASK : WALKX_SKIP;
+        bool const active = x0 != WALKX_SKIP && x0 != WALKX_PROJ;
+        uint64_t const packed = active ? fbp[idx] : 0;
+        uint32_t const q = active ? (uint32_t)(packed >> BK_Q_SHIFT) : 1;
+        uint32_t const r = active ? roots[idx] : 0;
+        uint32_t const I = 1u << t.logI;
+        uint32_t off = ((uint64_t)r * jb + I / 2) % q;
+        if constexpr (ROWS) {
+            static_assert(FILL_THREADS * ROWS < (1u << (32 - 17)));
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+            no_cluster const cluster;
+#else
+            auto const cluster = cooperative_groups::this_cluster();
+#endif
+            auto sync = [&] {
+                if constexpr (C == 1) __syncthreads();
+                else cluster.sync();
+            };
+            auto map = [&](uint32_t * p, uint32_t rank) {
+                if constexpr (C == 1) return p;
+                else return cluster.map_shared_rank(p, rank);
+            };
+            uint32_t const rank = blockIdx.x % C;
+            uint32_t const regions = ROWS << max((int)t.logI - SREG_LOG, 0);
+            extern __shared__ uint32_t row_window_storage[];
+            uint32_t * used = row_window_storage, * base = used + regions;
+            for (uint32_t row = jb; row < je; row += ROWS) {
+                for (uint32_t k = threadIdx.x; k < regions; k += FILL_THREADS)
+                    used[k] = 0;
+                __syncthreads();
+                uint32_t const first = ((row - t.j0) << t.logI) >> SREG_LOG;
+                uint32_t held[LEAN ? 1 : ROWS];
+                uint32_t hits = 0, o = off;
+                #pragma unroll
+                for (uint32_t k = 0; k < ROWS; k++) {
+                    uint32_t const x = ((row + k - t.j0) << t.logI) + o;
+                    bool const hit = active && row + k < je && o < I &&
+                                     dev_fill_keeps(t, row + k, o) &&
+                                     !dev_gate_drops(gate, x);
+                    if constexpr (LEAN) {
+                        if (hit) {
+                            atomicAdd(used + ((x >> SREG_LOG) - first), 1);
+                            hits |= 1u << k;
+                        }
+                    } else {
+                        held[k] = 0;
+                        if (hit) {
+                            uint32_t const ticket = atomicAdd(used + ((x >> SREG_LOG) - first), 1);
+                            held[k] = ((ticket + 1) << t.logI) | o;
+                        }
+                    }
+                    uint64_t const next = (uint64_t)o + r;
+                    o = next >= q ? next - q : next;
+                }
+                if constexpr (!LEAN)
+                    off = o;
+                sync();
+                for (uint32_t k = threadIdx.x * C + rank; k < regions; k += FILL_THREADS * C) {
+                    uint32_t sizes[C], total = 0;
+                    #pragma unroll
+                    for (uint32_t c = 0; c < C; c++) {
+                        sizes[c] = map(used, c)[k];
+                        total += sizes[c];
+                    }
+                    uint32_t offset = total ? atomicAdd(cnt + (first + k) * BK_CNT_STRIDE, total) : 0;
+                    #pragma unroll
+                    for (uint32_t c = 0; c < C; c++) {
+                        map(base, c)[k] = offset;
+                        offset += sizes[c];
+                    }
+                }
+                sync();
+                if constexpr (LEAN) {
+                    #pragma unroll
+                    for (uint32_t k = 0; k < ROWS; k++) {
+                        if (hits >> k & 1) {
+                            uint32_t const x = ((row + k - t.j0) << t.logI) + off;
+                            uint32_t const region = x >> SREG_LOG;
+                            uint32_t const slot = atomicAdd(base + (region - first), 1);
+                            if (slot < cap)
+                                buckets[dev_bucket_idx(region, slot, cap)] = packed | (x & (SREG - 1));
+                            else
+                                *overflow = 1;
+                        }
+                        uint64_t const next = (uint64_t)off + r;
+                        off = next >= q ? next - q : next;
+                    }
+                } else {
+                    #pragma unroll
+                    for (uint32_t k = 0; k < ROWS; k++) {
+                        uint32_t const ticket = held[k] >> t.logI;
+                        if (ticket) {
+                            uint32_t const x = ((row + k - t.j0) << t.logI) + (held[k] & (I - 1));
+                            uint32_t const region = x >> SREG_LOG;
+                            uint32_t const slot = base[region - first] + ticket - 1;
+                            if (slot < cap)
+                                buckets[dev_bucket_idx(region, slot, cap)] = packed | (x & (SREG - 1));
+                            else
+                                *overflow = 1;
+                        }
+                    }
+                }
+            }
+            sync();
+        } else for (uint32_t j = jb; j < je; j++) {
+            uint32_t const x = ((j - t.j0) << t.logI) + off;
+            bool const hit = active && off < I && dev_fill_keeps(t, j, off) &&
+                             !dev_gate_drops(gate, x);
+            uint32_t const mask = __ballot_sync(~0u, hit);
+            if (hit) {
+                uint32_t const region = x >> SREG_LOG;
+                uint64_t const entry = packed | (x & (SREG - 1));
+                if (GROUP) {
+                    uint32_t const peers = __match_any_sync(mask, region);
+                    uint32_t const leader = __ffs(peers) - 1;
+                    uint32_t slot = 0;
+                    if (lane == leader)
+                        slot = atomicAdd(&cnt[region * BK_CNT_STRIDE], __popc(peers));
+                    slot = __shfl_sync(peers, slot, leader) +
+                           __popc(peers & ((1u << lane) - 1));
+                    if (slot < cap)
+                        buckets[dev_bucket_idx(region, slot, cap)] = entry;
+                    else
+                        *overflow = 1;
+                } else {
+                    dev_bucket_append(region, entry, cap, buckets, cnt, overflow);
+                }
+            }
+            uint64_t const next = (uint64_t)off + r;
+            off = next >= q ? next - q : next;
+        }
+        if (idx < n && x0 == WALKX_PROJ) {
+            uint64_t const pe = fbp[idx];
+            uint32_t const pq = (uint32_t)(pe >> BK_Q_SHIFT);
+            dev_proj_walk(t, pq, roots[idx] - pq, jb, je,
+                [&](uint32_t x) {
+                    if (dev_gate_drops(gate, x))
+                        return;
+                    dev_bucket_append(x >> SREG_LOG, pe | (x & (SREG - 1)),
+                                      cap, buckets, cnt, overflow);
+                });
+        }
     }
 }
 
@@ -1851,7 +1551,10 @@ region_kernel(gpu_task t, gpu_small_entry const * small,
 
     /* small entries: the warp group g = warp >> segs_log walks the dense
      * entries g, g + 32 / segs, ..., each warp of the group one row
-     * segment; one thread per sparse walk */
+     * segment; one thread per sparse walk.  (Passing the sparse entries
+     * through the warp batches as well ran the kernel three times
+     * slower: a sparse entry has about one hit in the window, so a
+     * batch entry is a whole warp instruction for one lane.) */
     if (t.skip & 2)
         n_small = n_dense = n_pat = n_skip = 0;
     uint32_t const dense_end = (t.skip & 16) ? 0 : n_dense;
@@ -2023,13 +1726,14 @@ constexpr uint32_t REGION_SMEM = SREG * 2 + PAT_LEN * 2;
 constexpr uint32_t RS_TILE = 1024;
 constexpr uint32_t RS_EGRP = 512;   /* entries per block group */
 
-__global__ void resieve_compact_kernel(gpu_fb_entry const * fb,
+__global__ void resieve_compact_kernel(uint64_t const * fbp,
                                        uint32_t n_small,
                                        uint32_t const * roots,
                                        uint32_t * rs_idx, uint32_t * rs_cnt)
 {
     uint32_t const e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= n_small || !fb[e].resieve || roots[e] == SKIP_ROOT)
+    if (e >= n_small || !(fbp[e] >> BK_RESIEVE_SHIFT & 1) ||
+        roots[e] == SKIP_ROOT)
         return;
     rs_idx[atomicAdd(rs_cnt, 1)] = e;
 }
@@ -3500,23 +3204,9 @@ void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
         ctx.skip = atoi(e);
     if (char const * e = getenv("GLAS_FILL_BANDS"))
         ctx.fill_bands = std::max(1, atoi(e));
-    ctx.carry = env_flag("GLAS_FILL_CARRY", false);
-    if (char const * e = getenv("GLAS_FILL_OWNERS"))
-        ctx.fill_owners = atoi(e);
-    assert(ctx.fill_owners >= 1 && ctx.fill_owners <= 16 &&
-           !(ctx.fill_owners & (ctx.fill_owners - 1)));
-    assert(ctx.fill_owners == 1 || !ctx.carry);
-    ctx.fill_owner_pairs = env_flag("GLAS_FILL_OWNER_PAIRS", true);
-    if (char const * e = getenv("GLAS_FILL_PAIR_SLOTS"))
-        ctx.fill_pair_slots = strtoul(e, nullptr, 10);
-    ctx.fill_pair_fused = env_flag("GLAS_FILL_PAIR_FUSED", true);
-    ctx.fill_stage = ctx.fill_owners > 1 || env_flag("GLAS_FILL_STAGE", false);
-    ctx.fill_row_bands = !ctx.fill_pair_slots && !ctx.fill_stage &&
-                        !ctx.carry && ctx.skip == 0 ? 32 : 0;
     if (char const * e = getenv("GLAS_FILL_ROW_BANDS"))
-        ctx.fill_row_bands = strtoul(e, nullptr, 10);
+        ctx.fill_row_bands = std::max(1ul, strtoul(e, nullptr, 10));
     ctx.fill_row_group = env_flag("GLAS_FILL_ROW_GROUP", true);
-    ctx.fill_row_fused = env_flag("GLAS_FILL_ROW_FUSED", true);
     if (char const * e = getenv("GLAS_FILL_ROW_WINDOW"))
         ctx.fill_row_window = strtoul(e, nullptr, 10);
     if (char const * e = getenv("GLAS_FILL_ROW_WINDOW_SIDE"))
@@ -3526,45 +3216,36 @@ void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
         ctx.fill_row_window_blocks = strtoul(e, nullptr, 10);
     if (char const * e = getenv("GLAS_FILL_ROW_CLUSTER"))
         ctx.fill_row_cluster = strtoul(e, nullptr, 10);
-    ctx.fill_ahead = ctx.fill_row_bands ? 1 : 0;
     if (char const * e = getenv("GLAS_FILL_AHEAD"))
         ctx.fill_ahead = strtoul(e, nullptr, 10);
     assert(ctx.fill_ahead <= 2);
     assert(ctx.fill_row_window_side >= -1 && ctx.fill_row_window_side <= 1);
-    assert(!ctx.fill_ahead || ctx.fill_row_bands);
     assert(ctx.fill_row_window == 0 || ctx.fill_row_window == 8 ||
            ctx.fill_row_window == 16 || ctx.fill_row_window == 32);
     assert(ctx.fill_row_cluster == 1 || (ctx.fill_row_cluster == 2 && ctx.fill_row_window));
     assert(ctx.fill_row_window_blocks == 2 || ctx.fill_row_window_blocks == 6);
     assert((!ctx.fill_row_window_lean && ctx.fill_row_window_blocks == 2) ||
            (ctx.fill_row_window == 8 && ctx.fill_row_cluster == 1));
-    assert(!ctx.fill_row_window || (ctx.fill_row_bands && ctx.fill_row_group));
-    assert(ctx.fill_pair_slots == 0 || ctx.fill_pair_slots == 1024 ||
-           ctx.fill_pair_slots == 4096);
-    bool const local_fill = ctx.fill_pair_slots || ctx.fill_row_bands;
-    assert(!(ctx.fill_pair_slots && ctx.fill_row_bands));
-    assert(!local_fill || (!ctx.fill_stage && !ctx.carry && ctx.skip == 0));
-    uint32_t local_bound = ctx.fill_row_bands ?
-        std::max(4u, ctx.fill_bands) * I : 1u << 22;
+    assert(!ctx.fill_row_window || ctx.fill_row_group);
+    /* the row kernel walks the entries with q in [I, local_bound) row by
+     * row; the fill_ahead kernel walks the larger ones along their
+     * lattice (GLAS_FILL_LOCAL_BOUND; 2^21 and up measured slower) */
+    uint32_t local_bound = std::max(4u, ctx.fill_bands) * I;
     if (char const * e = getenv("GLAS_FILL_LOCAL_BOUND"))
         local_bound = strtoul(e, nullptr, 10);
-    assert(!local_fill || local_bound >= ctx.fill_bands * I);
-    uint32_t owner_bound = 1u << 20;
-    if (char const * e = getenv("GLAS_FILL_OWNER_BOUND"))
-        owner_bound = strtoul(e, nullptr, 10);
-    assert(owner_bound > 0);
+    assert(local_bound >= ctx.fill_bands * I);
     ctx.bucket_slab = env_flag("GLAS_BUCKET_SLAB", true);
     ctx.norm_reg = env_flag("GLAS_NORM_REG", true);
     ctx.fill_gate = env_flag("GLAS_FILL_GATE", true);
+    /* 3 (8 positions per gate bit, a 2 MB gate per 2^30 chunk): on an
+     * A100, 2 ran 8% slower and 4 and 5 within 1% either way */
     ctx.gate_shift = ctx.fill_gate ? 3 : 0;
     if (char const * e = getenv("GLAS_FILL_GATE_SHIFT"))
         ctx.gate_shift = strtoul(e, nullptr, 10);
     assert(ctx.gate_shift <= 5 && (ctx.fill_gate || !ctx.gate_shift));
-    ctx.fill_tail0 = env_flag("GLAS_FILL_TAIL0",
-                              ctx.fill_gate && ctx.fill_row_bands);
-    assert(!ctx.fill_tail0 || (ctx.fill_gate && ctx.fill_row_bands));
-    bool const cand_ok = logI >= SREG_LOG && ctx.norm_reg &&
-                         ctx.skip == 0 && !ctx.fill_stage;
+    ctx.fill_tail0 = env_flag("GLAS_FILL_TAIL0", ctx.fill_gate);
+    assert(!ctx.fill_tail0 || ctx.fill_gate);
+    bool const cand_ok = logI >= SREG_LOG && ctx.norm_reg && ctx.skip == 0;
     ctx.region_cand = env_flag("GLAS_REGION_CAND", cand_ok);
     assert(!ctx.region_cand || cand_ok);
     /* the lane run must be a multiple of the four cells one packed
@@ -3575,6 +3256,16 @@ void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
         (ctx.norm_stride & 3))
         ctx.norm_stride = 4;
     ctx.fill_coprime = env_flag("GLAS_FILL_COPRIME", true);
+    if (char const * e = getenv("GLAS_BOUND_ADJ"))
+        ctx.bound_adj = atoi(e);
+    /* GLAS_GATE_CAP_DIV: the gated side stores a small fraction of its
+     * hits (0.6% at q = 1e9 with this polynomial), so its buckets need a
+     * fraction of the ungated capacity; 2 keeps a wide margin (the peak
+     * was 15% of the halved capacity for RSA-270 and 31% at c120) and an
+     * overflow still falls back to the CPU. */
+    uint32_t gate_cap_div = 2;
+    if (char const * e = getenv("GLAS_GATE_CAP_DIV"))
+        gate_cap_div = std::max(1u, (uint32_t)strtoul(e, nullptr, 10));
     for (int side = 0; side < 2; side++) {
         /* skip tier: entries with q below the bound are not sieved;
          * the survivor bound rises by a multiple of their expected
@@ -3590,10 +3281,10 @@ void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
 
         /* skip, dense, sparse small, banded, local, then large entries */
         uint32_t const band_bound = ctx.fill_bands * I;
-        auto tier = [I, skip_bound, band_bound, local_fill, local_bound](fb_entry const & e) {
+        auto tier = [I, skip_bound, band_bound, local_bound](fb_entry const & e) {
             return e.q < skip_bound ? 0 : e.q < I / 128 ? 1 :
                    e.q < I ? 2 : e.q < band_bound ? 3 :
-                   local_fill && e.q < local_bound ? 4 : 5;
+                   e.q < local_bound ? 4 : 5;
         };
         /* thread t owns the range [lo(t), lo(t + 1)) of the factor base
          * and its own slots in each tier, so each tier holds its entries
@@ -3622,10 +3313,15 @@ void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
             }
         std::vector<gpu_fb_entry> & h = ctx.h_fb[side];
         h.resize(n);
+        /* weight | resieve << 8 of each tiered entry, for the small table
+         * and the packed form */
+        std::vector<uint16_t> hw(n);
         run_threads(threads, [&](unsigned t) {
             for (size_t k = lo(t); k < lo(t + 1); k++) {
                 fb_entry const & e = fb[side][k];
-                h[off[t][tier(e)]++] = {e.q, e.r, e.weight, e.resieve};
+                size_t const pos = off[t][tier(e)]++;
+                h[pos] = {e.q, e.r, UINT64_MAX / e.q};
+                hw[pos] = (uint16_t)(e.weight | (unsigned)e.resieve << 8);
             }
         });
         ctx.n_fb[side] = h.size();
@@ -3633,14 +3329,7 @@ void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
         ctx.n_dense[side] = cnt[0] + cnt[1];
         ctx.n_small[side] = cnt[0] + cnt[1] + cnt[2];
         ctx.n_band[side] = cnt[0] + cnt[1] + cnt[2] + cnt[3];
-        ctx.n_owned[side] = ctx.n_small[side];
-        ctx.n_local[side] = local_fill ? ctx.n_band[side] + cnt[4] : ctx.n_small[side];
-        if (ctx.fill_owners > 1)
-            ctx.n_owned[side] = std::stable_partition(
-                h.begin() + ctx.n_band[side], h.end(),
-                [owner_bound](gpu_fb_entry const & e) {
-                    return e.q < owner_bound;
-                }) - h.begin();
+        ctx.n_local[side] = ctx.n_band[side] + cnt[4];
 
         /* dense tier: the pattern entries first, so the pattern build
          * scans only them */
@@ -3653,18 +3342,29 @@ void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
 
         double comp = 0.0;
         for (uint32_t k = 0; k < cnt[0]; k++)
-            comp += (double)h[k].weight / h[k].q;
+            comp += (double)(hw[k] & 0xff) / h[k].q;
         ctx.skip_comp[side] = (int32_t)std::lround(comp_x * comp);
 
         std::vector<gpu_small_entry> & m = ctx.h_small[side];
         m.resize(ctx.n_small[side]);
         for (uint32_t k = 0; k < ctx.n_small[side]; k++)
-            m[k] = {h[k].q, h[k].weight, UINT64_MAX / h[k].q};
+            m[k] = {h[k].q, (uint32_t)(hw[k] & 0xff), h[k].magic};
+
+        std::vector<uint64_t> & hp = ctx.h_fbp[side];
+        hp.resize(n);
+        run_threads(threads, [&](unsigned t) {
+            for (size_t k = lo(t); k < lo(t + 1); k++)
+                hp[k] = (uint64_t)h[k].q << BK_Q_SHIFT |
+                        (uint64_t)(hw[k] >> 8 & 1) << BK_RESIEVE_SHIFT |
+                        (uint64_t)(hw[k] & 0xff) << BK_W_SHIFT;
+        });
 
         double dens = 0.0;
         for (double d : part_dens)
             dens += d;
         ctx.bucket_cap[side] = ((uint32_t)(SREG * dens * 1.25) & ~31u) + 512;
+        if (side == 0 && ctx.fill_gate)
+            ctx.bucket_cap[side] = (ctx.bucket_cap[side] / gate_cap_div + 63) & ~63u;
         /* the slab layout fills whole 64-entry pieces */
         if (ctx.bucket_slab)
             ctx.bucket_cap[side] = (ctx.bucket_cap[side] + 63) & ~63u;
@@ -3751,14 +3451,11 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
         CUDA_CHECK(cudaMemcpy(ctx.small[side], m.data(),
                               m.size() * sizeof(gpu_small_entry),
                               cudaMemcpyHostToDevice));
-    }
-    for (int side = 0; ctx.carry && side < 2; side++) {
-        size_t bytes = 0;
-        CUDA_CHECK(cub::DeviceSelect::If(
-            nullptr, bytes, thrust::counting_iterator<uint32_t>(0),
-            (uint32_t *)nullptr, (uint32_t *)nullptr,
-            ctx.n_fb[side] - ctx.n_band[side], carry_due{nullptr, 0}));
-        ctx.select_temp_bytes = std::max(ctx.select_temp_bytes, bytes);
+
+        std::vector<uint64_t> const hp = std::move(ctx.h_fbp[side]);
+        CUDA_CHECK(cudaMalloc(&ctx.fbp[side], hp.size() * 8));
+        CUDA_CHECK(cudaMemcpy(ctx.fbp[side], hp.data(), hp.size() * 8,
+                              cudaMemcpyHostToDevice));
     }
     lap("fb");
 
@@ -3771,7 +3468,8 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
      * cheap, and the slots keep the device busy while the host
      * processes survivors. */
     auto slot_bytes = [](uint64_t area) {
-        uint64_t b = area / 8 + 2 * (area / 64 * (4 + 16) + area / 8 * 8);
+        uint64_t b = area / 8 + 2 * ((uint64_t)survivor_cap(area) * (4 + 16) +
+                                    (uint64_t)hit_cap(area) * 8);
         if (ctx.filter && !ctx.rhits) {
             b += area / 8 * 8;
             size_t st = 0;
@@ -3785,17 +3483,11 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
              * per parity */
             b += 2 * ((area >> SREG_LOG) * (RHITS_CAP * 8 + 4) +
                       RHITS_OV * 8);
-        b += ctx.select_temp_bytes;
         if (ctx.gate_shift)
             b += area / 8 >> ctx.gate_shift;
         for (int side = 0; side < 2; side++) {
-            /* roots for all entries; walk_x + lattice for the walked
-             * entries; carry record, next-chunk byte and active-list
-             * slot for the carried entries */
-            uint64_t const n_large = ctx.n_fb[side] - ctx.n_band[side];
-            uint64_t const n_walk = ctx.carry ? ctx.n_band[side] : ctx.n_fb[side];
-            b += (uint64_t)ctx.n_fb[side] * 4 + n_walk * 24 +
-                 (ctx.carry ? n_large * (sizeof(carry_state) + 5) : 0) +
+            /* roots and walk records for all entries, then the buckets */
+            b += (uint64_t)ctx.n_fb[side] * (4 + sizeof(ulonglong2)) +
                  (area >> SREG_LOG) * (side == 1 && ctx.fill_ahead ? ctx.fill_ahead : 1) *
                      (ctx.bucket_cap[side] * 8 + BK_CNT_STRIDE * 4);
         }
@@ -3834,8 +3526,8 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
     uint32_t const fill_coprime = ctx.fill_coprime;
     CUDA_CHECK(cudaMemcpyToSymbol(c_fill_coprime, &fill_coprime, 4));
     CUDA_CHECK(cudaMemcpyToSymbol(c_gate_shift, &ctx.gate_shift, 4));
-    ctx.max_survivors = chunk / 64;
-    ctx.max_hits = chunk / 8;
+    ctx.max_survivors = survivor_cap(chunk);
+    ctx.max_hits = hit_cap(chunk);
     if (ctx.assemble)
         ctx.fcand_cap = std::min(ctx.max_survivors, FCAND_MAX);
     if (ctx.filter) {
@@ -3855,49 +3547,17 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
     }
     ctx.tiny_grid = full_grid(tiny_mask_kernel, 256, 0);
     ctx.rs_grid = full_grid(resieve_small_kernel, 256, 0);
-    if (ctx.carry) {
-        ctx.carry_grid = full_grid(fill_carry_kernel, 256, 0);
-        assert(total_area / chunk < CARRY_DONE);
-    }
-    if (ctx.fill_stage) {
-        /* the fill probes are fill_kernel paths */
-        assert(!(ctx.skip & (8 | 64)));
-        /* the 16-byte pair store needs buckets that start 16-byte aligned */
-        assert(ctx.bucket_cap[0] % 2 == 0 && ctx.bucket_cap[1] % 2 == 0);
-        /* the slot table leaves room for one region block on the SM */
-        int smem = 0, reserved = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(
-            &smem, cudaDevAttrMaxSharedMemoryPerMultiprocessor, 0));
-        CUDA_CHECK(cudaDeviceGetAttribute(
-            &reserved, cudaDevAttrReservedSharedMemoryPerBlock, 0));
-        uint32_t const unit = 1u << std::max(logI - SREG_LOG, 0);
-        uint32_t const owner_regions =
-            (ctx.max_regions / unit + ctx.fill_owners - 1) / ctx.fill_owners * unit;
-        ctx.fill_stage_regions = std::min<uint32_t>(
-            owner_regions, (smem - REGION_SMEM - 2 * reserved) / 8);
-        size_t const bytes = (size_t)ctx.fill_stage_regions * 8;
-        CUDA_CHECK(cudaFuncSetAttribute(
-            fill_stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)bytes));
-        /* both kernels ask for the largest shared memory carveout, so
-         * one fill block and one region block share an SM */
-        CUDA_CHECK(cudaFuncSetAttribute(
-            fill_stage_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-            cudaSharedmemCarveoutMaxShared));
-        CUDA_CHECK(cudaFuncSetAttribute(
-            region_kernel<0>, cudaFuncAttributePreferredSharedMemoryCarveout,
-            cudaSharedmemCarveoutMaxShared));
-        ctx.fill_stage_grid =
-            full_grid(fill_stage_kernel, FILL_STAGE_THREADS, bytes);
-        ctx.fill_stage_grid =
-            ctx.fill_stage_grid / ctx.fill_owners * ctx.fill_owners;
-        assert(ctx.fill_stage_grid > 0);
-    }
-
-    ctx.n_slots = (int)std::min<uint64_t>(MAX_SLOTS,
+    /* A chunk of 2^30 fills the device for tens of milliseconds, and four
+     * slots measured 1-2% slower than two on an A100.  A smaller chunk
+     * finishes before the host hands over the next one, so it takes the
+     * slots that fit: at c120, 8 ran 2.5 times faster than 2 on an RTX
+     * 3080 Ti.  GLAS_GPU_SLOTS sets the count within the memory budget. */
+    ctx.n_slots = (int)std::min<uint64_t>(chunk >= 1ull << 30 ? 2 : MAX_SLOTS,
                                           budget / slot_bytes(chunk));
     if (char const * e = getenv("GLAS_GPU_SLOTS"))
-        ctx.n_slots = std::min(ctx.n_slots, atoi(e));
+        ctx.n_slots = (int)std::min<uint64_t>(
+            std::min<uint64_t>(MAX_SLOTS, budget / slot_bytes(chunk)),
+            std::max(1, atoi(e)));
     if (char const * e = getenv("GLAS_XFORM_REPEAT"))
         ctx.xform_repeat = std::max(1, atoi(e));
     ctx.pipeline = env_flag("GLAS_PIPELINE", true);
@@ -3924,17 +3584,9 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
                                                 cudaStreamNonBlocking,
                                                 prio_greatest));
         for (int side = 0; side < 2; side++) {
-            uint32_t const n_large = ctx.n_fb[side] - ctx.n_band[side];
-            uint32_t const n_walk = ctx.carry ? ctx.n_band[side] : ctx.n_fb[side];
             CUDA_CHECK(cudaMalloc(&s.roots[side], ctx.n_fb[side] * 4));
-            CUDA_CHECK(cudaMalloc(&s.walk_x[side], n_walk * 8));
-            CUDA_CHECK(cudaMalloc(&s.lattice[side], n_walk * 16));
-            if (ctx.carry) {
-                CUDA_CHECK(cudaMalloc(&s.carry[side],
-                                      n_large * sizeof(carry_state)));
-                CUDA_CHECK(cudaMalloc(&s.nextc[side], n_large));
-                CUDA_CHECK(cudaMalloc(&s.active[side], n_large * 4));
-            }
+            CUDA_CHECK(cudaMalloc(&s.walk[side],
+                                  ctx.n_fb[side] * sizeof(ulonglong2)));
             uint32_t const regions = ctx.max_regions *
                 (side == 1 && ctx.fill_ahead ? ctx.fill_ahead : 1);
             CUDA_CHECK(cudaMalloc(&s.buckets[side], (uint64_t)regions *
@@ -3944,10 +3596,6 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
             CUDA_CHECK(cudaMalloc(&s.rs_idx[side], ctx.n_small[side] * 4));
         }
         CUDA_CHECK(cudaMalloc(&s.rs_cnt, 2 * 4));
-        if (ctx.carry) {
-            CUDA_CHECK(cudaMalloc(&s.n_active, 2 * 4));
-            CUDA_CHECK(cudaMalloc(&s.select_temp, ctx.select_temp_bytes));
-        }
         CUDA_CHECK(cudaMalloc(&s.bitmask, ctx.chunk_area / 8));
         if (ctx.gate_shift)
             CUDA_CHECK(cudaMalloc(&s.cgate, ctx.chunk_area / 8 >> ctx.gate_shift));
@@ -4017,15 +3665,13 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
 
     if (ctx.stats) {
         fprintf(stderr,
-                "# GPU slots: %d, chunk 2^%d, %.2f GB per slot, fill stage "
-                "%d x %u blocks, %u of %u regions staged, bucket slab %d, "
-                "gate shift %u, side-0 tail kernel %d, side-0 candidate "
-                "region %d\n",
+                "# GPU slots: %d, chunk 2^%d, %.2f GB per slot, %u regions, "
+                "bucket slab %d, gate shift %u, side-0 tail kernel %d, "
+                "side-0 candidate region %d, bucket caps %u %u\n",
                 ctx.n_slots, 63 - __builtin_clzll(ctx.chunk_area),
-                slot_bytes(chunk) / 1073741824.0, ctx.fill_stage,
-                ctx.fill_stage_grid, ctx.fill_stage_regions, ctx.max_regions,
+                slot_bytes(chunk) / 1073741824.0, ctx.max_regions,
                 ctx.bucket_slab, ctx.gate_shift, ctx.fill_tail0,
-                ctx.region_cand);
+                ctx.region_cand, ctx.bucket_cap[0], ctx.bucket_cap[1]);
         for (int k = 0; k < ctx.n_slots; k++) {
             for (int par = 0; par < 2; par++)
                 for (int e = 0; e < N_EVENTS; e++)
@@ -4100,7 +3746,7 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
         t.degree[side] = task.degree[side];
         for (int k = 0; k <= task.degree[side]; k++)
             t.fijd[side][k] = task.fijd[side][k];
-        t.bound[side] = task.bound[side] + ctx.skip_comp[side];
+        t.bound[side] = task.bound[side] + ctx.skip_comp[side] + ctx.bound_adj;
     }
     t.skip = ctx.skip;
 
@@ -4154,170 +3800,100 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
             uint32_t const n = ctx.n_fb[side];
             for (int rep = 0; rep < ctx.xform_repeat; rep++)
                 transform_kernel<<<(n + 255) / 256, 256, 0, st>>>(
-                    t, ctx.fb[side], n, s.roots[side], s.walk_x[side],
-                    s.lattice[side], side, ctx.n_band[side], s.carry[side],
-                    s.nextc[side]);
+                    t, ctx.fb[side], n, s.roots[side], s.walk[side], side);
             if (side == 0)
                 CUDA_CHECK(cudaMemsetAsync(s.rs_cnt, 0, 2 * 4, st));
             resieve_compact_kernel<<<(ctx.n_small[side] + 255) / 256, 256, 0,
-                                     st>>>(ctx.fb[side], ctx.n_small[side],
+                                     st>>>(ctx.fbp[side], ctx.n_small[side],
                                            s.roots[side], s.rs_idx[side],
                                            s.rs_cnt + side);
         }
         mark(PH_TRANSFORM);
         auto fill = [&](int side, uint32_t const * gate) {
-            /* with carry, fill_kernel walks the banded entries only */
+            /* The large entries (q >= local_bound) walk their lattice in
+             * fill_ahead_kernel: on side 1 a chunk ahead, on side 0 under
+             * the gate.  Without those (GLAS_FILL_AHEAD=0, GLAS_FILL_TAIL0=0)
+             * the row kernel takes them after its row items. */
             bool const ahead = ctx.fill_ahead && side == 1;
             bool const tail0 = ctx.fill_tail0 && side == 0;
-            uint32_t const n = ctx.carry ? ctx.n_band[side] :
-                ahead || tail0 ? ctx.n_local[side] : ctx.n_fb[side];
+            uint32_t const n = ahead || tail0 ? ctx.n_local[side] : ctx.n_fb[side];
+            uint32_t const large_grid =
+                (ctx.n_fb[side] - n + FILL_THREADS - 1) / FILL_THREADS;
             if (ahead && !bank && n < ctx.n_fb[side]) {
                 gpu_task next = t;
                 next.rows = std::min(ctx.fill_ahead * chunk_rows, task.J - j0);
                 next.area = next.rows << task.logI;
                 next.nregions = next.area >> SREG_LOG;
-                fill_ahead_kernel<false><<<(ctx.n_fb[side] - n + FILL_THREADS - 1) /
-                                     FILL_THREADS, FILL_THREADS, 0, st>>>(
-                    next, ctx.fb[side], n, ctx.n_fb[side], s.roots[side],
-                    s.walk_x[side], s.lattice[side], ctx.max_regions,
+                fill_ahead_kernel<false><<<large_grid, FILL_THREADS, 0, st>>>(
+                    next, ctx.fbp[side], n, ctx.n_fb[side], s.roots[side],
+                    s.walk[side], ctx.max_regions,
                     ctx.bucket_cap[side], s.buckets[side], s.bucket_cnt[side],
                     s.counters[par] + 2, nullptr);
             }
             if (tail0 && n < ctx.n_fb[side])
-                fill_ahead_kernel<true><<<(ctx.n_fb[side] - n + FILL_THREADS - 1) /
-                                    FILL_THREADS, FILL_THREADS, 0, st>>>(
-                    t, ctx.fb[side], n, ctx.n_fb[side], s.roots[side],
-                    s.walk_x[side], s.lattice[side], ctx.max_regions,
+                fill_ahead_kernel<true><<<large_grid, FILL_THREADS, 0, st>>>(
+                    t, ctx.fbp[side], n, ctx.n_fb[side], s.roots[side],
+                    s.walk[side], ctx.max_regions,
                     ctx.bucket_cap[side], buckets[side], bucket_cnt[side],
                     s.counters[par] + 2, gate);
-            bool const owned = ctx.fill_owners > 1;
-            bool const local = ctx.fill_pair_slots || ctx.fill_row_bands;
-            bool const fused = ((ctx.fill_pair_slots && ctx.fill_pair_fused) ||
-                                (ctx.fill_row_bands && ctx.fill_row_fused)) &&
-                                ctx.n_local[side] > ctx.n_small[side];
-            uint32_t const n_small = owned ? ctx.n_owned[side] :
-                local ? ctx.n_local[side] : ctx.n_small[side];
-            uint32_t const n_band = owned || local ? n_small : ctx.n_band[side];
-            uint32_t const n_thr =
-                n - n_small + (n_band - n_small) *
-                                            (ctx.fill_bands - 1);
-            uint32_t const unit = 1u << std::max((int)t.logI - SREG_LOG, 0);
-            uint32_t const owner_regions =
-                (t.nregions / unit + ctx.fill_owners - 1) / ctx.fill_owners * unit;
-            uint32_t const n_staged =
-                std::min(owner_regions, ctx.fill_stage_regions);
-            if (local && ctx.n_local[side] > ctx.n_small[side]) {
-                uint32_t const count = ctx.n_local[side] - ctx.n_small[side];
-                if (ctx.fill_pair_slots) {
-                    uint32_t const total = ctx.fill_pair_fused ? n : ctx.n_local[side];
-                    uint32_t const threads = total - ctx.n_small[side] +
-                        (ctx.n_band[side] - ctx.n_small[side]) * (ctx.fill_bands - 1);
-                    auto launch = [&](auto kernel) {
-                        kernel<<<(threads + FILL_THREADS - 1) / FILL_THREADS,
-                                 FILL_THREADS, 0, st>>>(
-                            t, ctx.fb[side], ctx.n_small[side], ctx.n_band[side],
-                            ctx.fill_bands, total, ctx.n_local[side], s.roots[side],
-                            s.walk_x[side], s.lattice[side], ctx.bucket_cap[side],
-                            buckets[side], bucket_cnt[side], s.counters[par] + 2,
-                            gate);
-                    };
-                    if (ctx.fill_pair_slots == 1024)
-                        launch(fill_local_pair_kernel<10>);
-                    else
-                        launch(fill_local_pair_kernel<12>);
-                } else {
-                    uint32_t const bands = std::min(ctx.fill_row_bands, t.rows);
-                    uint32_t const total = ctx.fill_row_fused ? n : ctx.n_local[side];
-                    uint32_t const window = ctx.fill_row_window_side < 0 ||
-                        ctx.fill_row_window_side == side ? ctx.fill_row_window : 0;
-                    uint32_t const width = window ?
-                        FILL_THREADS * ctx.fill_row_cluster : 32;
-                    uint32_t const row_threads =
-                        (((count + width - 1) / width * width * bands + FILL_THREADS - 1) /
-                         FILL_THREADS) * FILL_THREADS;
-                    uint32_t const threads = row_threads + total - ctx.n_local[side];
-                    auto launch = [&](auto kernel) {
-                        kernel<<<(threads + FILL_THREADS - 1) / FILL_THREADS,
-                                 FILL_THREADS, 0, st>>>(
-                            t, ctx.fb[side], ctx.n_small[side], ctx.n_local[side], total,
-                            bands, s.roots[side], s.walk_x[side], s.lattice[side], ctx.bucket_cap[side],
-                            buckets[side], bucket_cnt[side], s.counters[par] + 2,
-                            gate);
-                    };
-                    if (window) {
-                        uint32_t const c = ctx.fill_row_cluster;
-                        cudaLaunchAttribute attr{};
-                        attr.id = cudaLaunchAttributeClusterDimension;
-                        attr.val.clusterDim = {c, 1, 1};
-                        cudaLaunchConfig_t config{};
-                        config.gridDim = {(threads + FILL_THREADS * c - 1) / (FILL_THREADS * c) * c, 1, 1};
-                        config.blockDim = {FILL_THREADS, 1, 1};
-                        config.dynamicSmemBytes = 2 * window * unit * sizeof(uint32_t);
-                        config.stream = st;
-                        config.attrs = &attr;
-                        config.numAttrs = c > 1 ? 1 : 0;
-                        auto reserve = [&](auto kernel) {
-                            CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, t, ctx.fb[side],
-                                ctx.n_small[side], ctx.n_local[side], total, bands, s.roots[side],
-                                s.walk_x[side], s.lattice[side], ctx.bucket_cap[side], buckets[side],
-                                bucket_cnt[side], s.counters[par] + 2, gate));
-                        };
-                        bool const lean = ctx.fill_row_window_lean;
-                        bool const b6 = ctx.fill_row_window_blocks == 6;
-                        if (window == 8) {
-                            if (c == 2) reserve(fill_row_kernel<true, 8, 2>);
-                            else if (lean && b6) reserve(fill_row_kernel<true, 8, 1, true, 6>);
-                            else if (lean) reserve(fill_row_kernel<true, 8, 1, true>);
-                            else if (b6) reserve(fill_row_kernel<true, 8, 1, false, 6>);
-                            else reserve(fill_row_kernel<true, 8, 1>);
-                        } else if (window == 16) {
-                            if (c == 1) reserve(fill_row_kernel<true, 16, 1>);
-                            else reserve(fill_row_kernel<true, 16, 2>);
-                        } else {
-                            if (c == 1) reserve(fill_row_kernel<true, 32, 1>);
-                            else reserve(fill_row_kernel<true, 32, 2>);
-                        }
-                    } else if (ctx.fill_row_group)
-                        launch(fill_row_kernel<true>);
-                    else
-                        launch(fill_row_kernel<false>);
-                }
-            }
-            if (ctx.fill_stage && (n_thr || owned))
-                fill_stage_kernel<<<ctx.fill_stage_grid, FILL_STAGE_THREADS,
-                                    (size_t)n_staged * 8, st>>>(
-                    t, ctx.fb[side], ctx.n_small[side],
-                    owned ? ctx.n_small[side] : ctx.n_band[side],
-                    owned ? 1 : ctx.fill_bands, owned ? ctx.n_owned[side] : n,
-                    s.roots[side], s.walk_x[side], s.lattice[side],
-                    owned && !ctx.fill_owner_pairs ? 0 : n_staged,
-                    ctx.bucket_cap[side], buckets[side],
-                    bucket_cnt[side], s.counters[par] + 2, ctx.fill_owners,
-                    gate);
-            if (n_thr && (!ctx.fill_stage || owned) &&
-                !fused)
-                fill_kernel<<<(n_thr + FILL_THREADS - 1) / FILL_THREADS,
-                              FILL_THREADS, 0, st>>>(
-                    t, ctx.fb[side], n_small, n_band,
-                    ctx.fill_bands, n,
-                    s.roots[side], s.walk_x[side], s.lattice[side],
-                    ctx.bucket_cap[side], buckets[side],
-                    bucket_cnt[side], s.counters[par] + 2, gate);
-            uint32_t const n_large = ctx.n_fb[side] - ctx.n_band[side];
-            if (!ctx.carry || !n_large)
+            uint32_t const count = ctx.n_local[side] - ctx.n_small[side];
+            if (!count && n <= ctx.n_local[side])
                 return;
-            uint32_t const chunk_log = __builtin_ctzll(ctx.chunk_area);
-            uint32_t const cur = (uint32_t)(((uint64_t)j0 << t.logI) >> chunk_log);
-            size_t tmp_bytes = ctx.select_temp_bytes;
-            CUDA_CHECK(cub::DeviceSelect::If(
-                s.select_temp, tmp_bytes, thrust::counting_iterator<uint32_t>(0),
-                s.active[side], s.n_active + side, n_large,
-                carry_due{s.nextc[side], cur}, st));
-            fill_carry_kernel<<<ctx.carry_grid, 256, 0, st>>>(
-                t, chunk_log, ctx.fb[side], s.roots[side], ctx.n_band[side],
-                s.active[side], s.n_active + side, s.carry[side],
-                s.nextc[side], ctx.bucket_cap[side], buckets[side],
-                bucket_cnt[side], s.counters[par] + 2);
+            uint32_t const bands = std::min(ctx.fill_row_bands, t.rows);
+            uint32_t const window = ctx.fill_row_window_side < 0 ||
+                ctx.fill_row_window_side == side ? ctx.fill_row_window : 0;
+            uint32_t const width = window ?
+                FILL_THREADS * ctx.fill_row_cluster : 32;
+            uint32_t const row_threads =
+                (((count + width - 1) / width * width * bands + FILL_THREADS - 1) /
+                 FILL_THREADS) * FILL_THREADS;
+            uint32_t const threads = row_threads + n - ctx.n_local[side];
+            auto launch = [&](auto kernel) {
+                kernel<<<(threads + FILL_THREADS - 1) / FILL_THREADS,
+                         FILL_THREADS, 0, st>>>(
+                    t, ctx.fbp[side], ctx.n_small[side], ctx.n_local[side], n,
+                    bands, s.roots[side], s.walk[side], ctx.bucket_cap[side],
+                    buckets[side], bucket_cnt[side], s.counters[par] + 2,
+                    gate);
+            };
+            if (window) {
+                uint32_t const unit = 1u << std::max((int)t.logI - SREG_LOG, 0);
+                uint32_t const c = ctx.fill_row_cluster;
+                cudaLaunchAttribute attr{};
+                attr.id = cudaLaunchAttributeClusterDimension;
+                attr.val.clusterDim = {c, 1, 1};
+                cudaLaunchConfig_t config{};
+                config.gridDim = {(threads + FILL_THREADS * c - 1) / (FILL_THREADS * c) * c, 1, 1};
+                config.blockDim = {FILL_THREADS, 1, 1};
+                config.dynamicSmemBytes = 2 * window * unit * sizeof(uint32_t);
+                config.stream = st;
+                config.attrs = &attr;
+                config.numAttrs = c > 1 ? 1 : 0;
+                auto reserve = [&](auto kernel) {
+                    CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, t, ctx.fbp[side],
+                        ctx.n_small[side], ctx.n_local[side], n, bands, s.roots[side],
+                        s.walk[side], ctx.bucket_cap[side], buckets[side],
+                        bucket_cnt[side], s.counters[par] + 2, gate));
+                };
+                bool const lean = ctx.fill_row_window_lean;
+                bool const b6 = ctx.fill_row_window_blocks == 6;
+                if (window == 8) {
+                    if (c == 2) reserve(fill_row_kernel<true, 8, 2>);
+                    else if (lean && b6) reserve(fill_row_kernel<true, 8, 1, true, 6>);
+                    else if (lean) reserve(fill_row_kernel<true, 8, 1, true>);
+                    else if (b6) reserve(fill_row_kernel<true, 8, 1, false, 6>);
+                    else reserve(fill_row_kernel<true, 8, 1>);
+                } else if (window == 16) {
+                    if (c == 1) reserve(fill_row_kernel<true, 16, 1>);
+                    else reserve(fill_row_kernel<true, 16, 2>);
+                } else {
+                    if (c == 1) reserve(fill_row_kernel<true, 32, 1>);
+                    else reserve(fill_row_kernel<true, 32, 2>);
+                }
+            } else if (ctx.fill_row_group)
+                launch(fill_row_kernel<true>);
+            else
+                launch(fill_row_kernel<false>);
         };
         /* side 1 fills the bitmask, side 0 intersects, emits survivors
          * and rescans both bucket lists for the resieve hits */

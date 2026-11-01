@@ -1,9 +1,13 @@
 name = c270
 
-# For RSA-270 on an A100, about 0.46 s per special-q. The relation target
-# is that of params.c260, which has the same large prime bounds, and it
-# has not been checked by a filtering run. qrange gives workunits of about
-# 10 minutes.
+# Measured for RSA-270 on an A100 80 GB, with the polynomial of 2026-09:
+# about 0.37 s per special-q at q = 1e9.
+# A = 31 reaches 57% more relations per second at q = 1e9 but needs a special-q
+# range three times as long, and the two tie over the whole range.  qmin = 2e9
+# costs 3% less than 1e9, since low special-q create more duplicates later.
+# The relation target is that of params.c260, which has the same large prime
+# bounds, and it has not been checked by a filtering run; the duplicate model
+# of scripts/glas-dupsim.py points to about 3.8e10 raw relations.
 
 tasks.polyselect.degree = 6
 tasks.polyselect.P = 10000000
@@ -24,7 +28,7 @@ tasks.sieve.ncurves0 = 50
 tasks.sieve.ncurves1 = 35
 tasks.A = 33
 tasks.sieve.sqside = 1
-tasks.qmin = 1000000000
+tasks.qmin = 2000000000
 
 tasks.sieve.fill_bands = 2
 

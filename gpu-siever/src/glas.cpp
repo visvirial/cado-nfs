@@ -704,11 +704,14 @@ bool skew_gauss(basis64 & B, uint64_t q, uint64_t rho, double skewness)
     return true;
 }
 
-bool fits_31bits(basis64 const & B)
+/* las requires 31 bits, and with a skewed polynomial that discards most of
+ * the special-q near 2^38.  The root transform here has a 128-bit path, and
+ * a = i a0 + j a1 stays in 64 bits with 44-bit coefficients and logI <= 17. */
+bool fits_basis(basis64 const & B)
 {
-    constexpr int64_t t31 = INT64_C(1) << 31;
-    return B.a0 >= -t31 && B.a0 < t31 && B.a1 >= -t31 && B.a1 < t31 &&
-           B.b0 >= -t31 && B.b0 < t31 && B.b1 >= -t31 && B.b1 < t31;
+    constexpr int64_t lim = INT64_C(1) << 44;
+    return B.a0 >= -lim && B.a0 < lim && B.a1 >= -lim && B.a1 < lim &&
+           B.b0 >= -lim && B.b0 < lim && B.b1 >= -lim && B.b1 < lim;
 }
 
 /* max |f(x)| for x in [-s, s] (las get_maxnorm_aux) */
@@ -820,7 +823,7 @@ struct siever {
 std::optional<sq_task> siever::make_task(uint64_t q, uint64_t rho) const
 {
     basis64 B;
-    if (!skew_gauss(B, q, rho, cpoly.skew) || !fits_31bits(B))
+    if (!skew_gauss(B, q, rho, cpoly.skew) || !fits_basis(B))
         return std::nullopt;
 
     double const skew = cpoly.skew;

@@ -30,6 +30,8 @@ This is the `latest` version.
 - `polyselect/gps1*` — `gps1`, a CUDA port of CADO-NFS polynomial
   selection stage 1 with the size optimization on the GPU.
 - `src/eprime*` — `eprime`, an E-prime polynomial scorer.
+- `scripts/glas-dupsim.py` — estimates the duplicate share of a special-q
+  range from sampled relations.
 - `params/params.cNNN` — CADO-NFS parameter files for 150 to 344
   digit inputs, tuned for this siever.
 - `scripts/` — the launchers that plug the GPU programs into
@@ -144,6 +146,10 @@ the `tasks.*` settings after it:
       tasks.polyselect.import=<poly> \
       tasks.sieve.las.execpath=$PWD/scripts \
       tasks.sieve.las.execbin=las-glas
+
+`glas` sizes its chunks and slots from the device memory: the largest chunk up
+to 2^30 that still leaves two slots. `GLAS_GPU_CHUNK` and `GLAS_GPU_SLOTS`
+override this.
 
 `glas` needs `I >= 12`: below `c120`, add `tasks.I=12`. Parameters
 tuned for `las` with a large `mfb0`, such as `parameters/factor/params.c270`,

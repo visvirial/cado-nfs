@@ -3581,7 +3581,7 @@ void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
          * contribution instead.  The host tiny-prime division recovers
          * their factors, so the bound must stay within the tiny-prime
          * table (primes up to TINY_PRIME_BOUND). */
-        uint32_t skip_bound = 96;
+        uint32_t skip_bound = 32;
         if (char const * e = getenv("GLAS_SKIP_BOUND"))
             skip_bound = std::min((uint32_t)atoi(e), TINY_PRIME_BOUND);
         double comp_x = 1.0;
@@ -3810,9 +3810,12 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
         chunk <<= 1;
     uint64_t const chunk_max = chunk;
     uint64_t const budget = mem_free * 8 / 10;
-    while (chunk > chunk_min && slot_bytes(chunk) * 6 > budget &&
-           (slot_bytes(chunk) > budget ||
-            budget / slot_bytes(chunk >> 1) > budget / slot_bytes(chunk)))
+    /* Each chunk reads the walk cursor of every large entry, so a larger
+     * chunk is cheaper per position, up to 2^30 and two slots.  On an A100
+     * 80 GB at A=31 and A=33, 2^30 beat 2^28 (6 slots) by 17-18%, while one
+     * slot at 2^31 lost about 10% against 2^30. */
+    chunk = std::min<uint64_t>(chunk, 1ull << 30);
+    while (chunk > chunk_min && slot_bytes(chunk) * 2 > budget)
         chunk >>= 1;
     /* GLAS_GPU_CHUNK=K sets the chunk to 2^K within [chunk_min, chunk_max];
      * the slot count then follows from the memory budget. */

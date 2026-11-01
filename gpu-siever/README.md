@@ -95,7 +95,8 @@ the filtering and square root stages run on the server host.
   assigning one GPU per workunit by its `ad` range.
 - `scripts/las-glas` runs `glas-gpu` for a sieving workunit,
   assigning one GPU per process by its special-q range and giving the
-  process the CPUs of that GPU's share of the host. One client per
+  process the CPUs next to that GPU. Run by hand, `glas-gpu` needs the same
+  `taskset`: unpinned runs on an A100 took up to 10% longer. One client per
   GPU keeps every device busy; the server prints its URL and
   certificate fingerprint at start:
 

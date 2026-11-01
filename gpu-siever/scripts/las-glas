@@ -5,8 +5,9 @@
 #
 # cadofactor passes the las command line. The launcher picks one GPU
 # per process from the special-q range (GLAS_GPU overrides), gives the
-# process the CPUs of that GPU's share of the host, and replaces the
-# -t value with that share (GLAS_THREADS overrides). GLAS_BIN names the
+# process the CPUs next to that GPU, or its share of the host when those
+# are unknown, and replaces the -t value with that share (GLAS_THREADS
+# overrides). GLAS_BIN names the
 # glas-gpu binary; the default is the one next to this directory, or
 # glas-gpu on the PATH (a client that downloaded this launcher from the
 # server runs it from its download directory).
@@ -23,13 +24,38 @@ done
 ngpu=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
 gpu="${GLAS_GPU:-$((q0 / 10000 % ngpu))}"
 quota=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo max)
+buses=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader | tr '\n' ' ')
 read -r workers cpus < <(python3 -c '
 import os, sys
 gpu, ngpu, quota = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].split()
 cpus = sorted(os.sched_getaffinity(0))
 ncpu = len(cpus) if quota[0] == "max" else min(len(cpus), int(quota[0]) // int(quota[1]))
+def local_cpus(bus):
+    # 00000000:41:00.0 in nvidia-smi is 0000:41:00.0 in sysfs
+    path = "/sys/bus/pci/devices/%s/local_cpulist" % bus.lower()[-12:]
+    found = set()
+    with open(path) as f:
+        for part in f.read().strip().split(","):
+            lo, _, hi = part.partition("-")
+            found.update(range(int(lo), int(hi or lo) + 1))
+    return found
 per = len(cpus) // ngpu
-print(ncpu // ngpu, ",".join(map(str, cpus[gpu * per:(gpu + 1) * per])))' "$gpu" "$ngpu" "$quota")
+share = cpus[gpu * per:(gpu + 1) * per]
+# Host memory far from the GPU slows the filter kernel, which writes its
+# results there, and through it the whole device. Prefer the CPUs next to this
+# GPU, split among the GPUs next to the same CPUs. Keep the plain share when
+# they cannot be read or are too few to run the cofactorization.
+try:
+    near = [local_cpus(bus) for bus in sys.argv[4:]]
+    peers = [g for g in range(ngpu) if near[g] == near[gpu]]
+    mine = sorted(near[gpu].intersection(cpus))
+    part = len(mine) // len(peers)
+    rank = peers.index(gpu)
+    if part >= 8:
+        share = mine[rank * part:(rank + 1) * part]
+except (OSError, ValueError, IndexError):
+    pass
+print(min(ncpu // ngpu, len(share)), ",".join(map(str, share)))' "$gpu" "$ngpu" "$quota" $buses)
 workers="${GLAS_THREADS:-$workers}"
 args=()
 while [ $# -gt 0 ]; do

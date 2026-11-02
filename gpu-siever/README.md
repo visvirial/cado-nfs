@@ -127,10 +127,14 @@ found elsewhere is imported with `tasks.polyselect.import=<poly>`.
 ## Vast.ai
 
 Rent an A100 with 80 GB (`gpu_name=A100_SXM4 num_gpus=1 gpu_ram>=70`, in
-GB; `A=33` takes 13.5 GB per slot at the 2^30 chunk plus 5 GB of tables,
-so a 40 GB card should hold two slots but is untested) and the image
+GB) or 40 GB (`gpu_name=A100_PCIE num_gpus=1 gpu_ram<50`) and the image
 `nvidia/cuda:12.4.1-devel-ubuntu22.04`. Keep that CUDA version: on the
 same machine, `glas` built with 12.8 takes 20% longer per special-q.
+
+`A=33` takes 13.5 GB per slot at the 2^30 chunk plus 5 GB of tables, so
+both sizes hold two slots. The one 40 GB card measured took 7% longer per
+special-q than an 80 GB SXM4, and rented at 60% of its price on
+2026-11-02.
 
     gpu-siever/scripts/vast-a100-setup.sh
 

@@ -7,3 +7,9 @@ MINCREDIT=30     # below this Vast.ai credit, destroy everything
 STOP=0           # 1: destroy every host and exit
 SALAD_ORG=       # for salad.sh: the SaladCloud organization and project
 SALAD_PROJECT=
+CLORE_CAP=0.5    # clore-fleet.sh: dollars per hour per ad/s
+CLORE_MAXHOSTS=60
+CLORE_MINREL=0.98   # Clore server reliability
+CLORE_MINBAL=2   # below this Clore balance, cancel every order
+CLORE_MINKEEP=0
+CLORE_STOP=0     # 1: cancel every Clore order and exit (STOP=1 does too)

@@ -170,7 +170,8 @@ about 35% more than an RTX 5090.
 which have no SSH: each container fetches the pushed commit from GitHub, builds,
 and logs its work units to the Salad logs (`salad.sh logs`).
 `vast-polyselect/clore.sh` rents Clore.ai servers on demand for the same client,
-installing an SSH server with the fleet key in the public CUDA image.
+installing an SSH server with the fleet key in the public CUDA image; `clore.sh manage`
+starts `clore-fleet.sh`, which keeps that fleet as `fleet.sh` keeps the Vast one.
 
 `glas` sizes its chunks and slots from the device memory: the largest chunk up
 to 2^30 that still leaves two slots, then two slots at 2^30 and as many as fit

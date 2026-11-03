@@ -3,7 +3,7 @@
 #
 #   salad.sh classes                         GPU classes and their prices
 #   salad.sh create NAME REPLICAS PRIORITY GPU-CLASS-NAME...
-#                                            a container group of salad-boot.sh, started
+#                                            a container group of host/container-boot.sh, started
 #   salad.sh status [NAME]                   groups, or the instances of one
 #   salad.sh replicas NAME N                 change the number of replicas
 #   salad.sh start NAME                      start a stopped group (one made over the replica
@@ -35,7 +35,7 @@ miss=[w for w in want if w not in got]
 if miss: sys.exit("unknown GPU classes: "+", ".join(miss))
 print(json.dumps([got[w] for w in want]))' "$@")
   commit=${SRC_COMMIT:-$(git -C "$HERE" rev-parse origin/rsa-270)}
-  python3 - "$name" "$n" "$prio" "$ids" "$commit" "$HERE/salad-boot.sh" > /tmp/salad-create.$$ <<'EOF'
+  python3 - "$name" "$n" "$prio" "$ids" "$commit" "$HERE/host/container-boot.sh" > /tmp/salad-create.$$ <<'EOF'
 import json,os,sys
 name,n,prio,ids,commit,boot=sys.argv[1:]
 print(json.dumps({

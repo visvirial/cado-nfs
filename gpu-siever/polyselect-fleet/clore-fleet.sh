@@ -1,5 +1,5 @@
 #!/bin/bash
-# Keep a Clore.ai fleet of single-GPU clients on the polynomial search, as fleet.sh does on
+# Keep a Clore.ai fleet of single-GPU clients on the polynomial search, as vast-fleet.sh does on
 # Vast.ai. Started by "clore.sh manage"; state and events.log in $FLEET_DIR/clore, one
 # directory s<server> per rented server. It takes over orders made by hand.
 #

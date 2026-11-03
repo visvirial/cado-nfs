@@ -7,4 +7,4 @@ if [ -z "${V:-}" ]; then
 fi
 KEY=${KEY:-$FLEET_DIR/id_vast}
 export HERE FLEET_DIR V KEY
-running() { ps -eo cmd | awk -v f="$HERE/fleet.sh" '$1=="bash" && $2==f {r=1} END {exit !r}'; }
+running() { ps -eo cmd | awk -v f="$HERE/$1" '$1=="bash" && $2==f {r=1} END {exit !r}'; }   # running vast-fleet.sh

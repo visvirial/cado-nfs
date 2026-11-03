@@ -4,7 +4,7 @@
 # per hour per ad/s, or PRICE_<GPU> dollars per hour where set), replaces hosts (checked every 10 minutes) that never come up, stop answering, exit, fail two work units in a row, or run below
 # 75% of their GPU's speed (and never rents those machines again), gives back idle hosts beyond
 # MINKEEP, and destroys every host when SERVER has not answered for 2 h (the server exits when
-# the search ends), the credit is below MINCREDIT, or STOP=1. Started by ./run; logs to
+# the search ends), the credit is below MINCREDIT, or STOP=1. Started by "vast.sh manage"; logs to
 # $FLEET_DIR/events.log. The speeds are those measured with gps1 -sopt-gpu 0 at P=2e7.
 cd $FLEET_DIR; E=$FLEET_DIR/events.log
 log() { echo "$(date '+%F %T') $*" >> $E; }
@@ -27,14 +27,14 @@ for x in json.load(sys.stdin):
 for e,x in sorted(best.values(),key=lambda t:t[0]): print(x["gpu_name"].replace(" ","_"),x["id"],x["machine_id"])' $CAP $(for d in $(active); do cat $d/machine; done | sort -u); }
 launch() { # label gpu offer machine; runs in the background
   l=$1; mkdir -p $l; echo $2 > $l/gpu; echo $4 > $l/machine; date +%s > $l/t0; touch $l/launching
-  r=$(timeout 1200 bash $HERE/start-host.sh $l ${ARCH[$2]} $IMG $3 2>&1 | tail -1); log "$l $2 machine $4: $r"
+  r=$(timeout 1200 bash $HERE/vast-launch.sh $l ${ARCH[$2]} $IMG $3 2>&1 | tail -1); log "$l $2 machine $4: $r"
   [ -f $l/id ] || { echo $4 >> machines.bad; touch $l/dead; }
   rm -f $l/launching
 }
 active() { for d in m*/; do d=${d%/}; [ ! -f $d/dead ] && { [ -f $d/id ] || [ -f $d/launching ]; } && echo $d; done; }
 launching() { ls -d m*/launching 2>/dev/null | wc -l; }
 rm -f m*/launching   # launches of an earlier manager are over
-PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc gps1) $(pgrep -xc polyselect_ropt)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out); fi; echo "age $(( $(date +%s) - t ))"; cat out/wu.log 2>/dev/null'
+PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc gps1) $(pgrep -xc polyselect_ropt)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; cat out/wu.log 2>/dev/null'
 export PROBE
 last_health=0; nidle=0
 while :; do
@@ -51,7 +51,7 @@ while :; do
 for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get("dph_total",0),3))' 2>/dev/null)
     # probe every host over SSH in parallel; the decisions below read the answers
     for l in $(live); do [ -f $l/launching ] || [ ! -f $l/addr ] || echo $l; done | xargs -r -P 32 -I{} \
-      bash -c 'timeout 90 "$HERE/ssh-host.sh" {} "$PROBE" 2>/dev/null | grep -v -i "welcome\|have fun" > {}/probe.new; mv {}/probe.new {}/probe'
+      bash -c 'timeout 90 "$HERE/vast.sh" ssh {} "$PROBE" 2>/dev/null | grep -v -i "welcome\|have fun" > {}/probe.new; mv {}/probe.new {}/probe'
     idle=()
     for l in $(live); do
       id=$(cat $l/id); a=$(echo "$st" | awk -v i=$id '$1==i{print $2}'); age=$(( $(date +%s) - $(cat $l/t0) ))

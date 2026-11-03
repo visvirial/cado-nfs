@@ -3,7 +3,7 @@
 #
 #   clore.sh manage                start the Clore fleet manager, clore-fleet.sh (again)
 #   clore.sh offers [MINREL [N]]   the N (40) cheapest free single-GPU servers per ad/s
-#   clore.sh rent SERVER-ID...     rent on demand and start salad-boot.sh there
+#   clore.sh rent SERVER-ID...     rent on demand and start host/container-boot.sh there
 #   clore.sh status                the orders, with their SSH ports
 #   clore.sh ssh ORDER-ID [CMD]    SSH into the container of an order
 #   clore.sh cancel ORDER-ID...    end orders
@@ -15,7 +15,7 @@
 # The API key is read from ~/.config/clore/api_key, SERVER and CERTSHA1 from
 # $FLEET_DIR/fleet.conf; payment is in USD-Blockchain. Prices on the marketplace are per
 # server and day. The image is the public CUDA one, which has no SSH server: the start
-# command installs one with the fleet key, then fetches salad-boot.sh of SRC_COMMIT (default:
+# command installs one with the fleet key, then fetches host/container-boot.sh of SRC_COMMIT (default:
 # origin/rsa-270, so it must be pushed) from GitHub and runs it in the background. GPU names
 # are printed with _ for spaces.
 set -eu
@@ -43,7 +43,7 @@ for r in sorted(v)[:n]:
     else: print(r[3],r[2])' "$@"; }
 case ${1:-} in
 manage)
-  if ps -eo cmd | awk -v f="$HERE/clore-fleet.sh" '$1=="bash" && $2==f {r=1} END {exit !r}'; then echo "already running"; exit 0; fi
+  if running clore-fleet.sh; then echo "already running"; exit 0; fi
   mkdir -p "$FLEET_DIR/clore"; cd "$FLEET_DIR/clore"
   setsid nohup bash "$HERE/clore-fleet.sh" >> manager.out 2>&1 < /dev/null &
   echo "started; log in $FLEET_DIR/clore/events.log";;
@@ -55,10 +55,10 @@ rent)
     body=$(python3 - "$sid" "$c" "$(cat $KEY.pub)" <<'EOF'
 import json,os,sys
 sid,c,pub=sys.argv[1:]
-url=f"https://raw.githubusercontent.com/visvirial/cado-nfs/{c}/gpu-siever/vast-polyselect/salad-boot.sh"
+url=f"https://raw.githubusercontent.com/visvirial/cado-nfs/{c}/gpu-siever/polyselect-fleet/host/container-boot.sh"
 cmd=("(export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq openssh-server curl ca-certificates"
      " && mkdir -p /root/.ssh /run/sshd && echo \"$FLEET_PUB\" >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
-     " && /usr/sbin/sshd && curl -sfL --retry 5 " + url + " > /root/boot-clore.sh && bash /root/boot-clore.sh) > /root/boot-clore.out 2>&1 &")
+     " && /usr/sbin/sshd && curl -sfL --retry 5 " + url + " > /root/container-boot.sh && bash /root/container-boot.sh) > /root/container-boot.out 2>&1 &")
 print(json.dumps({"currency":"USD-Blockchain","image":"nvidia/cuda:12.8.1-devel-ubuntu22.04","renting_server":int(sid),
   "type":"on-demand","ports":{"22":"tcp"},"ssh_key":pub,"command":cmd,
   "env":{"SRC_COMMIT":c,"SERVER":os.environ["SERVER"],"CERTSHA1":os.environ["CERTSHA1"],"SALAD_MACHINE_ID":"clore-"+sid,"FLEET_PUB":pub}}))

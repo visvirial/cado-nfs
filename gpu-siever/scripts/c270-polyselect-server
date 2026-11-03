@@ -14,7 +14,7 @@
 #   WHITELIST    comma-separated CIDR ranges of the clients.
 #
 # Optional, with their defaults below: PORT, P, INCR, NQ, ADMIN, ADMAX,
-# ADRANGE, NRKEEP, ROPTEFFORT, THREADS, SERVER_THREADS, MAXFAILED. CADO_NFS names
+# ADRANGE, NRKEEP, ROPTEFFORT, THREADS, SERVER_THREADS, MAXFAILED, MAXTIMEDOUT. CADO_NFS names
 # cado-nfs.py if it is not in the pipeline build under build/cado. Arguments
 # are passed on to cado-nfs.py after the others, as tasks.* settings.
 #
@@ -29,9 +29,9 @@
 # clients keep retrying until they are stopped.
 #
 # The server answers HTTP in threads (server.threaded): in one thread it stopped
-# accepting connections with about 110 clients. MAXFAILED is far above the
-# stock 100 failed work units, after which the server exits; the count is kept
-# in WORKDIR across restarts.
+# accepting connections with about 110 clients. MAXFAILED and MAXTIMEDOUT are
+# far above the stock 100 failed and 100 timed-out work units, after either of
+# which the server stops; the counts are kept in WORKDIR across restarts.
 set -Eeuo pipefail
 
 scripts=$(dirname "$(readlink -f "$0")")
@@ -62,5 +62,6 @@ exec "$cado_nfs" --parameters "$siever/params/params.c270" \
   tasks.polyselect.ropteffort="${ROPTEFFORT:-5}" \
   tasks.polyselect.threads="${THREADS:-16}" \
   tasks.polyselect.maxfailed="${MAXFAILED:-100000}" \
+  tasks.polyselect.maxtimedout="${MAXTIMEDOUT:-100000}" \
   tasks.sieve.run=false \
   "$@"

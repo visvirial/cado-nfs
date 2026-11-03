@@ -57,7 +57,7 @@ exec "$cado_nfs" --parameters "$siever/params/params.c270" \
   tasks.polyselect.nq="${NQ:-1296}" \
   tasks.polyselect.admin="${ADMIN:-0}" \
   tasks.polyselect.admax="${ADMAX:-3000000000000}" \
-  tasks.polyselect.adrange="${ADRANGE:-221760000}" \
+  tasks.polyselect.adrange="${ADRANGE:-133056000}" \
   tasks.polyselect.nrkeep="${NRKEEP:-2000}" \
   tasks.polyselect.ropteffort="${ROPTEFFORT:-5}" \
   tasks.polyselect.threads="${THREADS:-16}" \

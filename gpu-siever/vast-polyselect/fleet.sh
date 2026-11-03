@@ -1,7 +1,7 @@
 #!/bin/bash
 # Keep a Vast.ai fleet of single-GPU clients on a polynomial search served by
 # c270-polyselect-server. Every minute it rents each offer under the cost cap (CAP dollars
-# per hour per ad/s, or PRICE_<GPU> dollars per hour where set), replaces hosts (checked every 10 minutes) that never come up, stop answering, exit, or run below
+# per hour per ad/s, or PRICE_<GPU> dollars per hour where set), replaces hosts (checked every 10 minutes) that never come up, stop answering, exit, fail two work units in a row, or run below
 # 75% of their GPU's speed (and never rents those machines again), gives back idle hosts beyond
 # MINKEEP, and destroys every host when SERVER has not answered for 2 h (the server exits when
 # the search ends), the credit is below MINCREDIT, or STOP=1. Started by ./run; logs to
@@ -63,6 +63,9 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
         [ "$a" != running ] && [ $m -ge 2 ] || [ $m -ge 4 ] && { echo $(cat $l/machine) >> machines.bad; kill_host $l "unreachable, status $a"; }; continue; fi
       echo 0 > $l/miss
       if ! echo "$s" | grep -q '^state \[\]'; then echo $(cat $l/machine) >> machines.bad; kill_host $l "$(echo "$s" | head -1)"; continue; fi
+      # the last two work units failed: the wrapper should have stopped the client already
+      if [ "$(echo "$s" | awk 'NF==5 {r[++n]=$5} END{print (n>=2 && r[n]!=0 && r[n-1]!=0) ? "y" : "n"}')" = y ]; then
+        echo $(cat $l/machine) >> machines.bad; kill_host $l "work units failing: $(echo "$s" | awk 'NF==5' | tail -2 | awk '{print $5}' | paste -sd,)"; continue; fi
       rate=$(echo "$s" | awk 'NF==5 && $5==0 {ad+=($2-$1)/$3; t+=$4; n++} END{if(n>=2 && t>0) printf "%.3f", ad/t}')
       if [ -n "$rate" ] && python3 -c "import sys;sys.exit(0 if $rate < 0.75*${RATE[$(cat $l/gpu)]} else 1)"; then
         echo $(cat $l/machine) >> machines.bad; kill_host $l "slow: $rate ad/s, $(cat $l/gpu)"; continue; fi

@@ -2,8 +2,10 @@
 # GPS1_BIN for the polyselect-gps1 launcher: gps1 with the size optimization on the CPU,
 # since -sopt-gpu 1 gives far worse polynomials on an RTX 5090. Keeps every polynomial in
 # out/gps1.out and one line per work unit in out/wu.log: admin admax incr seconds rc.
-# After 3 failures in a row it stops the client, so that a broken host does not fail work
-# units until the server gives up (maxfailed); the fleet manager then replaces the host.
+# After 2 failures in a row, or one with a GPU that nvidia-smi no longer sees, it kills the
+# client, so that a broken host does not fail work units: the server drops a work unit after
+# 2 failures. The client ignores SIGTERM when started in the background over SSH, so this
+# uses SIGKILL; boot.sh then writes the state, and the fleet manager replaces the host.
 t0=$(date +%s); prev=; a=0; b=0; i=1
 for x in "$@"; do case $prev in -admin) a=$x;; -admax) b=$x;; -incr) i=$x;; esac; prev=$x; done
 /workspace/src/gpu-siever/gps1 "$@" -sopt-gpu 0 | tee -a /workspace/out/gps1.out
@@ -12,7 +14,7 @@ echo "$a $b $i $(( $(date +%s) - t0 )) $rc" >> /workspace/out/wu.log
 if [ $rc = 0 ]; then echo 0 > /workspace/out/fails
 else
   n=$(( $(cat /workspace/out/fails 2>/dev/null || echo 0) + 1 )); echo $n > /workspace/out/fails
-  [ $n -ge 3 ] && pkill -f cado-nfs-client.py
+  if [ $n -ge 2 ] || ! nvidia-smi -L > /dev/null 2>&1; then pkill -KILL -f 'python3 .*cado-nfs-client[.]py'; exit $rc; fi
   sleep 60
 fi
 exit $rc

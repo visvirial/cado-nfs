@@ -9,7 +9,7 @@ set -u
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null || exit 1
 mkdir -p /workspace/out /workspace/src && cd /workspace
-curl -sfL https://codeload.github.com/visvirial/cado-nfs/tar.gz/${SRC_COMMIT:?} | tar xz --strip-components=1 -C src || exit 2
+curl -sfL --retry 5 https://codeload.github.com/visvirial/cado-nfs/tar.gz/${SRC_COMMIT:?} | tar xz --strip-components=1 -C src || exit 2
 tar czf src.tgz -C src . && rm -rf src && mkdir src
 V=src.v; mkdir -p $V; tar xzf src.tgz -C $V ./gpu-siever/vast-polyselect
 cp $V/gpu-siever/vast-polyselect/{boot.sh,client.sh,gps1-cpu-sopt} . && rm -rf $V

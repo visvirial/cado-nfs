@@ -42,7 +42,7 @@ sid,c,pub=sys.argv[1:]
 url=f"https://raw.githubusercontent.com/visvirial/cado-nfs/{c}/gpu-siever/vast-polyselect/salad-boot.sh"
 cmd=("(export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get install -y -qq openssh-server curl ca-certificates"
      " && mkdir -p /root/.ssh /run/sshd && echo \"$FLEET_PUB\" >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
-     " && /usr/sbin/sshd && curl -sfL " + url + " > /root/boot-clore.sh && bash /root/boot-clore.sh) > /root/boot-clore.out 2>&1 &")
+     " && /usr/sbin/sshd && curl -sfL --retry 5 " + url + " > /root/boot-clore.sh && bash /root/boot-clore.sh) > /root/boot-clore.out 2>&1 &")
 print(json.dumps({"currency":"USD-Blockchain","image":"nvidia/cuda:12.8.1-devel-ubuntu22.04","renting_server":int(sid),
   "type":"on-demand","ports":{"22":"tcp"},"ssh_key":pub,"command":cmd,
   "env":{"SRC_COMMIT":c,"SERVER":os.environ["SERVER"],"CERTSHA1":os.environ["CERTSHA1"],"SALAD_MACHINE_ID":"clore-"+sid,"FLEET_PUB":pub}}))

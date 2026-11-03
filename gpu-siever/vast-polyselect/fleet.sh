@@ -34,6 +34,8 @@ launch() { # label gpu offer machine; runs in the background
 active() { for d in m*/; do d=${d%/}; [ ! -f $d/dead ] && { [ -f $d/id ] || [ -f $d/launching ]; } && echo $d; done; }
 launching() { ls -d m*/launching 2>/dev/null | wc -l; }
 rm -f m*/launching   # launches of an earlier manager are over
+PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc gps1) $(pgrep -xc polyselect_ropt)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out); fi; echo "age $(( $(date +%s) - t ))"; cat out/wu.log 2>/dev/null'
+export PROBE
 last_health=0; nidle=0
 while :; do
   unset $(compgen -v PRICE_); set -a; . ./fleet.conf; set +a
@@ -47,13 +49,16 @@ while :; do
     last_health=$(date +%s)
     st=$($V show instances --raw 2>/dev/null | python3 -c 'import json,sys
 for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get("dph_total",0),3))' 2>/dev/null)
+    # probe every host over SSH in parallel; the decisions below read the answers
+    for l in $(live); do [ -f $l/launching ] || [ ! -f $l/addr ] || echo $l; done | xargs -r -P 32 -I{} \
+      bash -c 'timeout 90 "$HERE/ssh-host.sh" {} "$PROBE" 2>/dev/null | grep -v -i "welcome\|have fun" > {}/probe.new; mv {}/probe.new {}/probe'
     idle=()
     for l in $(live); do
       id=$(cat $l/id); a=$(echo "$st" | awk -v i=$id '$1==i{print $2}'); age=$(( $(date +%s) - $(cat $l/t0) ))
       if [ -n "$st" ] && [ -z "$a" ]; then touch $l/dead; log "$l instance $id is gone"; continue; fi
       [ -f $l/launching ] && continue
       if [ ! -f $l/addr ]; then [ $age -gt 1800 ] && { echo $(cat $l/machine) >> machines.bad; kill_host $l "never came up"; }; continue; fi
-      s=$(timeout 90 $HERE/ssh-host.sh $l 'cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc gps1) $(pgrep -xc polyselect_ropt)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out); fi; echo "age $(( $(date +%s) - t ))"; cat out/wu.log 2>/dev/null' 2>/dev/null | grep -v -i 'welcome\|have fun')
+      s=$(cat $l/probe 2>/dev/null)
       if [ -z "$s" ]; then m=$(( $(cat $l/miss 2>/dev/null || echo 0) + 1 )); echo $m > $l/miss
         [ "$a" != running ] && [ $m -ge 2 ] || [ $m -ge 4 ] && { echo $(cat $l/machine) >> machines.bad; kill_host $l "unreachable, status $a"; }; continue; fi
       echo 0 > $l/miss

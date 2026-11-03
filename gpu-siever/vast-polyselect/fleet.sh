@@ -15,7 +15,7 @@ touch machines.bad; [ -f counter ] || echo 0 > counter; srv_down_since=
 live() { for d in m*/; do d=${d%/}; [ -f $d/id ] && [ ! -f $d/dead ] && echo $d; done; }
 kill_host() { l=$1; shift; $V destroy instance $(cat $l/id) -y >/dev/null 2>&1; touch $l/dead; log "$l destroyed: $*"; }
 offers() { # "gpu offer machine" lines under the cap, best first, skipping bad and used machines
-  $V search offers "num_gpus=1 rentable=true rented=false verified=true direct_port_count>=4 cpu_cores_effective>=16 reliability>=0.97 inet_down>=200 gpu_name in [RTX_3090,RTX_5080,RTX_4080S,RTX_4090,RTX_5090]" --raw --limit 1000 2>/dev/null | python3 -c '
+  $V search offers "num_gpus=1 rentable=true rented=false verified=true direct_port_count>=4 cpu_cores_effective>=16 reliability>=0.97 cuda_max_good>=12.8 inet_down>=200 gpu_name in [RTX_3090,RTX_5080,RTX_4080S,RTX_4090,RTX_5090]" --raw --limit 1000 2>/dev/null | python3 -c '
 import json,sys,os
 R={"RTX 3090":.496,"RTX 5080":.522,"RTX 4080S":.415,"RTX 4090":.57,"RTX 5090":.96}
 cap=float(sys.argv[1]);skip=set(open("machines.bad").read().split())|set(sys.argv[2:]);best={}

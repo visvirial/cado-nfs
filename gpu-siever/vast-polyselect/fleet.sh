@@ -14,7 +14,7 @@ IMG=nvidia/cuda:12.8.1-devel-ubuntu22.04
 touch machines.bad; [ -f counter ] || echo 0 > counter; srv_down_since=
 live() { for d in m*/; do d=${d%/}; [ -f $d/id ] && [ ! -f $d/dead ] && echo $d; done; }
 kill_host() { l=$1; shift; $V destroy instance $(cat $l/id) -y >/dev/null 2>&1; touch $l/dead; log "$l destroyed: $*"; }
-offers() { # "gpu offer machine" lines under the cap, best first, skipping bad and used machines
+offers() { # "gpu offer machine" lines under the cap, best first, skipping bad machines and those in use
   $V search offers "num_gpus=1 rentable=true rented=false verified=true direct_port_count>=4 cpu_cores_effective>=16 reliability>=0.97 cuda_max_good>=12.8 inet_down>=200 gpu_name in [RTX_3090,RTX_5080,RTX_4080S,RTX_4090,RTX_5090]" --raw --limit 1000 2>/dev/null | python3 -c '
 import json,sys,os
 R={"RTX 3090":.496,"RTX 5080":.522,"RTX 4080S":.415,"RTX 4090":.57,"RTX 5090":.96}
@@ -24,7 +24,7 @@ for x in json.load(sys.stdin):
     lim=os.environ.get("PRICE_"+x["gpu_name"].replace(" ","_"))
     if m in skip or (x["dph_total"]>float(lim) if lim else e>cap) or x.get("inet_down_cost",1)>.03: continue
     if m not in best or e<best[m][0]: best[m]=(e,x)
-for e,x in sorted(best.values(),key=lambda t:t[0]): print(x["gpu_name"].replace(" ","_"),x["id"],x["machine_id"])' $CAP $(cat m*/machine 2>/dev/null | sort -u); }
+for e,x in sorted(best.values(),key=lambda t:t[0]): print(x["gpu_name"].replace(" ","_"),x["id"],x["machine_id"])' $CAP $(for d in $(active); do cat $d/machine; done | sort -u); }
 launch() { # label gpu offer machine; runs in the background
   l=$1; mkdir -p $l; echo $2 > $l/gpu; echo $4 > $l/machine; date +%s > $l/t0; touch $l/launching
   r=$(timeout 1200 bash $HERE/start-host.sh $l ${ARCH[$2]} $IMG $3 2>&1 | tail -1); log "$l $2 machine $4: $r"

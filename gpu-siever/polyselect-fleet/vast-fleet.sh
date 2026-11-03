@@ -1,9 +1,9 @@
 #!/bin/bash
 # Keep a Vast.ai fleet of single-GPU clients on a polynomial search served by
 # c270-polyselect-server. Every minute it rents each offer under the cost cap (CAP dollars
-# per hour per ad/s, or PRICE_<GPU> dollars per hour where set), replaces hosts (checked every 10 minutes) that never come up, stop answering, exit, fail two work units in a row, or run below
+# per hour per ad/s, or PRICE_<GPU> dollars per hour where set), replaces hosts (checked every 10 minutes) that never come up, stop answering, fail to build, fail two work units in a row, or run below
 # 75% of their GPU's speed (and never rents those machines again), gives back idle hosts beyond
-# MINKEEP, and destroys every host when SERVER has not answered for 2 h (the server exits when
+# MINKEEP, restarts clients that ended when the server stopped serving work units, and destroys every host when SERVER has not answered for 2 h (the server exits when
 # the search ends), the credit is below MINCREDIT, or STOP=1. Started by "vast.sh manage"; logs to
 # $FLEET_DIR/events.log. The speeds are those measured with gps1 -sopt-gpu 0 at P=2e7.
 cd $FLEET_DIR; E=$FLEET_DIR/events.log
@@ -62,6 +62,8 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
       if [ -z "$s" ]; then m=$(( $(cat $l/miss 2>/dev/null || echo 0) + 1 )); echo $m > $l/miss
         [ "$a" != running ] && [ $m -ge 2 ] || [ $m -ge 4 ] && { echo $(cat $l/machine) >> machines.bad; kill_host $l "unreachable, status $a"; }; continue; fi
       echo 0 > $l/miss
+      if echo "$s" | grep -q '^state \[done rc=0\]'; then
+        timeout 90 "$HERE/vast.sh" ssh $l "$RESTART" > /dev/null 2>&1; log "$l client ended, restarted"; continue; fi
       if ! echo "$s" | grep -q '^state \[\]'; then echo $(cat $l/machine) >> machines.bad; kill_host $l "$(echo "$s" | head -1)"; continue; fi
       # the last two work units failed: the wrapper should have stopped the client already
       if [ "$(echo "$s" | awk 'NF==5 {r[++n]=$5} END{print (n>=2 && r[n]!=0 && r[n-1]!=0) ? "y" : "n"}')" = y ]; then

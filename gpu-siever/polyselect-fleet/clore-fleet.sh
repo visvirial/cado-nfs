@@ -6,7 +6,8 @@
 # Every minute it rents each free server under CLORE_CAP dollars per hour per ad/s, with
 # reliability at least CLORE_MINREL, up to CLORE_MAXHOSTS. Every 10 minutes it probes the
 # hosts over SSH and cancels, and never rents again, those that do not boot or answer within
-# 30 minutes, whose client ended, whose last two work units failed, that run below 75% of
+# 30 minutes, whose client failed (one that ended when the server stopped serving work units is
+# restarted), whose last two work units failed, that run below 75% of
 # their GPU's speed, or that never got a work unit (the server unreachable from there). Idle
 # hosts beyond CLORE_MINKEEP are cancelled, and none rented while any is idle. Every order is
 # cancelled when STOP or CLORE_STOP is 1, the balance falls below CLORE_MINBAL dollars, or
@@ -52,6 +53,9 @@ while :; do
         m=$(( $(cat $d/miss 2>/dev/null || echo 0) + 1 )); echo $m > $d/miss
         [ "$s" = nows ] || [ $m -ge 3 ] && { bad $d; cancel_host $d "${s:-unreachable} ${age}s after renting"; }; continue; fi
       echo 0 > $d/miss
+      if echo "$s" | grep -q '^state \[done rc=0\]'; then read h p < $d/addr
+        timeout 90 ssh -i $KEY -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=20 -p $p root@$h "$RESTART" > /dev/null 2>&1
+        log "$d client ended, restarted"; continue; fi
       if ! echo "$s" | grep -q '^state \[\]'; then bad $d; cancel_host $d "$(echo "$s" | grep '^state')"; continue; fi
       if [ "$(echo "$s" | awk 'NF==5 {r[++n]=$5} END{print (n>=2 && r[n]!=0 && r[n-1]!=0) ? "y" : "n"}')" = y ]; then
         bad $d; cancel_host $d "work units failing"; continue; fi

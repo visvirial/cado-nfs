@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Start, or resume, the cado-nfs.py server of an RSA-270 polynomial search.
+# It stops at the factor base, before any sieving.
+#
+#   WORKDIR=/data/c270-ps PUBLIC_NAME=ps.example.org WHITELIST=203.0.113.0/24 \
+#     gpu-siever/scripts/c270-polyselect-server
+#
+# Required:
+#   WORKDIR      keeps the state. The same WORKDIR resumes the search; a new
+#                one starts another. Raising ADMAX and rerunning extends it.
+#   PUBLIC_NAME  the name or IP the clients dial, for the certificate. The
+#                certificate is made once per WORKDIR, so a later change has
+#                no effect.
+#   WHITELIST    comma-separated CIDR ranges of the clients.
+#
+# Optional, with their defaults below: PORT, P, INCR, NQ, ADMIN, ADMAX,
+# ADRANGE, NRKEEP, ROPTEFFORT, THREADS, SERVER_THREADS. CADO_NFS names
+# cado-nfs.py if it is not in the pipeline build under build/cado. Arguments
+# are passed on to cado-nfs.py after the others, as tasks.* settings.
+#
+# The server prints the --certsha1 value for the clients, and a --server value
+# naming localhost: remote clients use https://$PUBLIC_NAME:$PORT instead. They
+# set ROPT_BIN, GPS1_BIN and GLAS_GPU; see polyselect-ropt-local and
+# polyselect-gps1. Use a GPS1_BIN that runs gps1 with -sopt-gpu 0 on an
+# RTX 5090, where -sopt-gpu 1 gives far worse polynomials.
+#
+# A new P or INCR in the same WORKDIR applies from the next ad on, and does not
+# search the lower ad again. The server exits by itself at the factor base; the
+# clients keep retrying until they are stopped.
+set -Eeuo pipefail
+
+scripts=$(dirname "$(readlink -f "$0")")
+siever=$(dirname "$scripts")
+cado_nfs=${CADO_NFS:-$siever/build/cado/cado-nfs.py}
+[ -x "$cado_nfs" ] || { echo "$cado_nfs not found; set CADO_NFS" >&2; exit 1; }
+
+rsa270=233108530344407544527637656910680524145619812480305449042948611968495918245135782867888369318577116418213919268572658314913060672626911354027609793166341626693946596196427744273886601876896313468704059066746903123910748277606548649151920812699309766587514735456594993207
+
+exec "$cado_nfs" --parameters "$siever/params/params.c270" \
+  --server-threads "${SERVER_THREADS:-8}" \
+  --workdir "${WORKDIR:?set WORKDIR}" "$rsa270" \
+  server.alternate_names="${PUBLIC_NAME:?set PUBLIC_NAME}" \
+  server.port="${PORT:-8001}" \
+  server.whitelist="${WHITELIST:?set WHITELIST}" \
+  tasks.polyselect.polyselect.execpath="$scripts" \
+  tasks.polyselect.polyselect.execbin=polyselect-gps1 \
+  tasks.polyselect.polyselect_ropt.execpath="$scripts" \
+  tasks.polyselect.polyselect_ropt.execbin=polyselect-ropt-local \
+  tasks.polyselect.P="${P:-20000000}" \
+  tasks.polyselect.incr="${INCR:-110880}" \
+  tasks.polyselect.nq="${NQ:-1296}" \
+  tasks.polyselect.admin="${ADMIN:-0}" \
+  tasks.polyselect.admax="${ADMAX:-3000000000000}" \
+  tasks.polyselect.adrange="${ADRANGE:-221760000}" \
+  tasks.polyselect.nrkeep="${NRKEEP:-2000}" \
+  tasks.polyselect.ropteffort="${ROPTEFFORT:-5}" \
+  tasks.polyselect.threads="${THREADS:-16}" \
+  tasks.sieve.run=false \
+  "$@"

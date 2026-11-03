@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Root optimization launcher for cadofactor: runs the client's own
+# polyselect_ropt, not a copy of the server's, which may not run on the
+# client's CPU or glibc.
+#
+#   tasks.polyselect.polyselect_ropt.execpath=<this directory>
+#   tasks.polyselect.polyselect_ropt.execbin=polyselect-ropt-local
+#
+# ROPT_BIN names the binary on the client.
+exec "${ROPT_BIN:?set ROPT_BIN to polyselect_ropt on this client}" "$@"

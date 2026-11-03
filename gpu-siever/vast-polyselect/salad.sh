@@ -6,6 +6,8 @@
 #                                            a container group of salad-boot.sh, started
 #   salad.sh status [NAME]                   groups, or the instances of one
 #   salad.sh replicas NAME N                 change the number of replicas
+#   salad.sh start NAME                      start a stopped group (one made over the replica
+#                                            quota stays stopped)
 #   salad.sh logs NAME [MINUTES]             the container output of the last MINUTES (30)
 #   salad.sh delete NAME                    stop and delete a group
 #
@@ -63,6 +65,7 @@ d=json.load(sys.stdin)
 for e in reversed(d.get("items",[]) if isinstance(d,dict) else d):
     l=e.get("resource",{}).get("labels",{}); print(e.get("time","")[11:19], l.get("instance_id","")[:8], e.get("message",e.get("text_log",e.get("json_log",""))))
 if isinstance(d,dict) and "items" not in d: print(d)';;
+start) api POST $P/$2/start && echo "$2 started";;
 delete) api POST $P/$2/stop >/dev/null || true; api DELETE $P/$2 && echo "$2 deleted";;
-*) sed -n '2,16p' "$0"; exit 1;;
+*) sed -n '2,18p' "$0"; exit 1;;
 esac

@@ -1,0 +1,7 @@
+SERVER=https://cado-nfs.example.org:8270   # what the clients dial, as c270-polyselect-server's PUBLIC_NAME and PORT
+CERTSHA1=0000000000000000000000000000000000000000   # the --certsha1 the server prints
+CAP=0.6          # dollars per hour per ad/s; an RTX 3090 at 0.30 dollars an hour is 0.6
+MAXHOSTS=60
+MINKEEP=6        # idle hosts kept for root optimization
+MINCREDIT=30     # below this Vast.ai credit, destroy everything
+STOP=0           # 1: destroy every host and exit

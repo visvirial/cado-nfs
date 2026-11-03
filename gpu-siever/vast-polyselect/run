@@ -1,0 +1,20 @@
+#!/bin/bash
+# Start the fleet manager (again, after a reboot). The first run creates FLEET_DIR with
+# fleet.conf to fill in, an SSH key registered with Vast.ai, and src.tgz, the source the
+# hosts build: this repository's HEAD.
+set -Eeuo pipefail
+. "$(dirname "$(readlink -f "$0")")/env.sh"
+[ -n "$V" ] || { echo "vastai not found: pip install vastai, or set V" >&2; exit 1; }
+mkdir -p "$FLEET_DIR"; chmod 700 "$FLEET_DIR"; cd "$FLEET_DIR"
+if [ ! -f fleet.conf ]; then cp "$HERE/fleet.conf.example" fleet.conf; echo "fill in $FLEET_DIR/fleet.conf and run again"; exit 1; fi
+. ./fleet.conf
+case "$CERTSHA1" in 0000*) echo "set SERVER and CERTSHA1 in $FLEET_DIR/fleet.conf" >&2; exit 1;; esac
+[ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N "" -C rsa270-fleet -f "$KEY"
+pub=$(awk '{print $2}' "$KEY.pub")
+"$V" show ssh-keys --raw | python3 -c 'import json,sys
+sys.exit(0 if any(sys.argv[1] in (k.get("public_key") or k.get("ssh_key") or "") for k in json.load(sys.stdin)) else 1)' "$pub" \
+  || "$V" create ssh-key "$(cat "$KEY.pub")" > /dev/null
+[ -f src.tgz ] || git -C "$HERE" archive --format=tar.gz -o "$FLEET_DIR/src.tgz" HEAD
+if running; then echo "already running"; exit 0; fi
+setsid nohup bash "$HERE/fleet.sh" >> fleet.out 2>&1 < /dev/null &
+echo "started; log in $FLEET_DIR/events.log"

@@ -153,6 +153,20 @@ the `tasks.*` settings after it:
       tasks.sieve.las.execpath=$PWD/scripts \
       tasks.sieve.las.execbin=las-glas
 
+### Polynomial selection
+
+`scripts/c270-polyselect-server` starts or resumes the server of an RSA-270
+polynomial search (see its header). `vast-polyselect/run` keeps a Vast.ai
+fleet of single-GPU clients on it: it rents each offer under a cost cap per
+unit of gps1 speed, replaces hosts that fail or run slow, and destroys every
+host when the server is gone for two hours or the credit runs low. The
+first run creates `~/.local/share/rsa270-fleet/fleet.conf` to fill in with
+the server's URL and certificate fingerprint; `vast-polyselect/status`
+shows the fleet. The hosts run gps1 with `-sopt-gpu 0`: on an RTX 5090,
+`-sopt-gpu 1` gives far worse polynomials. With the size optimization on the CPU,
+gps1 used about 4 GB of device memory, and per dollar an RTX 3090 searched
+about 35% more than an RTX 5090.
+
 `glas` sizes its chunks and slots from the device memory: the largest chunk up
 to 2^30 that still leaves two slots, then two slots at 2^30 and as many as fit
 below it. `GLAS_GPU_CHUNK` and `GLAS_GPU_SLOTS` override this.

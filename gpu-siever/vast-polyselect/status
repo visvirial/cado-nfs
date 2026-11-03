@@ -1,0 +1,9 @@
+#!/bin/bash
+# Show whether the manager runs, its last log lines, and each host's speed and polynomials.
+. "$(dirname "$(readlink -f "$0")")/env.sh"
+cd "$FLEET_DIR"
+running && echo "fleet manager: running" || echo "fleet manager: NOT running"
+tail -3 events.log
+for d in m*/; do d=${d%/}; [ -f $d/id ] && [ ! -f $d/dead ] || continue
+  r=$(timeout 60 "$HERE/ssh-host.sh" $d 'awk "NF==5 && \$5==0 {ad+=(\$2-\$1)/\$3; t+=\$4; n++} END{printf \"%d WUs %.3f ad/s\", n, (t?ad/t:0)}" /workspace/out/wu.log 2>/dev/null; echo " polys $(grep -c "^# exp_E" /workspace/out/gps1.out 2>/dev/null) best $(grep -h "^# exp_E" /workspace/out/gps1.out 2>/dev/null | sort -k3 -g | head -1 | cut -c1-14)"' 2>/dev/null | grep -v -i 'welcome\|have fun')
+  echo "$d $(cat $d/gpu) $r"; done

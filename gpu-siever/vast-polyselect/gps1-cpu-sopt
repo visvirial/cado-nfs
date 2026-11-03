@@ -1,0 +1,10 @@
+#!/bin/bash
+# GPS1_BIN for the polyselect-gps1 launcher: gps1 with the size optimization on the CPU,
+# since -sopt-gpu 1 gives far worse polynomials on an RTX 5090. Keeps every polynomial in
+# out/gps1.out and one line per work unit in out/wu.log: admin admax incr seconds rc.
+t0=$(date +%s); prev=; a=0; b=0; i=1
+for x in "$@"; do case $prev in -admin) a=$x;; -admax) b=$x;; -incr) i=$x;; esac; prev=$x; done
+/workspace/src/gpu-siever/gps1 "$@" -sopt-gpu 0 | tee -a /workspace/out/gps1.out
+rc=${PIPESTATUS[0]}
+echo "$a $b $i $(( $(date +%s) - t0 )) $rc" >> /workspace/out/wu.log
+exit $rc

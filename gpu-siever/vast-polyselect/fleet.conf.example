@@ -5,3 +5,5 @@ MAXHOSTS=60
 MINKEEP=6        # idle hosts kept for root optimization
 MINCREDIT=30     # below this Vast.ai credit, destroy everything
 STOP=0           # 1: destroy every host and exit
+SALAD_ORG=       # for salad.sh: the SaladCloud organization and project
+SALAD_PROJECT=

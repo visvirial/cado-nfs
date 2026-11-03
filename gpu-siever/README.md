@@ -166,6 +166,9 @@ shows the fleet. The hosts run gps1 with `-sopt-gpu 0`: on an RTX 5090,
 `-sopt-gpu 1` gives far worse polynomials. With the size optimization on the CPU,
 gps1 used about 4 GB of device memory, and per dollar an RTX 3090 searched
 about 35% more than an RTX 5090.
+`vast-polyselect/salad.sh` runs the same client in SaladCloud container groups,
+which have no SSH: each container fetches the pushed commit from GitHub, builds,
+and logs its work units to the Salad logs (`salad.sh logs`).
 
 `glas` sizes its chunks and slots from the device memory: the largest chunk up
 to 2^30 that still leaves two slots, then two slots at 2^30 and as many as fit

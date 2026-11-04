@@ -1,8 +1,9 @@
 #!/bin/bash
 # Resubmit now the work units the server will otherwise wait tasks.wutimeout (24000 s) for:
 # those assigned to a client that no longer exists (a destroyed Vast instance, a cancelled
-# Clore order, a gone Salad instance), and those a living client got before its newest one
-# (a client works on one work unit at a time, so it dropped them, say on a restart).
+# Clore order, a gone Salad instance), and those a living client got before its newest two (a
+# client computes one work unit and downloads the next meanwhile, cado-nfs-client.py's
+# DownloadPipeline, so it holds two; older ones it dropped, say on a restart).
 #
 #   resubmit-lost.sh            list them, by reason; changes nothing
 #   resubmit-lost.sh --apply    also set them NEED_RESUBMIT in the server's database (after a
@@ -39,14 +40,15 @@ python3 - $T/live $T/assigned > $T/lost <<'EOF'
 import sys
 live = set(open(sys.argv[1]).read().split())
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2]) if l.strip()]
-newest = {}
-for w, cl, t in rows: newest[cl] = max(newest.get(cl, ""), t)
+held = {}
+for w, cl, t in rows: held.setdefault(cl, []).append(t)
+second = {cl: sorted(ts)[-2] if len(ts) > 1 else ts[0] for cl, ts in held.items()}
 n = {"gone": 0, "older": 0}
 for w, cl, t in rows:
-    why = "gone" if cl not in live else "older" if t < newest[cl] else None
+    why = "gone" if cl not in live else "older" if t < second[cl] else None
     if why: n[why] += 1; print(w)
 print(f"{len(rows)} assigned, {len(live)} living clients: {n['gone']} of gone clients,"
-      f" {n['older']} older than their client's newest", file=sys.stderr)
+      f" {n['older']} older than their client's newest two", file=sys.stderr)
 EOF
 [ "${1:-}" = --apply ] || { cat $T/lost; exit 0; }
 [ -s $T/lost ] || { echo "nothing to resubmit"; exit 0; }

@@ -2,7 +2,8 @@
 # Keep a Vast.ai fleet of single-GPU clients on a polynomial search served by
 # c270-polyselect-server. Every minute it rents each offer under the cost cap (CAP dollars
 # per hour per ad/s, or PRICE_<GPU> dollars per hour where set), replaces hosts (checked every 10 minutes) that never come up, stop answering, fail to build, fail two work units in a row, or run below
-# 75% of their GPU's speed (and never rents those machines again), gives back idle hosts beyond
+# 75% of their GPU's speed (and never rents those machines again), with BID=1 also rents interruptible
+# offers at BID_MARGIN above their minimum bid (and gives them up once outbid), gives back idle hosts beyond
 # MINKEEP, restarts clients that ended when the server stopped serving work units, and destroys every host when SERVER has not answered for 2 h (the server exits when
 # the search ends), the credit is below MINCREDIT, or STOP=1. Started by "vast.sh manage"; logs to
 # $FLEET_DIR/events.log. The speeds are those measured with gps1 -sopt-gpu 0 at P=2e7.
@@ -14,20 +15,30 @@ IMG=nvidia/cuda:12.8.1-devel-ubuntu22.04
 touch machines.bad; [ -f counter ] || echo 0 > counter; srv_down_since=
 live() { for d in m*/; do d=${d%/}; [ -f $d/id ] && [ ! -f $d/dead ] && echo $d; done; }
 kill_host() { l=$1; shift; $V destroy instance $(cat $l/id) -y >/dev/null 2>&1; touch $l/dead; log "$l destroyed: $*"; }
-offers() { # "gpu offer machine" lines under the cap, best first, skipping bad machines and those in use
-  $V search offers "num_gpus=1 rentable=true rented=false verified=true direct_port_count>=4 cpu_cores_effective>=16 reliability>=0.97 cuda_max_good>=12.8 inet_down>=200 gpu_name in [RTX_3090,RTX_5080,RTX_4080S,RTX_4090,RTX_5090]" --raw --limit 1000 2>/dev/null | python3 -c '
+offers() { # "gpu offer machine bid" lines under the cap, best first, skipping bad machines and those in use;
+  # bid is the price of an interruptible rental (BID=1), or - for an on-demand one
+  q="num_gpus=1 rentable=true rented=false verified=true direct_port_count>=4 cpu_cores_effective>=16 reliability>=0.97 cuda_max_good>=12.8 inet_down>=200 gpu_name in [RTX_3090,RTX_5080,RTX_4080S,RTX_4090,RTX_5090]"
+  { $V search offers "$q" --raw --limit 1000 2>/dev/null; echo; [ "${BID:-0}" = 1 ] && $V search offers "$q" --type bid --raw --limit 1000 2>/dev/null; } | python3 -c '
 import json,sys,os
 R={"RTX 3090":.496,"RTX 5080":.522,"RTX 4080S":.415,"RTX 4090":.57,"RTX 5090":.96}
-cap=float(sys.argv[1]);skip=set(open("machines.bad").read().split())|set(sys.argv[2:]);best={}
-for x in json.load(sys.stdin):
-    m=str(x["machine_id"]);e=x["dph_total"]/R[x["gpu_name"]]
-    lim=os.environ.get("PRICE_"+x["gpu_name"].replace(" ","_"))
-    if m in skip or (x["dph_total"]>float(lim) if lim else e>cap) or x.get("inet_down_cost",1)>.03: continue
-    if m not in best or e<best[m][0]: best[m]=(e,x)
-for e,x in sorted(best.values(),key=lambda t:t[0]): print(x["gpu_name"].replace(" ","_"),x["id"],x["machine_id"])' $CAP $(for d in $(active); do cat $d/machine; done | sort -u); }
-launch() { # label gpu offer machine; runs in the background
+cap=float(sys.argv[1]);margin=float(sys.argv[2]);skip=set(open("machines.bad").read().split())|set(sys.argv[3:]);best={}
+parts=[p for p in sys.stdin.read().split("\n\n") if p.strip()]
+for k,p in enumerate(parts):
+    for x in json.loads(p):
+        bid=None
+        if k==1:
+            if not x.get("min_bid"): continue
+            bid=round(x["min_bid"]*(1+margin)+0.0005,3); price=bid
+        else: price=x["dph_total"]
+        m=str(x["machine_id"]);e=price/R[x["gpu_name"]]
+        lim=os.environ.get("PRICE_"+x["gpu_name"].replace(" ","_"))
+        if m in skip or (price>float(lim) if lim else e>cap) or x.get("inet_down_cost",1)>.03: continue
+        if m not in best or e<best[m][0]: best[m]=(e,x,bid)
+for e,x,bid in sorted(best.values(),key=lambda t:t[0]): print(x["gpu_name"].replace(" ","_"),x["id"],x["machine_id"],bid if bid else "-")' $CAP ${BID_MARGIN:-0.05} $(for d in $(active); do cat $d/machine; done | sort -u); }
+launch() { # label gpu offer machine bid; runs in the background
   l=$1; mkdir -p $l; echo $2 > $l/gpu; echo $4 > $l/machine; date +%s > $l/t0; touch $l/launching
-  r=$(timeout 1200 bash $HERE/vast-launch.sh $l ${ARCH[$2]} $IMG $3 2>&1 | tail -1); log "$l $2 machine $4: $r"
+  b=; [ "${5:--}" != - ] && { b=$5; echo $b > $l/bid; }
+  r=$(BID_PRICE=$b timeout 1200 bash $HERE/vast-launch.sh $l ${ARCH[$2]} $IMG $3 2>&1 | tail -1); log "$l $2 machine $4${b:+ bid \$$b}: $r"
   [ -f $l/id ] || { echo $4 >> machines.bad; touch $l/dead; }
   rm -f $l/launching
 }
@@ -57,6 +68,8 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
       id=$(cat $l/id); a=$(echo "$st" | awk -v i=$id '$1==i{print $2}'); age=$(( $(date +%s) - $(cat $l/t0) ))
       if [ -n "$st" ] && [ -z "$a" ]; then touch $l/dead; log "$l instance $id is gone"; continue; fi
       [ -f $l/launching ] && continue
+      # an interruptible host stops when outbid: give it up, without holding it against the machine
+      if [ -f $l/bid ] && [ -n "$a" ] && [ "$a" != running ]; then kill_host $l "interrupted (status $a, bid \$$(cat $l/bid))"; continue; fi
       if [ ! -f $l/addr ]; then [ $age -gt 1800 ] && { echo $(cat $l/machine) >> machines.bad; kill_host $l "never came up"; }; continue; fi
       s=$(cat $l/probe 2>/dev/null)
       if [ -z "$s" ]; then m=$(( $(cat $l/miss 2>/dev/null || echo 0) + 1 )); echo $m > $l/miss
@@ -83,7 +96,7 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
     want=$(( MAXHOSTS - $(active | wc -l) )); room=$(( 8 - $(launching) )); [ $want -gt $room ] && want=$room
     if [ $want -gt 0 ]; then
       offers | head -$want > offers.now
-      while read g o m; do c=$(( $(cat counter) + 1 )); echo $c > counter; launch $(printf 'm%03d' $c) $g $o $m & sleep 2; done < offers.now
+      while read g o m b; do c=$(( $(cat counter) + 1 )); echo $c > counter; launch $(printf 'm%03d' $c) $g $o $m $b & sleep 2; done < offers.now
     fi
   fi
   sleep 60

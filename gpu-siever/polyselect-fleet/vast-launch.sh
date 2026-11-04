@@ -1,10 +1,11 @@
 #!/bin/bash
 # usage: vast-launch.sh host arch image offer [offer...]
 # Rents the first offer that comes up and answers SSH, copies the source and the client over,
-# and starts host/boot.sh there. Prints one line; exit 0 if a host started.
+# and starts host/boot.sh there. Prints one line; exit 0 if a host started. With BID_PRICE set, the
+# rental is interruptible at that price in dollars per hour.
 l=$1; arch=$2; img=$3; shift 3; D=$FLEET_DIR/$l; mkdir -p $D
 for off in "$@"; do
-  $V create instance $off --image $img --disk 40 --ssh --direct --label rsa270-ps-$l --cancel-unavail --onstart-cmd 'mkdir -p /workspace' --raw > $D/create 2>&1
+  $V create instance $off --image $img --disk 40 --ssh --direct --label rsa270-ps-$l --cancel-unavail --onstart-cmd 'mkdir -p /workspace' ${BID_PRICE:+--bid_price $BID_PRICE} --raw > $D/create 2>&1
   id=$(python3 -c "import json;print(json.load(open('$D/create'))['new_contract'])" 2>/dev/null) || { echo "$l offer $off CREATE_FAILED $(head -c 100 $D/create | grep -v api_key)"; continue; }
   echo $id > $D/id; echo $off > $D/offer; rm -f $D/addr
   a=

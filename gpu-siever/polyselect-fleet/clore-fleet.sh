@@ -14,6 +14,7 @@
 # SERVER has not answered for 2 h. New orders need a balance of CLORE_MINBAL plus two hours
 # of the fleet's cost.
 D=$FLEET_DIR/clore; mkdir -p $D; cd $D; E=$D/events.log; C="bash $HERE/clore.sh"
+echo $$ > $FLEET_DIR/clore-fleet.sh.pid   # for running() in env.sh
 log() { echo "$(date '+%F %T') $*" >> $E; }
 declare -A RATE=([RTX_3090]=0.496 [RTX_5080]=0.522 [RTX_4080_SUPER]=0.415 [RTX_4090]=0.57 [RTX_5090]=0.96)
 touch servers.bad; srv_down_since=; last_health=0; nidle=0

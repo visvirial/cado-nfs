@@ -10,4 +10,6 @@ KEY=${KEY:-$FLEET_DIR/id_vast}
 # start client.sh again as boot.sh does; client.sh waits until the server answers.
 RESTART='cd /workspace && rm -f state && { setsid nohup bash -c "bash client.sh >> out/boot.log 2>&1; echo \"done rc=\$?\" > state" > /dev/null 2>&1 < /dev/null & }'
 export HERE FLEET_DIR V KEY RESTART
-running() { ps -eo cmd | awk -v f="$HERE/$1" '$1=="bash" && $2==f {r=1} END {exit !r}'; }   # running vast-fleet.sh
+# running vast-fleet.sh: whether the manager whose PID it wrote to $FLEET_DIR/vast-fleet.sh.pid still runs.
+# Its subshells (launches) carry the same command line and can outlive it, so the command line alone is no sign.
+running() { local p; p=$(cat "$FLEET_DIR/$1.pid" 2>/dev/null) && [ -n "$p" ] && { tr '\0' ' ' < /proc/$p/cmdline; } 2>/dev/null | grep -qF "$HERE/$1"; }

@@ -8,6 +8,7 @@
 # the search ends), the credit is below MINCREDIT, or STOP=1. Started by "vast.sh manage"; logs to
 # $FLEET_DIR/events.log. The speeds are those measured with gps1 -sopt-gpu 0 at P=2e7.
 cd $FLEET_DIR; E=$FLEET_DIR/events.log
+echo $$ > $FLEET_DIR/vast-fleet.sh.pid   # for running() in env.sh
 log() { echo "$(date '+%F %T') $*" >> $E; }
 declare -A RATE=([RTX_3090]=0.496 [RTX_5080]=0.522 [RTX_4080S]=0.415 [RTX_4090]=0.57 [RTX_5090]=0.96)
 declare -A ARCH=([RTX_3090]=86 [RTX_5080]=100 [RTX_4080S]=89 [RTX_4090]=89 [RTX_5090]=100)

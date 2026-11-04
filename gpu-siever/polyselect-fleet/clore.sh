@@ -6,7 +6,7 @@
 #   clore.sh rent SERVER-ID...     rent on demand and start host/container-boot.sh there
 #   clore.sh status                the orders, with their SSH ports
 #   clore.sh ssh ORDER-ID [CMD]    SSH into the container of an order
-#   clore.sh cancel ORDER-ID...    end orders
+#   clore.sh cancel ORDER-ID...    end orders; fails unless every order is ended
 #   clore.sh balance               the USD balance
 #   clore.sh tsv                   the orders, one per line: order server gpu host port $/h
 #   clore.sh candidates CAP MINREL the free servers under CAP, cheapest per ad/s first:
@@ -21,7 +21,10 @@
 set -eu
 HERE=$(dirname "$(readlink -f "$0")"); . "$HERE/env.sh"; set -a; . "$FLEET_DIR/fleet.conf"; set +a
 K=$(cat ~/.config/clore/api_key); U=https://api.clore.ai/v1
-api() { m=$1; u=$2; shift 2; curl -sS -m 60 -X $m -H "auth: $K" -H 'Content-Type: application/json' "$U/$u" "$@"; }
+# The API allows about one request a second per key, and answers more with an error, so every
+# request, from any clore.sh at once, waits its turn on a lock and keeps it a second longer.
+api() { m=$1; u=$2; shift 2
+  ( flock 9; curl -sS -m 60 -X $m -H "auth: $K" -H 'Content-Type: application/json' "$U/$u" "$@"; r=$?; sleep 1; exit $r ) 9> "$FLEET_DIR/clore-api.lock"; }
 orders() { # the API allows about one request a second
   for i in 1 2 3 4 5; do r=$(api GET my_orders) && echo "$r" | grep -q '"orders"' && { echo "$r"; return; }; sleep 2; done; echo "$r" >&2; return 1; }
 market() { # mode cap minrel n
@@ -84,6 +87,10 @@ ssh) id=$2; shift 2
 for o in json.load(sys.stdin)["orders"]:
     if str(o["id"])==sys.argv[1]: print(o["pub_cluster"][0],[t for t in o["tcp_ports"] if t.startswith("22:")][0].split(":")[1])' $id)
   exec ssh -i $KEY -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -p $p root@$h "$@";;
-cancel) shift; for id in "$@"; do echo "$id $(api POST cancel_order --data "{\"id\":$id}")"; sleep 1.2; done;;
+cancel) shift; rc=0
+  for id in "$@"; do
+    for i in 1 2 3 4 5; do r=$(api POST cancel_order --data "{\"id\":$id}") && echo "$r" | grep -q '"code": *0[,}]' && break; sleep $((2 * i)); done
+    echo "$id $r"; echo "$r" | grep -q '"code": *0[,}]' || { echo "order $id not cancelled" >&2; rc=1; }; done
+  exit $rc;;
 *) sed -n '2,20p' "$0"; exit 1;;
 esac

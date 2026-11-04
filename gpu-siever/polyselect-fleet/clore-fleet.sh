@@ -19,7 +19,10 @@ log() { echo "$(date '+%F %T') $*" >> $E; }
 declare -A RATE=([RTX_3090]=0.496 [RTX_5080]=0.522 [RTX_4080_SUPER]=0.415 [RTX_4090]=0.57 [RTX_5090]=0.96)
 touch servers.bad; srv_down_since=; last_health=0; nidle=0
 live() { for d in s*/; do d=${d%/}; [ -d $d ] && [ ! -f $d/dead ] && echo $d; done; }
-cancel_host() { d=$1; shift; [ -f $d/order ] && $C cancel $(cat $d/order) > /dev/null 2>&1; touch $d/dead; log "$d $(cat $d/gpu 2>/dev/null) cancelled: $*"; }
+# a host whose order did not end stays live, and is tried again on the next round
+cancel_host() { d=$1; shift
+  if [ -f $d/order ] && ! $C cancel $(cat $d/order) > /dev/null 2>&1; then log "$d $(cat $d/gpu 2>/dev/null) cancel failed ($*)"; return; fi
+  touch $d/dead; log "$d $(cat $d/gpu 2>/dev/null) cancelled: $*"; }
 bad() { echo ${1#s} >> servers.bad; }
 PROBE='cd /workspace 2>/dev/null || { echo nows; exit 0; }; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc gps1) $(pgrep -xc polyselect_ropt)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y out/boot.log 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; cat out/wu.log 2>/dev/null'
 export PROBE KEY

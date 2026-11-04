@@ -622,6 +622,13 @@ recent than 3.1.3) fixes this.
                 if not chunk:
                     return True
 
+    def _remove(self, paths):
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError as err:
+                self.logger.error(f"cannot remove {path}: {err}")
+
     def api_upload_file(self):
         """
         Receives the result files of a workunit.
@@ -652,6 +659,13 @@ recent than 3.1.3) fixes this.
 
         uploaded_files = []
         duplicates = 0
+        # The files this request stored: removed again unless the result
+        # is taken. A file left by a work unit that was resubmitted
+        # meanwhile ("was not currently assigned") has the name of the
+        # resubmitted copy's file, so it would refuse that copy's result
+        # (output that differs from run to run, as gps1's does), and the
+        # range would never be done.
+        saved = []
         for fkey, f in flask.request.files.items():
             filename = secure_filename(f.filename)
             path = os.path.join(self.get_upload_folder(), filename)
@@ -665,6 +679,7 @@ recent than 3.1.3) fixes this.
 
             if not os.path.isfile(path):
                 f.save(path)
+                saved.append(path)
             elif self._same_content(path, f.stream):
                 self.logger.info(f"{clientid} re-sent {path}"
                                  f" for {wuid} with identical content")
@@ -673,6 +688,7 @@ recent than 3.1.3) fixes this.
                 self.logger.error(f"denied request from {clientid}"
                                   f" to overwrite existing file {path}"
                                   " with different content")
+                self._remove(saved)
                 flask.abort(409, "File already exists"
                                  " with different content")
             tup = [filename, path, fi["key"]]
@@ -691,6 +707,7 @@ recent than 3.1.3) fixes this.
                                        failedcommand)
         except wudb.StatusUpdateError:
             self.logger.warning(f'Workunit {wuid} was not currently assigned')
+            self._remove(saved)
         else:
             self.logger.debug(f'Workunit {wuid} completed,'
                               f' uploaded files {uploaded_files}')

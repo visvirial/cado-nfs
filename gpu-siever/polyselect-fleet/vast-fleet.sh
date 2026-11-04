@@ -39,7 +39,7 @@ launch() { # label gpu offer machine bid; runs in the background
   l=$1; mkdir -p $l; echo $2 > $l/gpu; echo $4 > $l/machine; date +%s > $l/t0; touch $l/launching
   b=; [ "${5:--}" != - ] && { b=$5; echo $b > $l/bid; }
   r=$(BID_PRICE=$b timeout 1200 bash $HERE/vast-launch.sh $l ${ARCH[$2]} $IMG $3 2>&1 | tail -1); log "$l $2 machine $4${b:+ bid \$$b}: $r"
-  [ -f $l/id ] || { echo $4 >> machines.bad; touch $l/dead; }
+  [ -f $l/id ] || { [ -n "$b" ] || echo $4 >> machines.bad; touch $l/dead; }   # a failed bid is no fault of the machine
   rm -f $l/launching
 }
 active() { for d in m*/; do d=${d%/}; [ ! -f $d/dead ] && { [ -f $d/id ] || [ -f $d/launching ]; } && echo $d; done; }

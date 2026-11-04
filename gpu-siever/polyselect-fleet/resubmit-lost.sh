@@ -10,6 +10,10 @@
 # currently assigned"); gps1 output differs from run to run, so every later copy's result
 # is refused, and the client drops it.
 #
+# A work unit at the server's last attempt (__R<maxresubmit>, from the log, 5 by default) is
+# left alone: the server would cancel it, not resubmit it ("Not resubmitting workunit"), and
+# its range would never be searched.
+#
 #   resubmit-lost.sh            list them, by reason; changes nothing
 #   resubmit-lost.sh --apply    also move the result files of work units with no accepted
 #                               result to WORKDIR/<name>.upload.orphan, and set the work
@@ -51,6 +55,11 @@ for w, s, cl, t in c.execute("select wuid, status, assignedclient, timeassigned 
                              " where wuid like ?", (name + "_polyselect1_%",)):
     if s == 1: print("A", w, cl, t, sep="\t")
     if s == 5: ok.add(re.sub(r"__R\d+$", "", w))
+m = None
+for l in open(name + ".log", errors="replace"):
+    if "Polynomial Selection (size optimized): params = " in l:
+        m = re.search(r"'maxresubmit': (\d+)", l) or m
+print("M", m.group(1) if m else 5, sep="\t")
 pat = re.compile(r"denied request from (\S+) to overwrite existing file \S*/"
                  + re.escape(name) + r"\.polyselect1\.(\S+) with")
 for l in open(name + ".log", errors="replace"):
@@ -68,24 +77,30 @@ ssh -o BatchMode=yes $SERVER_SSH "cd $SERVER_WORKDIR && python3 -" < $T/read.py 
 python3 - $T/live $T/state $T/orphans > $T/lost <<'EOF'
 import re, sys
 live = set(open(sys.argv[1]).read().split())
-rows, denied, orphans = [], set(), []
+rows, denied, orphans, maxresubmit = [], set(), [], 5
 for l in open(sys.argv[2]):
     f = l.rstrip("\n").split("\t")
     if f[0] == "A": rows.append(f[1:])
     elif f[0] == "D": denied.add((f[1], f[2]))
     elif f[0] == "O": orphans.append(f[2])
+    elif f[0] == "M": maxresubmit = int(f[1])
 open(sys.argv[3], "w").write("".join(o + "\n" for o in orphans))
 held = {}
 for w, cl, t in rows: held.setdefault(cl, []).append(t)
 second = {cl: sorted(ts)[-2] if len(ts) > 1 else ts[0] for cl, ts in held.items()}
-n = {"gone": 0, "older": 0, "refused": 0}
+n = {"gone": 0, "older": 0, "refused": 0}; last = []
 for w, cl, t in rows:
     why = ("gone" if cl not in live else "older" if t < second[cl]
            else "refused" if (cl, re.sub(r"__R\d+$", "", w)) in denied else None)
-    if why: n[why] += 1; print(w)
+    if not why: continue
+    a = re.search(r"__R(\d+)$", w)
+    if (int(a.group(1)) if a else 1) >= maxresubmit: last.append(f"{w} ({why}, {cl})"); continue
+    n[why] += 1; print(w)
 print(f"{len(rows)} assigned, {len(live)} living clients: {n['gone']} of gone clients,"
       f" {n['older']} older than their client's newest two, {n['refused']} refused;"
       f" {len(orphans)} result files of work units with no accepted result", file=sys.stderr)
+for x in last:
+    print(f"left alone, at the last attempt ({maxresubmit}): {x}", file=sys.stderr)
 EOF
 [ "${1:-}" = --apply ] || { cat $T/lost; exit 0; }
 [ -s $T/lost ] || [ -s $T/orphans ] || { echo "nothing to do"; exit 0; }

@@ -2,8 +2,8 @@
 # Fill the SaladCloud replica quota with sieving clients, cheapest priority first. Started by
 # "salad.sh manage"; logs to $FLEET_DIR/salad/events.log.
 #
-# One container group per priority of SALAD_TIERS (default "batch low"): SALAD_GROUP (c270-sv)
-# for the first, SALAD_GROUP-<priority> for the others, each with the GPU classes whose price
+# One container group per priority of SALAD_TIERS (default "batch low"), SALAD_GROUP-<priority>
+# (c270-sv-batch, c270-sv-low, ...), each with the GPU classes whose price
 # at that priority is within CAP ("salad.sh fit"). The quota counts the replicas a group asks
 # for, not those it gets, so every 10 minutes each group but the last asks for the replicas it
 # has (creating or running) plus SALAD_HEADROOM (5), to keep taking free machines at its
@@ -19,7 +19,7 @@ while :; do
   SALAD_TIERS="batch low" SALAD_GROUP=c270-sv SALAD_HEADROOM=5 SALAD_REPLICAS= SALAD_STOP=0 STOP=0
   set -a; . $FLEET_DIR/fleet.conf; set +a
   tiers=($SALAD_TIERS); n=${#tiers[@]}
-  name() { [ $1 = 0 ] && echo $SALAD_GROUP || echo $SALAD_GROUP-${tiers[$1]}; }
+  name() { echo $SALAD_GROUP-${tiers[$1]}; }
   if curl -sk -m 20 $SERVER/ | grep -q Hello; then srv_down_since=
   else [ -z "$srv_down_since" ] && log "server unreachable"; srv_down_since=${srv_down_since:-$(date +%s)}; fi
   if [ "$STOP" = 1 ] || [ "$SALAD_STOP" = 1 ] || { [ -n "$srv_down_since" ] && [ $(( $(date +%s) - srv_down_since )) -gt 7200 ]; }; then

@@ -180,6 +180,15 @@ the pushed commit from GitHub. The hosts run gps1 with `-sopt-gpu 0`: on an RTX
 the CPU, gps1 used about 4 GB of device memory, and per dollar an RTX 3090
 searched about 35% more than an RTX 5090.
 
+### Sieving
+
+`scripts/c270-sieve-server` starts or resumes the RSA-270 sieving server in the
+WORKDIR of the finished polynomial search: it builds the factor base, hands
+out work units of `QRANGE` special-q (150000 by default, 20-23 minutes on an RTX
+5090 and up to 85 minutes on an RTX 3090) to clients that run `las-glas`, and
+stops before the filtering. Each client downloads the factor base once (about
+800 MB), and the relations total about 3 TB compressed.
+
 `glas` sizes its chunks and slots from the device memory. On a GPU with an L2
 cache of 32 MB or more it takes the largest chunk up to 2^30 that one slot
 fits, keeping 1.5 GB for the context and the cofactorization buffers: at

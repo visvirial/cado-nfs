@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Start, or resume, the cado-nfs.py server of the RSA-270 sieving, in the WORKDIR of the
+# finished polynomial search (c270-polyselect-server): the search is done, so the server
+# builds the factor base and hands out sieving work units. It stops before the
+# filtering (tasks.filter.run=false), which needs far more memory than the server has;
+# the relations stay in WORKDIR for a filtering host.
+#
+#   WORKDIR=/data/c270-ps PUBLIC_NAME=ps.example.org WHITELIST=203.0.113.0/24 \
+#     gpu-siever/scripts/c270-sieve-server
+#
+# The polynomial search settings and their defaults are those of c270-polyselect-server,
+# so that the server finds the parameters of the search unchanged; set the same
+# environment as for that run. Sieving:
+#   QRANGE       special-q per work unit (150000): 20-23 min on an RTX 5090, 34-55 min
+#                on an RTX 4090, 5080 or 5070 Ti, 72-85 min on an RTX 3090 (2e9 to 1e11)
+#   WUTIMEOUT    seconds before a work unit is handed out again (10800)
+#   MAXRESUBMIT  hand-outs of one work unit (5)
+# The clients run las-glas with glas-gpu (GLAS_BIN) on their PATH and GLAS_THREADS=8.
+# Each client downloads the factor base once (about 800 MB), so the fleet grows in steps.
+# The relations total about 3 TB compressed: WORKDIR needs that much free space.
+set -Eeuo pipefail
+
+scripts=$(dirname "$(readlink -f "$0")")
+siever=$(dirname "$scripts")
+cado_nfs=${CADO_NFS:-$siever/build/cado/cado-nfs.py}
+[ -x "$cado_nfs" ] || { echo "$cado_nfs not found; set CADO_NFS" >&2; exit 1; }
+
+rsa270=233108530344407544527637656910680524145619812480305449042948611968495918245135782867888369318577116418213919268572658314913060672626911354027609793166341626693946596196427744273886601876896313468704059066746903123910748277606548649151920812699309766587514735456594993207
+
+exec "$cado_nfs" --parameters "$siever/params/params.c270" \
+  --server-threads "${SERVER_THREADS:-8}" \
+  --workdir "${WORKDIR:?set WORKDIR}" "$rsa270" \
+  server.alternate_names="${PUBLIC_NAME:?set PUBLIC_NAME}" \
+  server.port="${PORT:-8001}" \
+  server.whitelist="${WHITELIST:?set WHITELIST}" \
+  server.threaded=true \
+  tasks.polyselect.polyselect.execpath="$scripts" \
+  tasks.polyselect.polyselect.execbin=polyselect-gps1 \
+  tasks.polyselect.polyselect_ropt.execpath="$scripts" \
+  tasks.polyselect.polyselect_ropt.execbin=polyselect-ropt-local \
+  tasks.polyselect.P="${P:-20000000}" \
+  tasks.polyselect.incr="${INCR:-110880}" \
+  tasks.polyselect.nq="${NQ:-1296}" \
+  tasks.polyselect.admin="${ADMIN:-0}" \
+  tasks.polyselect.admax="${ADMAX:-3000000000000}" \
+  tasks.polyselect.adrange="${ADRANGE:-133056000}" \
+  tasks.polyselect.nrkeep="${NRKEEP:-2000}" \
+  tasks.polyselect.ropteffort="${ROPTEFFORT:-5}" \
+  tasks.polyselect.threads="${THREADS:-16}" \
+  tasks.polyselect.maxfailed="${MAXFAILED:-100000}" \
+  tasks.polyselect.maxtimedout="${MAXTIMEDOUT:-100000}" \
+  tasks.sieve.las.execpath="$scripts" \
+  tasks.sieve.las.execbin=las-glas \
+  tasks.sieve.qrange="${QRANGE:-150000}" \
+  tasks.sieve.wutimeout="${WUTIMEOUT:-10800}" \
+  tasks.sieve.maxresubmit="${MAXRESUBMIT:-5}" \
+  tasks.filter.run=false \
+  "$@"

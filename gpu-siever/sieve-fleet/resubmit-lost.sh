@@ -1,9 +1,10 @@
 #!/bin/bash
 # Resubmit now the sieving work units the server would otherwise wait tasks.sieve.wutimeout
 # (10800 s with c270-sieve-server) for: those assigned to a client that no longer exists (a
-# destroyed Vast instance), those a living client got before its newest two (a client
-# computes one work unit and downloads the next meanwhile, cado-nfs-client.py's
-# DownloadPipeline, so it holds two; older ones it dropped, say on a restart), and those
+# destroyed Vast instance, a cancelled Clore order, a gone Salad instance), those a living
+# client got before its newest two (a client computes one work unit and downloads the next
+# meanwhile, cado-nfs-client.py's DownloadPipeline, so it holds two; older ones it dropped,
+# say on a restart), and those
 # whose result the server refused, "denied request from CLIENT to overwrite existing file".
 # The last come from a resubmission: the first copy's client computed on, and its result
 # file stayed in WORKDIR/<name>.upload though the server did not take the result ("was not
@@ -22,7 +23,8 @@
 #
 # The server is reached with "ssh $SERVER_SSH", its WORKDIR is SERVER_WORKDIR, both from
 # $FLEET_DIR/fleet.conf. The living clients are the hosts the Vast manager has not marked
-# dead, and the instances "salad.sh status" lists for every group. A client judged lost that still runs only loses its result: the server answers it
+# dead, the Clore orders the Clore manager has not, and the instances "salad.sh status" lists
+# for every group. A client judged lost that still runs only loses its result: the server answers it
 # "was not currently assigned" and keeps the resubmitted copy; its result file is moved by the
 # next --apply.
 set -euo pipefail
@@ -32,6 +34,7 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # living clients, by the --clientid host/client.sh gives itself
 cd "$FLEET_DIR"
 for d in m*/; do d=${d%/}; [ -f $d/id ] && [ ! -f $d/dead ] && echo "vast-sv$d.gpu0"; done > $T/live || true
+for d in clore/s*/; do d=${d%/}; [ -f $d/order ] && [ ! -f $d/dead ] && echo "vast-sv$(echo "salad-clore-${d#clore/s}" | cut -c1-24).gpu0"; done >> $T/live || true
 if [ -n "${SALAD_ORG:-}" ]; then
   # a failed listing would make every Salad client look lost, so it stops the script
   g=$("$HERE/salad.sh" status) || { echo "salad.sh status failed" >&2; exit 1; }

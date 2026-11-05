@@ -2,7 +2,7 @@ SERVER=https://cado-nfs.example.org:8270   # what the clients dial: c270-sieve-s
 CERTSHA1=0000000000000000000000000000000000000000   # the --certsha1 the server prints
 SERVER_SSH=        # resubmit-lost.sh: how to ssh to the server (user@host), and its WORKDIR
 SERVER_WORKDIR=
-CAP=40           # dollars per million special-q: an RTX 5090 at 0.72 dollars an hour is 40
+CAP=40           # dollars per million special-q, for every provider: an RTX 5090 at 0.72 dollars an hour is 40
 MAXHOSTS=10
 GPUS=RTX_5090,RTX_4090,RTX_3090   # GPU models to rent, of those in SPQ_TABLE (env.sh)
 MINCPU=16        # effective cores of an offer; glas runs 8 threads, and fewer cores left it host-bound
@@ -20,3 +20,7 @@ SALAD_ORG=       # salad.sh: the SaladCloud organization and project, and each c
 SALAD_PROJECT=   # vCPUs and memory in MB (glas runs 8 threads and takes about 3.5 GB)
 SALAD_CPU=16
 SALAD_MEMORY=24576
+CLORE_MAXHOSTS=10   # clore-fleet.sh
+CLORE_MINREL=0.98   # Clore server reliability
+CLORE_MINBAL=2   # below this Clore balance, cancel every order
+CLORE_STOP=0     # 1: cancel every Clore order and exit (STOP=1 does too)

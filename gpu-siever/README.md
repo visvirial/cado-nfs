@@ -211,8 +211,12 @@ for their GPU and run the client with `host/glas-wu` as `GLAS_BIN`, which logs
 each work unit. Before the client starts, a host both downloads the factor base
 and makes it with `makefb` (`MAKEFB` in fleet.conf), and keeps whichever ends
 first: from the server in Singapore, a host in China got under 0.4 MB/s, while
-`makefb` writes the same file in one to five minutes. `resubmit-lost.sh` lists, and with `--apply` resubmits, the work
-units of hosts that are gone.
+`makefb` writes the same file in one to five minutes. `clore.sh manage` starts
+`clore-fleet.sh`, which does the same with Clore.ai servers rented on demand, and
+`salad.sh` runs SaladCloud container groups; both start their containers with
+`host/container-boot.sh`, which fetches the pushed commit from GitHub.
+`resubmit-lost.sh` lists, and with `--apply` resubmits, the work units of hosts
+that are gone.
 
 `glas` needs `I >= 12`: below `c120`, add `tasks.I=12`. Parameters
 tuned for `las` with a large `mfb0`, such as `parameters/factor/params.c270`,

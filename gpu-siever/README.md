@@ -199,6 +199,21 @@ the largest chunk that still leaves two slots, within 80% of the free memory,
 then two slots at 2^30 and as many as fit below it. `GLAS_GPU_CHUNK` and
 `GLAS_GPU_SLOTS` override this.
 
+`sieve-fleet/` keeps sieving clients on Vast.ai, as `polyselect-fleet/` did for
+the search, in its own `~/.local/share/rsa270-sieve-fleet` (fleet.conf from
+`fleet.conf.example`). `vast.sh manage` starts `vast-fleet.sh`, which rents
+single-GPU RTX 5090, 4090 and 3090 offers under a cap in dollars per million
+special-q (`SPQ_TABLE` in `env.sh` holds the seconds per special-q of each
+model), replaces hosts that fail or run slow, and destroys every host when the
+server is gone for two hours or the credit runs low; `vast.sh status` shows each
+host's work units, seconds per special-q and relations. The hosts build `glas-gpu`
+for their GPU and run the client with `host/glas-wu` as `GLAS_BIN`, which logs
+each work unit. Before the client starts, a host both downloads the factor base
+and makes it with `makefb` (`MAKEFB` in fleet.conf), and keeps whichever ends
+first: from the server in Singapore, a host in China got under 0.4 MB/s, while
+`makefb` writes the same file in one to five minutes. `resubmit-lost.sh` lists, and with `--apply` resubmits, the work
+units of hosts that are gone.
+
 `glas` needs `I >= 12`: below `c120`, add `tasks.I=12`. Parameters
 tuned for `las` with a large `mfb0`, such as `parameters/factor/params.c270`,
 overflow the device and fall back to the CPU, so use the ones in `params/`.

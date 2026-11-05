@@ -1,0 +1,21 @@
+#!/bin/bash
+# GLAS_BIN for the las-glas launcher: runs glas-gpu and keeps one line per work unit in
+# out/wu.log: q0 q1 seconds rc special-q relations (the last two from the "# Phases" and
+# "# Total" lines of the output file). Writes nothing to stderr, which the client uploads as
+# the statistics. After 2 failures in a row, or one with a GPU that nvidia-smi no longer
+# sees, it kills the client, so that a broken host does not fail work units; boot.sh then
+# writes the state, and the fleet manager replaces the host. The client ignores SIGTERM when
+# started in the background over SSH, so this uses SIGKILL.
+t0=$(date +%s); prev=; a=0; b=0; out=
+for x in "$@"; do case $prev in -q0) a=$x;; -q1) b=$x;; -out) out=$x;; esac; prev=$x; done
+/workspace/src/gpu-siever/glas-gpu "$@"
+rc=$?
+s="0 0"; [ $rc = 0 ] && [ -n "$out" ] && s=$(zcat -f "$out" 2>/dev/null | awk '/^# Phases:/ {n = $(NF-1)} /^# Total / {r = $3} END {print n + 0, r + 0}')
+echo "$a $b $(( $(date +%s) - t0 )) $rc $s" >> /workspace/out/wu.log
+if [ $rc = 0 ]; then echo 0 > /workspace/out/fails
+else
+  n=$(( $(cat /workspace/out/fails 2>/dev/null || echo 0) + 1 )); echo $n > /workspace/out/fails
+  if [ $n -ge 2 ] || ! nvidia-smi -L > /dev/null 2>&1; then pkill -KILL -f 'python3 .*cado-nfs-client[.]py'; exit $rc; fi
+  sleep 60
+fi
+exit $rc

@@ -1,0 +1,22 @@
+SERVER=https://cado-nfs.example.org:8270   # what the clients dial: c270-sieve-server's PUBLIC_NAME and PORT
+CERTSHA1=0000000000000000000000000000000000000000   # the --certsha1 the server prints
+SERVER_SSH=        # resubmit-lost.sh: how to ssh to the server (user@host), and its WORKDIR
+SERVER_WORKDIR=
+CAP=40           # dollars per million special-q: an RTX 5090 at 0.72 dollars an hour is 40
+MAXHOSTS=10
+GPUS=RTX_5090,RTX_4090,RTX_3090   # GPU models to rent, of those in SPQ_TABLE (env.sh)
+MINCPU=16        # effective cores of an offer; glas runs 8 threads, and fewer cores left it host-bound
+VERIFIED=true    # false: also rent unverified machines
+BID=0            # 1: also rent interruptible offers, when cheaper per special-q
+BID_MARGIN=0.05  # bid this much above the offer's minimum bid
+MINCREDIT=30     # below this Vast.ai credit, destroy everything
+STOP=0           # 1: destroy every host and exit
+# host/client.sh: make the factor base on the host with makefb while downloading it from the
+# server, and keep whichever ends first (far from the server, the download takes hours); the
+# poly file name and the makefb arguments of the server's c270.makefb.stdout.1, and the output
+MAKEFB="c270.poly -lim 2147483648 -maxbits 17 -side 1"
+MAKEFB_OUT=c270.roots1.gz
+SALAD_ORG=       # salad.sh: the SaladCloud organization and project, and each container's
+SALAD_PROJECT=   # vCPUs and memory in MB (glas runs 8 threads and takes about 3.5 GB)
+SALAD_CPU=16
+SALAD_MEMORY=24576

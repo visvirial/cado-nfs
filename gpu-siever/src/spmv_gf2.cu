@@ -81,12 +81,31 @@ struct gather_seg {
      * row is at or past block k (device, nbands * (nblk + 1)) */
     unsigned int nblk;
     uint32_t * rs;
+    std::pair<uint64_t, uint64_t> l { 0, 0 };       /* light rows (packed) */
 };
+
+struct pk_chunk;
+struct pk_light;
 
 struct spmv_dev {
     int device;
     unsigned int row0;
     unsigned int nrows;
+    /* the packed layout (SPMV_GF2_LAYOUT=packed, spmv_packed.cuh): the
+     * chunks of the heavy rows with their gap words, the light rows
+     * with their raw columns; one band, so chunk0 and rec0 have one
+     * entry, and the record arrays are empty */
+    bool packed = false;
+    pk_chunk * pk_chunks = nullptr;
+    uint32_t * pk_pool = nullptr;
+    pk_light * lt_rows = nullptr;
+    uint32_t * lt_pool = nullptr;
+    uint64_t lt_n = 0;
+    std::vector<uint32_t> light_row;    /* host, the device row of each light row */
+    std::vector<pk_chunk> pk_chunks_h;  /* host, in row order, for the column order */
+    std::vector<pk_light> lt_rows_h;    /* host, in row order, for the column order */
+    std::vector<uint32_t> lt_col;       /* host, the first column of each light row */
+    size_t pk_bytes = 0;                /* the device bytes of the layout */
     uint64_t * rowptr;      /* device, nbands * (nrows + 1) */
     uint32_t * cols;        /* device, one entry per coefficient */
     /* the gather chunk list; chunk0[b] is the first chunk of band b */
@@ -168,22 +187,47 @@ struct spmv_gf2 {
      * scratch per arena, so that a product never writes the memory
      * that an exchange of another arena still reads. */
     std::map<const bwc_device_arena *, std::vector<uint64_t *>> vsrc, vdst;
+    /* the words each scratch buffer holds, by its address */
+    std::map<uint64_t *, size_t> scratch_words;
 };
 
+/* The scratch buffers of the arena, each of at least need(d) words.  A
+ * source scratch holds the whole source on every device; an output
+ * scratch holds the rows of its device, except on the first device,
+ * whose buffer stands in for the mirror (trial_gather), and in the
+ * scatter, which accumulates the whole output on every device.  A
+ * buffer that grows is freed first, which drains the device: growth
+ * happens at the first product of a kind, or after a split. */
+template <class F>
 static uint64_t ** scratch(spmv_gf2 * m,
         std::map<const bwc_device_arena *, std::vector<uint64_t *>> & role,
-        const bwc_device_arena * a)
+        const bwc_device_arena * a, F const & need)
 {
     std::vector<uint64_t *> & v = role[a];
-    if (v.empty()) {
-        v.resize(m->devs.size());
-        for (size_t d = 0; d < v.size(); d++) {
-            CUDA_CHECK(cudaSetDevice(m->devs[d].device));
-            CUDA_CHECK(cudaMalloc(&v[d],
-                        (size_t) m->max_dim * m->words * sizeof(uint64_t)));
+    v.resize(m->devs.size(), nullptr);
+    for (size_t d = 0; d < v.size(); d++) {
+        size_t const words = std::max<size_t>(need(d) * m->words, 1);
+        if (v[d] && m->scratch_words[v[d]] >= words)
+            continue;
+        CUDA_CHECK(cudaSetDevice(m->devs[d].device));
+        if (v[d]) {
+            m->scratch_words.erase(v[d]);
+            CUDA_CHECK(cudaFree(v[d]));
         }
+        CUDA_CHECK(cudaMalloc(&v[d], words * sizeof(uint64_t)));
+        m->scratch_words[v[d]] = words;
+        if (getenv("SPMV_GF2_TIMING"))
+            fprintf(stderr, "spmv_gf2 scratch: %.3f GB on dev %d (%s of arena %p)\n",
+                    words * 8 / 1073741824.0, m->devs[d].device,
+                    &role == &m->vsrc ? "source" : "output", (const void *) a);
     }
     return v.data();
+}
+
+/* the output rows of device d, the whole output on the first device */
+static size_t out_rows(spmv_gf2 * m, size_t d)
+{
+    return d ? m->devs[d].nrows : m->nrows;
 }
 
 /* Device mirrors for the bwc vector arenas.  When a communication
@@ -318,6 +362,8 @@ struct arena_ctx {
     cudaEvent_t bev = nullptr;  /* band event, product output tail */
     cudaEvent_t pre = nullptr;  /* the accesses before a copy in */
     std::map<int, cudaEvent_t> pev;     /* per device, product output piece */
+    std::map<int, cudaEvent_t> rdone;   /* per device, the last product read of the
+                                         * source replicas (SPMV_GF2_SELFDIST) */
     std::vector<bwc_device_band> bands; /* published band descriptors */
     std::vector<cudaEvent_t> wbev;      /* piece events, dev_copy/xor */
     std::vector<bwc_device_band> wbands; /* written pieces, sorted */
@@ -732,6 +778,10 @@ static void forward_segments(bwc_device_arena * dst, size_t doff,
     d.out_end = doff + bytes;
 }
 
+static bool env_selfdist();
+static void selfdist_copy(bwc_device_arena * dst, size_t doff,
+        bwc_device_arena * src, size_t soff, size_t bytes);
+
 static void arena_dev_copy(bwc_device_arena * dst, size_t doff,
         bwc_device_arena * src, size_t soff, size_t bytes)
 {
@@ -762,6 +812,7 @@ static void arena_dev_copy(bwc_device_arena * dst, size_t doff,
     ready_mark(dst);
     mirror_written(dst);
     forward_segments(dst, doff, src, soff, bytes);
+    selfdist_copy(dst, doff, src, soff, bytes);
     ready_follow(src, dst);
 }
 
@@ -843,6 +894,8 @@ static void arena_release(bwc_device_arena * a)
             CUDA_CHECK(cudaEventDestroy(c->bev));
         for (auto const & e : c->pev)
             CUDA_CHECK(cudaEventDestroy(e.second));
+        for (auto const & e : c->rdone)
+            CUDA_CHECK(cudaEventDestroy(e.second));
         for (cudaEvent_t e : c->wbev)
             CUDA_CHECK(cudaEventDestroy(e));
         CUDA_CHECK(cudaEventDestroy(c->ev));
@@ -859,6 +912,7 @@ struct combine_dev {
     cudaStream_t stream;
     cudaEvent_t ev;
     cudaEvent_t aev;            /* the terms are in the scratch */
+    cudaEvent_t sdev;           /* the self-distribution copies of the device */
     uint64_t * fbuf;            /* device, the combine matrices */
     uint64_t * terms = nullptr; /* device, the scratch of the terms */
     size_t terms_words = 0;
@@ -894,6 +948,7 @@ static combine_dev & combine_on(int device)
     CUDA_CHECK(cudaStreamCreate(&c.stream));
     CUDA_CHECK(cudaEventCreateWithFlags(&c.ev, cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&c.aev, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&c.sdev, cudaEventDisableTiming));
     CUDA_CHECK(cudaMalloc(&c.fbuf, ADDMUL64_MAX * 64 * sizeof(uint64_t)));
     CUDA_CHECK(cudaDeviceGetAttribute(&c.nsms,
                 cudaDevAttrMultiProcessorCount, device));
@@ -901,6 +956,84 @@ static combine_dev & combine_on(int device)
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 ADDMUL64_MAX * 2048 * sizeof(uint64_t)));
     return c;
+}
+
+/* The self-distribution of a device copy (SPMV_GF2_SELFDIST): the
+ * output segments of the last product into src, each on the device
+ * that computed it, go straight into the source replicas of dst on
+ * every device, and the copies are published as the write records of
+ * dst, so the next product from dst reads its source in place.  The
+ * replicas are the ones the last product from dst left (the scratch of
+ * the arena stays allocated); the copies into a device's replica wait
+ * for that product's read of it (rdone), and the segments are read
+ * behind their events on the combine stream of their device, which
+ * records a reader event in the segment owner, so the next product
+ * into src waits for the reads before it writes the segments again.
+ * Nothing happens when the segments do not cover the copied range or
+ * the replicas do not cover the destination range: the mirror copy
+ * stands, and the next product takes the mirror path.  The caller
+ * holds both arena locks and has written the mirror. */
+static void selfdist_copy(bwc_device_arena * dst, size_t doff,
+        bwc_device_arena * src, size_t soff, size_t bytes)
+{
+    if (!env_selfdist())
+        return;
+    auto * cd = (arena_ctx *) dst->owner;
+    auto * cs = (arena_ctx *) src->owner;
+    bwc_dev_pieces & s = cs->pieces;
+    bwc_dev_pieces & d = cd->pieces;
+    if (!s.nout || !d.nrep || !d.rep_owner || s.out[0].off > soff
+            || s.out_end < soff + bytes)
+        return;
+    for (int k = 0; k < d.nrep; k++)
+        if (d.rep[k].off > doff || d.rep[k].off + d.rep[k].bytes < doff + bytes)
+            return;
+    std::vector<bwc_dev_piece> wb;
+    std::set<int> devices;
+    for (int i = 0; i < s.nout; i++) {
+        bwc_dev_piece const & q = s.out[i];
+        size_t const lo = std::max(q.off, soff);
+        size_t const hi = std::min(q.off + q.bytes, soff + bytes);
+        if (lo >= hi)
+            continue;
+        combine_dev & c = combine_on(q.device);
+        CUDA_CHECK(cudaSetDevice(q.device));
+        CUDA_CHECK(cudaStreamWaitEvent(c.stream, q.ready, 0));
+        for (int k = 0; k < d.nrep; k++) {
+            bwc_dev_piece const & r = d.rep[k];
+            auto const it = cd->rdone.find(r.device);
+            if (it != cd->rdone.end())
+                CUDA_CHECK(cudaStreamWaitEvent(c.stream, it->second, 0));
+            char * const to = r.p + (doff + (lo - soff) - r.off);
+            const char * const from = q.p + (lo - q.off);
+            if (r.device == q.device && to == from)
+                continue;
+            CUDA_CHECK(cudaMemcpyPeerAsync(to, r.device, from, q.device,
+                        hi - lo, c.stream));
+            wb.push_back({ r.device, nullptr, doff + (lo - soff), hi - lo,
+                    c.sdev, nullptr });
+        }
+        devices.insert(q.device);
+    }
+    for (int device : devices) {
+        combine_dev & c = combine_on(device);
+        CUDA_CHECK(cudaSetDevice(device));
+        CUDA_CHECK(cudaEventRecord(c.sdev, c.stream));
+        /* the reader protocol of the segments (bwc_dev_pieces.h) */
+        bwc_dev_pieces * const owner = s.out[0].owner;
+        if (owner && owner->nrd < BWC_DEV_PIECES_MAX)
+            owner->rd[owner->nrd++] = c.sdev;
+    }
+    if (wb.size() > BWC_DEV_WBANDS_MAX) {
+        fprintf(stderr, "spmv_gf2: %zu self-distribution records pass"
+                " BWC_DEV_WBANDS_MAX\n", wb.size());
+        abort();
+    }
+    std::copy(wb.begin(), wb.end(), d.wb);
+    d.nwb = (int) wb.size();
+    d.wb_wgen = d.wgen;
+    d.rep_wgen = d.wgen;
+    CUDA_CHECK(cudaSetDevice(cd->device));
 }
 
 /* The mirror of a as device reads it: the mirror itself on its own
@@ -1012,12 +1145,24 @@ static void arena_dev_addmul64(bwc_device_arena * dst, size_t doff,
     arena_lockn const lock(ctxs);
     for (unsigned int j = 0; j < nsrc; j++)
         arena_make_dev(src[j], 0);
-    bwc_dev_pieces const & p = cd->pieces;
-    if (!p.nrep || p.rep_wgen != p.wgen) {
-        fprintf(stderr, "spmv_gf2: the combine finds no current source"
-                " replicas (%d replicas, written at generation %lu of %lu)\n",
-                p.nrep, p.rep_wgen, p.wgen);
-        abort();
+    bwc_dev_pieces & p = cd->pieces;
+    /* The replicas are current when the exchange plugin or the
+     * self-distribution filled them at the last write of the mirror.
+     * With one job and no self-distribution nothing does, so the mirror
+     * is copied into them here; with one device there are none, and the
+     * combine runs on the mirror alone. */
+    if (p.nrep && p.rep_wgen != p.wgen) {
+        CUDA_CHECK(cudaSetDevice(cd->device));
+        ready_wait(dst, cd->stream);
+        for (int k = 0; k < p.nrep; k++) {
+            bwc_dev_piece const & r = p.rep[k];
+            CUDA_CHECK(cudaStreamWaitEvent(cd->stream, r.ready, 0));
+            CUDA_CHECK(cudaMemcpyPeerAsync(r.p, r.device,
+                        (const char *) dst->dev + r.off, cd->device, r.bytes,
+                        cd->stream));
+        }
+        ready_mark(dst);
+        p.rep_wgen = p.wgen;
     }
     stale_check(dst, doff, bytes, "the combine");
     std::vector<arena_copy> const copies = copies_of(dst, doff, bytes);
@@ -1306,6 +1451,9 @@ static bwc_device_arena * mirror_on(int device, const void * host,
     void * dev;
     CUDA_CHECK(cudaMalloc(&dev, bytes));
     c->ready_bytes.store(bytes, std::memory_order_release);
+    if (getenv("SPMV_GF2_TIMING"))
+        fprintf(stderr, "spmv_gf2 mirror: %.3f GB on dev %d for host %p\n",
+                bytes / 1073741824.0, device, host);
     return bwc_dev_register({ const_cast<void *>(host), bytes, dev,
             device, BWC_ARENA_HOST, c, &arena_ops, nullptr, nullptr, 0 });
 }
@@ -1561,7 +1709,21 @@ static int env_gather_warps()
 static bool env_chunk_col_order()
 {
     const char * s = getenv("SPMV_GF2_CHUNK_ORDER");
-    return s && !strcmp(s, "col");
+    return s && (!strcmp(s, "col") || !strcmp(s, "colb"));
+}
+
+/* SPMV_GF2_CHUNK_ORDER=colb (packed layout): the chunks whose gaps fit
+ * SPMV_GF2_NARROW_BITS bits (default 12: a chunk of 1024 entries then
+ * spans at most 4M columns) go first, by column, then the wide chunks by
+ * column, so the sweep of the narrow chunks keeps a window of the
+ * source in L2 without the wide chunks walking over it */
+static unsigned int env_narrow_bits()
+{
+    const char * s = getenv("SPMV_GF2_CHUNK_ORDER");
+    if (!s || strcmp(s, "colb"))
+        return 64;
+    const char * b = getenv("SPMV_GF2_NARROW_BITS");
+    return b ? atoi(b) : 12;
 }
 
 /* SPMV_GF2_L2_MB: mark the source band of each gather as L2-persisting
@@ -1591,6 +1753,32 @@ static bool env_pieces()
 {
     const char * s = getenv("SPMV_GF2_PIECES");
     return !s || atoi(s);
+}
+
+/* SPMV_GF2_SELFDIST=1: with no communication plugin (one job), the
+ * device copy that moves a product's output into the next source
+ * vector (the identity collective of bwc, arena_dev_copy) distributes
+ * the output segments itself: each segment goes from the device that
+ * computed it into the source replica of the destination arena on every
+ * device, and the copies are published as the write records the next
+ * product from that arena waits for, so that product reads its source
+ * in place.  Without this, the next product copies the whole source
+ * out of the mirror device to every other device (seven whole vectors
+ * over the links of one device on an 8-GPU node, against a slice of
+ * one eighth from each device). */
+static bool env_selfdist()
+{
+    static int const v = getenv("SPMV_GF2_SELFDIST")
+        ? atoi(getenv("SPMV_GF2_SELFDIST")) : 0;
+    return v > 0;
+}
+
+/* SPMV_GF2_LAYOUT=packed: the delta-coded layout of spmv_packed.cuh,
+ * in one column band */
+static bool env_packed()
+{
+    const char * s = getenv("SPMV_GF2_LAYOUT");
+    return s && !strcmp(s, "packed");
 }
 
 /* SPMV_GF2_TIMING=n prints a host stamp every n product calls (1024
@@ -1709,6 +1897,8 @@ static void for_rows(row_stream const & rs, unsigned int row0,
     for_threads(nthr, [&](unsigned int t) { f(cut[t], cut[t + 1]); });
 }
 
+#include "spmv_packed.cuh"
+
 /* Sort the n values of a, all below max_val, on nthr threads: the
  * values go to buckets by their high bits, then each bucket is sorted. */
 static void sort_parallel(uint32_t * a, size_t n, uint32_t max_val,
@@ -1798,6 +1988,27 @@ static void build_all(spmv_gf2 * m, row_stream const & rs);
 static void free_dev(spmv_dev & dev);
 static void sync_all(spmv_gf2 * m);
 static std::vector<double> trial_gather(spmv_gf2 * m, unsigned int max_dim);
+
+/* the device memory in use on each device of the instance, on
+ * SPMV_GF2_TIMING */
+static void mem_report(spmv_gf2 * m, const char * what)
+{
+    if (!getenv("SPMV_GF2_TIMING"))
+        return;
+    for (spmv_dev & dev : m->devs) {
+        size_t mem_free = 0, mem_total = 0;
+        CUDA_CHECK(cudaSetDevice(dev.device));
+        CUDA_CHECK(cudaMemGetInfo(&mem_free, &mem_total));
+        fprintf(stderr, "spmv_gf2 device memory %s: dev %d in use %.3f GB of"
+                " %.1f GB (%u rows, %lu chunks, %lu records, %lu light rows,"
+                " layout %.3f GB)\n", what,
+                dev.device, (mem_total - mem_free) / 1073741824.0,
+                mem_total / 1073741824.0, dev.nrows,
+                (unsigned long) dev.chunk0.back(),
+                (unsigned long) dev.rec0.back(), (unsigned long) dev.lt_n,
+                dev.pk_bytes / 1073741824.0);
+    }
+}
 static void launch_gather(spmv_gf2 * m, spmv_dev & dev,
         bwc_device_arena * asrc, std::vector<bwc_device_band> const & sb,
         std::vector<bwc_device_band> const & wb,
@@ -1830,26 +2041,75 @@ static int pick_first_device(int ngpu)
     return device_range_start(ngpu, next++);
 }
 
-__global__ static void random_length_kernel(unsigned long n, double mean,
+/* The Poisson mean of stored row i: mean for every row, or with
+ * SPMV_GF2_RANDOM_ALPHA=a (and SPMV_GF2_RANDOM_OFFSET=o, default 32)
+ * mean * n * (i + o)^-a / sum_j (j + o)^-a, the column weight model of
+ * cado's random_matrix program (alpha 0.94, offset 32 there): the
+ * stored rows then have the weights of the ideals of a filtered NFS
+ * matrix, a few rows of millions of entries and a light tail, which the
+ * uniform model lacks. */
+struct row_mean {
+    double mean;        /* the mean of every row (alpha 0) */
+    double alpha, offset, c;    /* row i: c * (i + offset)^-alpha */
+    double cap;         /* the largest mean, below the range */
+    __host__ __device__ double at(unsigned long i) const
+    {
+        if (alpha <= 0) return mean;
+        double const m = c * pow((double) i + offset, -alpha);
+        return m < cap ? m : cap;
+    }
+};
+
+static row_mean env_row_mean(unsigned long n, unsigned long range,
+        double mean)
+{
+    row_mean r { mean, 0, 32, 0, 0.5 * (double) range };
+    const char * s = getenv("SPMV_GF2_RANDOM_ALPHA");
+    if (!s || atof(s) <= 0)
+        return r;
+    r.alpha = atof(s);
+    if (const char * o = getenv("SPMV_GF2_RANDOM_OFFSET"))
+        r.offset = atof(o);
+    /* the normalisation, summed on the host threads */
+    unsigned int const nthr = setup_threads();
+    std::vector<double> part(nthr, 0);
+    for_threads(nthr, [&](unsigned int t) {
+        double s = 0;
+        for (unsigned long i = n * t / nthr; i < n * (t + 1) / nthr; i++)
+            s += pow((double) i + r.offset, -r.alpha);
+        part[t] = s;
+    });
+    double sum = 0;
+    for (double x : part)
+        sum += x;
+    r.c = mean * (double) n / sum;
+    if (getenv("SPMV_GF2_TIMING"))
+        fprintf(stderr, "spmv_gf2 random matrix: alpha %g offset %g, row 0"
+                " mean %.4g, row %lu mean %.4g\n", r.alpha, r.offset, r.at(0),
+                n - 1, r.at(n - 1));
+    return r;
+}
+
+__global__ static void random_length_kernel(unsigned long n, row_mean mean,
         unsigned long long seed, uint32_t * len)
 {
     unsigned long const i = blockIdx.x * (unsigned long) blockDim.x + threadIdx.x;
     if (i >= n) return;
     curandStatePhilox4_32_10_t st;
     curand_init(seed, 2 * i, 0, &st);
-    len[i] = curand_poisson(&st, mean);
+    len[i] = curand_poisson(&st, mean.at(i));
 }
 
 /* soff[i] is the stream position of stored row i: one length word per
  * earlier row plus their lengths. */
 __global__ static void random_entry_kernel(unsigned long n,
         unsigned long range, unsigned long long seed,
-        const uint64_t * soff, uint32_t * out)
+        const uint64_t * soff, uint32_t * out, unsigned long row0)
 {
     unsigned long const i = blockIdx.x * (unsigned long) blockDim.x + threadIdx.x;
     if (i >= n) return;
     curandStatePhilox4_32_10_t st;
-    curand_init(seed, 2 * i + 1, 0, &st);
+    curand_init(seed, 2 * (row0 + i) + 1, 0, &st);
     uint32_t * p = out + soff[i];
     uint32_t const k = soff[i + 1] - soff[i] - 1;
     *p++ = k;
@@ -1875,7 +2135,7 @@ extern "C" std::vector<uint32_t> random_matrix_stream_solib(
 
     uint32_t * len;
     CUDA_CHECK(cudaMalloc(&len, n * sizeof(uint32_t)));
-    random_length_kernel<<<G, B>>>(n, mean, seed, len);
+    random_length_kernel<<<G, B>>>(n, env_row_mean(n, range, mean), seed, len);
     std::vector<uint32_t> hlen(n);
     CUDA_CHECK(cudaMemcpy(hlen.data(), len,
             n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
@@ -1886,17 +2146,41 @@ extern "C" std::vector<uint32_t> random_matrix_stream_solib(
     for (unsigned long i = 0; i < n; i++)
         hsoff[i + 1] = hsoff[i] + 1 + hlen[i];
 
-    uint64_t * soff;
-    CUDA_CHECK(cudaMalloc(&soff, (n + 1) * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpy(soff, hsoff.data(),
-            (n + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    uint32_t * out;
-    CUDA_CHECK(cudaMalloc(&out, hsoff[n] * sizeof(uint32_t)));
-    random_entry_kernel<<<G, B>>>(n, range, seed, soff, out);
-
+    /* the entries in pieces of rows of at most piece words, so that a
+     * stream past the device memory (a 2e10-entry matrix is 80 GB)
+     * still generates; the stream positions of a piece are relative to
+     * its first row */
+    uint64_t const piece = 1ull << 31;
     std::vector<uint32_t> stream(hsoff[n]);
-    CUDA_CHECK(cudaMemcpy(stream.data(), out,
-            hsoff[n] * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    uint64_t * soff;
+    uint32_t * out;
+    CUDA_CHECK(cudaMalloc(&soff, (n + 1) * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&out, std::min<uint64_t>(hsoff[n], piece)
+                * sizeof(uint32_t)));
+    std::vector<uint64_t> psoff;
+    for (unsigned long r0 = 0; r0 < n; ) {
+        unsigned long r1 = r0;
+        while (r1 < n && hsoff[r1 + 1] - hsoff[r0] <= piece)
+            r1++;
+        if (r1 == r0) {
+            fprintf(stderr, "random_matrix_stream_solib: a row of %lu entries"
+                    " passes the piece size\n", (unsigned long) hlen[r0]);
+            abort();
+        }
+        psoff.resize(r1 - r0 + 1);
+        for (unsigned long i = r0; i <= r1; i++)
+            psoff[i - r0] = hsoff[i] - hsoff[r0];
+        CUDA_CHECK(cudaMemcpy(soff, psoff.data(),
+                (r1 - r0 + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        /* row i of the piece draws stream (seed, 2 (r0 + i) + 1): the
+         * kernel takes the global row through the seed offset */
+        random_entry_kernel<<<(r1 - r0 + B - 1) / B, B>>>(r1 - r0, range,
+                seed, soff, out, r0);
+        CUDA_CHECK(cudaMemcpy(stream.data() + hsoff[r0], out,
+                (hsoff[r1] - hsoff[r0]) * sizeof(uint32_t),
+                cudaMemcpyDeviceToHost));
+        r0 = r1;
+    }
     CUDA_CHECK(cudaFree(soff));
     CUDA_CHECK(cudaFree(out));
     return stream;
@@ -1936,8 +2220,8 @@ spmv_gf2 * spmv_gf2_new(unsigned int nrows, uint64_t nwords,
     m->max_dim = max_dim;
     m->devs.resize(ngpu);
     size_t const esz = (size_t) words * sizeof(uint64_t);
-    unsigned int const nbands = env_nbands((size_t) max_dim * esz,
-            (nwords - nrows) / nrows);
+    unsigned int const nbands = env_packed() ? 1
+        : env_nbands((size_t) max_dim * esz, (nwords - nrows) / nrows);
     unsigned int const bandcols = (max_dim + nbands - 1) / nbands;
     m->nbands = nbands;
     m->bandcols = bandcols;
@@ -2017,6 +2301,7 @@ spmv_gf2 * spmv_gf2_new(unsigned int nrows, uint64_t nwords,
     split_rows(m, work, nrows);
     build_all(m, rs);
     phase("first build");
+    mem_report(m, "after the build");
 
     /* The estimated work misses the cost that depends on the row
      * range: the source locality of a row differs with its density.
@@ -2292,6 +2577,39 @@ static void segs_release(spmv_dev & dev)
  * inside each range changes, which xor commutativity allows. */
 static void chunks_col_order(spmv_dev & dev)
 {
+    if (dev.packed) {
+        /* the packed chunks of each segment sorted by first column; the
+         * descriptors carry the column, and chunk_row keeps the row
+         * order that cuts the segments */
+        if (dev.pk_chunks_h.empty())
+            return;
+        std::vector<pk_chunk> out(dev.pk_chunks_h);
+        unsigned int const narrow = env_narrow_bits();
+        for (gather_seg const & s : dev.segs)
+            std::sort(out.begin() + s.c[0].first, out.begin() + s.c[0].second,
+                    [narrow](pk_chunk const & a, pk_chunk const & b) {
+                        bool const wa = a.bits() > narrow, wb = b.bits() > narrow;
+                        return wa != wb ? wa < wb : a.base < b.base;
+                    });
+        CUDA_CHECK(cudaMemcpy(dev.pk_chunks, out.data(),
+                    out.size() * sizeof(pk_chunk), cudaMemcpyHostToDevice));
+        /* the light rows of each segment by first column too: the rows a
+         * warp works on at the same time then share source lines */
+        std::vector<uint32_t> idx(dev.lt_rows_h.size());
+        for (uint32_t k = 0; k < idx.size(); k++)
+            idx[k] = k;
+        for (gather_seg const & s : dev.segs)
+            std::sort(idx.begin() + s.l.first, idx.begin() + s.l.second,
+                    [&](uint32_t a, uint32_t b)
+                    { return dev.lt_col[a] < dev.lt_col[b]; });
+        std::vector<pk_light> lout(idx.size());
+        for (size_t k = 0; k < idx.size(); k++)
+            lout[k] = dev.lt_rows_h[idx[k]];
+        if (!lout.empty())
+            CUDA_CHECK(cudaMemcpy(dev.lt_rows, lout.data(),
+                        lout.size() * sizeof(pk_light), cudaMemcpyHostToDevice));
+        return;
+    }
     if (dev.chunk_col.empty())
         return;
     std::vector<uint32_t> idx(dev.chunk_h.size());
@@ -2341,6 +2659,10 @@ static void segs_cut(spmv_gf2 * m, spmv_dev & dev, size_t blk_bytes)
         for (unsigned int b = 0; b < m->nbands; b++) {
             s.c.push_back(range(dev.chunk_row, dev.chunk0, b));
             s.r.push_back(range(dev.rec_row, dev.rec0, b));
+        }
+        if (dev.packed) {
+            std::vector<uint64_t> const lt0 { 0, dev.light_row.size() };
+            s.l = range(dev.light_row, lt0, 0);
         }
         if (dev.segbuf) {
             /* the combine table: the row blocks of the segment cut the
@@ -2392,6 +2714,56 @@ static std::vector<gather_seg *> segs_ordered(spmv_gf2 * m, spmv_dev & dev,
 
 /* Build the banded CSR blocks and the chunk list of the row range of
  * the device, and upload them. */
+/* the packed layout of the device rows (spmv_packed.cuh) */
+static void pk_build_dev(spmv_gf2 * m, spmv_dev & dev, row_stream const & rs,
+        unsigned int nthr)
+{
+    pk_build B = pk_build_rows(rs, dev.row0, dev.row0 + dev.nrows, nthr);
+    dev.packed = true;
+    dev.chunk0 = { 0, B.chunks.size() };
+    dev.rec0 = { 0, 0 };
+    dev.rcol0 = { 0, 0 };
+    dev.chunk_row = std::move(B.chunk_row);
+    dev.rec_row.clear();
+    dev.light_row = std::move(B.light_row);
+    dev.lt_n = B.lights.size();
+    segs_release(dev);
+    CUDA_CHECK(cudaSetDevice(dev.device));
+    auto up = [&](auto *& d, auto const & v) {
+        size_t const bytes = v.size() * sizeof(v[0]);
+        CUDA_CHECK(cudaMalloc(&d, std::max<size_t>(bytes, 16)));
+        if (bytes)
+            CUDA_CHECK(cudaMemcpy(d, v.data(), bytes, cudaMemcpyHostToDevice));
+        dev.pk_bytes += bytes;
+    };
+    dev.pk_bytes = 0;
+    up(dev.pk_chunks, B.chunks);
+    if (env_chunk_col_order()) {
+        dev.pk_chunks_h = B.chunks;
+        dev.lt_rows_h = B.lights;
+        dev.lt_col.resize(B.lights.size());
+        for (size_t k = 0; k < B.lights.size(); k++)
+            dev.lt_col[k] = B.lpool[B.lights[k].off];
+    }
+    up(dev.pk_pool, B.pool);
+    up(dev.lt_rows, B.lights);
+    up(dev.lt_pool, B.lpool);
+    if (getenv("SPMV_GF2_TIMING")) {
+        uint64_t nent = 0, lent = B.lpool.size();
+        for (pk_chunk const & c : B.chunks)
+            nent += c.nent();
+        fprintf(stderr, "spmv_gf2 packed dev %d: %zu chunks of %lu entries in"
+                " %.3f GB (%.2f B/entry), %zu light rows of %lu entries in"
+                " %.3f GB (%.2f B/entry)\n", dev.device, B.chunks.size(),
+                (unsigned long) nent,
+                (B.chunks.size() * 16 + B.pool.size() * 4) / 1073741824.0,
+                nent ? (B.chunks.size() * 16.0 + B.pool.size() * 4) / nent : 0,
+                B.lights.size(), (unsigned long) lent,
+                (B.lights.size() * 16 + lent * 4) / 1073741824.0,
+                lent ? (B.lights.size() * 16.0 + lent * 4) / lent : 0);
+    }
+}
+
 static void build_dev(spmv_gf2 * m, spmv_dev & dev, row_stream const & rs)
 {
     unsigned int const nbands = m->nbands;
@@ -2400,6 +2772,10 @@ static void build_dev(spmv_gf2 * m, spmv_dev & dev, row_stream const & rs)
     unsigned int const row1 = row0 + dev.nrows;
     unsigned int const nthr = std::max<unsigned int>(1,
             setup_threads() / m->devs.size());
+    if (env_packed()) {
+        pk_build_dev(m, dev, rs, nthr);
+        return;
+    }
     {
         /* the banded CSR blocks: count, then scan, then fill; the
          * count and fill passes write the cells of one row only, so
@@ -2564,6 +2940,23 @@ static void free_dev(spmv_dev & dev)
 {
     segs_release(dev);
     CUDA_CHECK(cudaSetDevice(dev.device));
+    if (dev.packed) {
+        CUDA_CHECK(cudaFree(dev.pk_chunks));
+        CUDA_CHECK(cudaFree(dev.pk_pool));
+        CUDA_CHECK(cudaFree(dev.lt_rows));
+        CUDA_CHECK(cudaFree(dev.lt_pool));
+        dev.pk_chunks = nullptr;
+        dev.pk_pool = nullptr;
+        dev.lt_rows = nullptr;
+        dev.lt_pool = nullptr;
+        dev.lt_n = 0;
+        dev.pk_bytes = 0;
+        dev.light_row.clear();
+        dev.pk_chunks_h.clear();
+        dev.lt_rows_h.clear();
+        dev.lt_col.clear();
+        dev.packed = false;
+    }
     CUDA_CHECK(cudaFree(dev.rowptr));
     CUDA_CHECK(cudaFree(dev.cols));
     CUDA_CHECK(cudaFree(dev.chunks));
@@ -2605,8 +2998,10 @@ static std::vector<double> trial_gather(spmv_gf2 * m, unsigned int max_dim)
     int const reps = 5;
     size_t const ndev = m->devs.size();
     spmv_dev & r = m->devs[0];
-    uint64_t ** const vsrc = scratch(m, m->vsrc, nullptr);
-    uint64_t ** const vdst = scratch(m, m->vdst, nullptr);
+    uint64_t ** const vsrc = scratch(m, m->vsrc, nullptr,
+            [&](size_t) { return (size_t) max_dim; });
+    uint64_t ** const vdst = scratch(m, m->vdst, nullptr,
+            [&](size_t d) { return out_rows(m, d); });
     /* a source arena on the first device with one settled band, so
      * that copy_bands takes the pieces from vsrc[0] with no event wait */
     bwc_device_arena asrc;
@@ -2690,13 +3085,13 @@ static std::vector<double> trial_gather(spmv_gf2 * m, unsigned int max_dim)
  * through atomicXor, which starts from the zero that launch_gather
  * writes; xor is associative and commutative, so the result does not
  * depend on the atomic order. */
-template <int W, int D>
+template <int W, int D, int P>
 __global__ void gather_kernel(const gather_chunk * chunks,
                               const uint32_t * cols, const uint64_t * src,
                               uint64_t * dst, unsigned int nchunks)
 {
     constexpr int G = GATHER_LANES;
-    constexpr int P = W == 4 ? 2 : 1;   /* lanes per entry */
+    static_assert(P == 1 || (P == 2 && W == 4), "lanes per entry");
     constexpr int A = W / P;            /* words per lane */
     constexpr int S = G / P;            /* entries per step */
     extern __shared__ uint64_t desc[];
@@ -2730,12 +3125,15 @@ __global__ void gather_kernel(const gather_chunk * chunks,
         for (int u = 0; u < D; u++) {
             if (k + S * u >= end) continue;
             if constexpr (A % 2 == 0) {
-                /* src comes from cudaMalloc, so the 16-byte half of a
-                 * lane sits on a 16-byte boundary */
-                ulonglong2 const x = ((const ulonglong2 *) src)
-                    [(size_t) cc[u] * (W / 2) + lane % P];
-                v[u][0] = x.x;
-                v[u][1] = x.y;
+                /* src comes from cudaMalloc, so the 16-byte parts of a
+                 * lane sit on 16-byte boundaries */
+#pragma unroll
+                for (int h = 0; h < A / 2; h++) {
+                    ulonglong2 const x = ((const ulonglong2 *) src)
+                        [(size_t) cc[u] * (W / 2) + (lane % P) * (A / 2) + h];
+                    v[u][2 * h] = x.x;
+                    v[u][2 * h + 1] = x.y;
+                }
             } else {
                 v[u][0] = src[(size_t) cc[u]];
             }
@@ -3085,14 +3483,28 @@ typedef void combine_kern(const uint32_t *, const uint32_t *,
                           unsigned int, unsigned int, unsigned int,
                           unsigned int);
 
+/* SPMV_GF2_GATHER_P1=1: at W=4 one lane loads the whole 32-byte
+ * element (two 16-byte loads) instead of a lane pair sharing it, so a
+ * subwarp keeps twice the entries in flight */
+template <int W, int D>
+static gather_kern * gather_lanes()
+{
+    static bool const p1 = getenv("SPMV_GF2_GATHER_P1")
+        && atoi(getenv("SPMV_GF2_GATHER_P1"));
+    if constexpr (W == 4)
+        return p1 ? gather_kernel<W, D, 1> : gather_kernel<W, D, 2>;
+    else
+        return gather_kernel<W, D, 1>;
+}
+
 template <int W>
 static gather_kern * gather_depth()
 {
     switch (env_gather_depth()) {
-        case 1: return gather_kernel<W, 1>;
-        case 2: return gather_kernel<W, 2>;
-        case 4: return gather_kernel<W, 4>;
-        case 8: return gather_kernel<W, 8>;
+        case 1: return gather_lanes<W, 1>();
+        case 2: return gather_lanes<W, 2>();
+        case 4: return gather_lanes<W, 4>();
+        case 8: return gather_lanes<W, 8>();
     }
     fprintf(stderr, "spmv_gf2: unsupported gather depth\n");
     abort();
@@ -3167,6 +3579,27 @@ static scatter_kern * scatter_for(unsigned int words)
     abort();
 }
 
+typedef void pk_kern(const pk_chunk *, const uint32_t *, const uint64_t *,
+                     uint64_t *, unsigned int);
+typedef void lt_kern(const pk_light *, const uint32_t *, const uint64_t *,
+                     uint64_t *, unsigned int);
+
+template <template <int> class K>
+static auto * width_kernel(unsigned int words)
+{
+    switch (words) {
+        case 1: return K<1>::f();
+        case 2: return K<2>::f();
+        case 4: return K<4>::f();
+    }
+    fprintf(stderr, "spmv_gf2: unsupported element width\n");
+    abort();
+}
+template <int W> struct pk_gather_sel { static pk_kern * f() { return pk_gather_kernel<W>; } };
+template <int W> struct lt_gather_sel { static lt_kern * f() { return lt_gather_kernel<W>; } };
+template <int W> struct pk_scatter_sel { static pk_kern * f() { return pk_scatter_kernel<W>; } };
+template <int W> struct lt_scatter_sel { static lt_kern * f() { return lt_scatter_kernel<W>; } };
+
 /* Gather the rows of the device, one kernel launch per column band.
  * With source bands, the launch of band b enqueues behind only the
  * source ranges of band b: a copy into src when copy is set, a wait
@@ -3199,7 +3632,8 @@ static void launch_gather(spmv_gf2 * m, spmv_dev & dev,
         for (unsigned int b = 0; b < m->nbands; b++) {
             auto const n = (unsigned int) (s->c[b].second - s->c[b].first);
             auto const nr = (unsigned int) (s->r[b].second - s->r[b].first);
-            if (!n && !nr) continue;
+            auto const nl = (unsigned int) (s->l.second - s->l.first);
+            if (!n && !nr && !nl) continue;
             if (!in[b]) {
                 in[b] = true;
                 size_t const lo = std::min(b * bb, src_bytes);
@@ -3215,7 +3649,18 @@ static void launch_gather(spmv_gf2 * m, spmv_dev & dev,
             }
             if (probe)
                 probe_mark(dev);
-            if (n)
+            if (dev.packed) {
+                if (n)
+                    width_kernel<pk_gather_sel>(m->words)<<<(n + 3) / 4, 128,
+                        0, dev.stream>>>(dev.pk_chunks + s->c[b].first,
+                                dev.pk_pool, src, dst, n);
+                if (nl) {
+                    unsigned int const p = m->words == 4 ? 2 : 1;
+                    width_kernel<lt_gather_sel>(m->words)<<<(nl * p + 127) / 128,
+                        128, 0, dev.stream>>>(dev.lt_rows + s->l.first,
+                                dev.lt_pool, src, dst, nl);
+                }
+            } else if (n)
                 kern<<<(n + cpb - 1) / cpb, 32 * warps,
                         2 * cpb * sizeof(uint64_t), dev.stream>>>(
                         dev.chunks + s->c[b].first, dev.cols, src, dst, n);
@@ -3254,6 +3699,18 @@ static void launch_scatter(spmv_gf2 * m, spmv_dev & dev,
         const uint64_t * src, uint64_t * dst)
 {
     if (!dev.nrows) return;
+    if (dev.packed) {
+        auto const n = (unsigned int) dev.chunk0[1];
+        auto const nl = (unsigned int) dev.lt_n;
+        if (n)
+            width_kernel<pk_scatter_sel>(m->words)<<<(n + 3) / 4, 128, 0,
+                dev.stream>>>(dev.pk_chunks, dev.pk_pool, src, dst, n);
+        if (nl)
+            width_kernel<lt_scatter_sel>(m->words)<<<(nl + 127) / 128, 128, 0,
+                dev.stream>>>(dev.lt_rows, dev.lt_pool, src, dst, nl);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     unsigned int const blocks =
         (dev.nrows + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
     scatter_kern * const kern = scatter_for(m->words);
@@ -3345,8 +3802,11 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
         resplit_probed(m, asrc);
     double const t0 = now();
     spmv_dev & r = m->devs[0];
-    uint64_t ** const vsrc = scratch(m, m->vsrc, asrc);
-    uint64_t ** const vdst = scratch(m, m->vdst, adst);
+    uint64_t ** const vsrc = scratch(m, m->vsrc, asrc,
+            [&](size_t) { return (size_t) nsrc; });
+    uint64_t ** const vdst = scratch(m, m->vdst, adst,
+            [&](size_t d) { return std::max<size_t>(out_rows(m, d),
+                    d ? 0 : ndst); });
     pieces_release(m, adst);
     std::vector<bwc_device_band> const sb = src_bands(asrc);
     bool const in_place = asrc && asrc->device == r.device;
@@ -3468,6 +3928,20 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
                     (char *) (part + (size_t) (s.r0 - dev.row0) * m->words),
                     s.r0 * esz, (s.r1 - s.r0) * esz, s.ev, &p };
         }
+        /* the last product read of the source replicas, per device, for
+         * the self-distribution into them (selfdist_copy) */
+        if (env_selfdist() && asrc) {
+            auto * const cs = (arena_ctx *) asrc->owner;
+            for (size_t d = 0; d < m->devs.size(); d++) {
+                spmv_dev & dev = m->devs[d];
+                CUDA_CHECK(cudaSetDevice(dev.device));
+                cudaEvent_t & e = cs->rdone[dev.device];
+                if (!e)
+                    CUDA_CHECK(cudaEventCreateWithFlags(&e,
+                                cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventRecord(e, dev.stream));
+            }
+        }
         CUDA_CHECK(cudaSetDevice(c->device));
         if (!c->bev)
             CUDA_CHECK(cudaEventCreateWithFlags(&c->bev,
@@ -3534,8 +4008,10 @@ void spmv_gf2_scatter(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
     if (!asrc || !adst)
         copies.lock();
     spmv_dev & r = m->devs[0];
-    uint64_t ** const vsrc = scratch(m, m->vsrc, asrc);
-    uint64_t ** const vdst = scratch(m, m->vdst, adst);
+    uint64_t ** const vsrc = scratch(m, m->vsrc, asrc,
+            [&](size_t) { return (size_t) nsrc; });
+    uint64_t ** const vdst = scratch(m, m->vdst, adst,
+            [&](size_t) { return (size_t) ndst; });
     pieces_release(m, adst);
     replicas_release(m, asrc);
     std::vector<bwc_device_band> const sb = src_bands(asrc);
@@ -3630,6 +4106,7 @@ void spmv_gf2_scatter(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
 void spmv_gf2_free(spmv_gf2 * m)
 {
     if (!m) return;
+    mem_report(m, "at the end");
     if (getenv("SPMV_GF2_TIMING") && m->calls)
         fprintf(stderr, "spmv_gf2 dev %d+%zu: %lu calls, %lu replica hits,"
                 " h2d %.1f us/call, kernel %.1f us/call, d2h %.1f us/call\n",

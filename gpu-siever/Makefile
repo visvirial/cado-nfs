@@ -68,6 +68,11 @@ libmatmul_b%_cuda.so: src/matmul_cuda.cpp spmv_gf2.o src/spmv_gf2.h
 
 matmul-cuda: $(BWC_WIDTHS:%=libmatmul_b%_cuda.so)
 
+# the backend against a host product on a random matrix (src/spmv_test.cpp)
+spmv_test: src/spmv_test.cpp spmv_gf2.o src/spmv_gf2.h
+	$(CXX) $(CXXFLAGS) -I$(CADO_SRC)/linalg/bwc -o $@ src/spmv_test.cpp spmv_gf2.o \
+	    -L/usr/local/cuda/lib64 -lcudart -lpthread -Wl,-rpath,/usr/local/cuda/lib64
+
 matmul-cpu-stub: src/matmul_cuda.cpp src/spmv_gf2_cpu.cpp src/spmv_gf2.h
 	for g in $(BWC_WIDTHS); do \
 	    $(CXX) $(CXXFLAGS) -fPIC -shared $(BWC_DEFS) \

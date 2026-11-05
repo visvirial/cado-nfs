@@ -4182,7 +4182,8 @@ class SievingTask(ClientServerTask, DoesImport, FilesCreator, HasStatistics):
                                             Request.GET_FACTORBASE_FILENAME,
                                             side)
 
-        self.logger.info("We want %d relation(s)", self.state["rels_wanted"])
+        self.logger.info("We want %s relation(s)",
+                         f"{self.state['rels_wanted']:,}")
         qrange = self.params["qrange"]
         while self.should_schedule_more_work():
             q0 = self.state["qnext"]
@@ -4283,9 +4284,11 @@ class SievingTask(ClientServerTask, DoesImport, FilesCreator, HasStatistics):
         self.add_output_files({filename: rels}, commit=commit)
         if stats_filename:
             self.parse_stats(stats_filename, commit=commit)
-        self.logger.info("Found %d relations in '%s', total is now %d/%d",
-                         rels, filename, self.get_nrels(),
-                         self.state["rels_wanted"])
+        wanted = self.state["rels_wanted"]
+        self.logger.info("Found %s relations in '%s', total is now %s/%s"
+                         " (%.4f%%)", f"{rels:,}", filename,
+                         f"{self.get_nrels():,}", f"{wanted:,}",
+                         100 * self.get_nrels() / wanted if wanted else 0)
         return True
 
     re_rel = re.compile(bytes(r"(-?\d*),(\d*):(.*)", "ascii"))

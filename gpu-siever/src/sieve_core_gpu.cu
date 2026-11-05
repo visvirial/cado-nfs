@@ -3501,13 +3501,28 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
     while (chunk < total_area && chunk < (1ull << 31))
         chunk <<= 1;
     uint64_t const chunk_max = chunk;
-    uint64_t const budget = mem_free * 8 / 10;
+    /* A GPU with a large L2 gains more from a larger chunk than from a
+     * second slot: at RSA-270 (A=33), one slot at 2^30 beat two at 2^29 by
+     * 8% on an RTX 5090, and two at 2^28 by 28% on an RTX 4090 24 GB, and
+     * one at 2^28 ran six times faster than two at 2^24 on a 16 GB RTX
+     * 5080.  On an RTX 3090 (6 MB of L2) 2^29 and 2^30 were slower than
+     * 2^28, so a small L2 keeps the two-slot rule.  The large-L2 budget
+     * keeps a fixed reserve for the context and the per-thread
+     * cofactorization buffers, which the 5080 left 4.6 GB of 16 GB free
+     * beside one 2^28 slot. */
+    int dev = 0, l2 = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev));
+    bool const big_l2 = l2 >= 32 << 20;
+    uint64_t const reserve = 3ull << 29;   /* 1.5 GB */
+    uint64_t const budget = big_l2 ? (mem_free > reserve ? mem_free - reserve : 0)
+                                   : mem_free * 8 / 10;
     /* Each chunk reads the walk cursor of every large entry, so a larger
      * chunk is cheaper per position, up to 2^30 and two slots.  On an A100
      * 80 GB at A=31 and A=33, 2^30 beat 2^28 (6 slots) by 17-18%, while one
      * slot at 2^31 lost about 10% against 2^30. */
     chunk = std::min<uint64_t>(chunk, 1ull << 30);
-    while (chunk > chunk_min && slot_bytes(chunk) * 2 > budget)
+    while (chunk > chunk_min && slot_bytes(chunk) * (big_l2 ? 1 : 2) > budget)
         chunk >>= 1;
     /* GLAS_GPU_CHUNK=K sets the chunk to 2^K within [chunk_min, chunk_max];
      * the slot count then follows from the memory budget. */
@@ -3667,11 +3682,13 @@ bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
         fprintf(stderr,
                 "# GPU slots: %d, chunk 2^%d, %.2f GB per slot, %u regions, "
                 "bucket slab %d, gate shift %u, side-0 tail kernel %d, "
-                "side-0 candidate region %d, bucket caps %u %u\n",
+                "side-0 candidate region %d, bucket caps %u %u, "
+                "L2 %d MB, budget %.2f GB\n",
                 ctx.n_slots, 63 - __builtin_clzll(ctx.chunk_area),
                 slot_bytes(chunk) / 1073741824.0, ctx.max_regions,
                 ctx.bucket_slab, ctx.gate_shift, ctx.fill_tail0,
-                ctx.region_cand, ctx.bucket_cap[0], ctx.bucket_cap[1]);
+                ctx.region_cand, ctx.bucket_cap[0], ctx.bucket_cap[1],
+                l2 >> 20, budget / 1073741824.0);
         for (int k = 0; k < ctx.n_slots; k++) {
             for (int par = 0; par < 2; par++)
                 for (int e = 0; e < N_EVENTS; e++)

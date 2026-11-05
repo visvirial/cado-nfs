@@ -180,9 +180,15 @@ the pushed commit from GitHub. The hosts run gps1 with `-sopt-gpu 0`: on an RTX
 the CPU, gps1 used about 4 GB of device memory, and per dollar an RTX 3090
 searched about 35% more than an RTX 5090.
 
-`glas` sizes its chunks and slots from the device memory: the largest chunk up
-to 2^30 that still leaves two slots, then two slots at 2^30 and as many as fit
-below it. `GLAS_GPU_CHUNK` and `GLAS_GPU_SLOTS` override this.
+`glas` sizes its chunks and slots from the device memory. On a GPU with an L2
+cache of 32 MB or more it takes the largest chunk up to 2^30 that one slot
+fits, keeping 1.5 GB for the context and the cofactorization buffers: at
+RSA-270 one slot at 2^30 beat two at 2^29 by 8% on an RTX 5090 and two at
+2^28 by 28% on an RTX 4090, and a 16 GB RTX 5080 runs 2^29 instead of the
+2^24 that two slots leave it. On a GPU with a small L2 (an RTX 3090) it keeps
+the largest chunk that still leaves two slots, within 80% of the free memory,
+then two slots at 2^30 and as many as fit below it. `GLAS_GPU_CHUNK` and
+`GLAS_GPU_SLOTS` override this.
 
 `glas` needs `I >= 12`: below `c120`, add `tasks.I=12`. Parameters
 tuned for `las` with a large `mfb0`, such as `parameters/factor/params.c270`,

@@ -213,8 +213,14 @@ and makes it with `makefb` (`MAKEFB` in fleet.conf), and keeps whichever ends
 first: from the server in Singapore, a host in China got under 0.4 MB/s, while
 `makefb` writes the same file in one to five minutes. `clore.sh manage` starts
 `clore-fleet.sh`, which does the same with Clore.ai servers rented on demand, and
-`salad.sh` runs SaladCloud container groups; both start their containers with
-`host/container-boot.sh`, which fetches the pushed commit from GitHub.
+`salad.sh` runs SaladCloud container groups, which `salad.sh manage`
+(`salad-fleet.sh`) keeps at the replica quota, batch priority first and low
+priority for the rest; `akash.sh` deploys single GPUs on Akash through the
+Console API. All three start their containers with `host/container-boot.sh`,
+which fetches the pushed commit from GitHub. On 2026-11-06 the data center
+GPUs on Akash sieved at 0.19 (RTX PRO 6000), 0.23 (H100) s per special-q for
+$2.1-2.6 an hour, over three times the cost per special-q of the RTX 5090,
+4090 and 3090 elsewhere.
 `resubmit-lost.sh` lists, and with `--apply` resubmits, the work units of hosts
 that are gone.
 

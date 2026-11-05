@@ -24,3 +24,8 @@ CLORE_MAXHOSTS=10   # clore-fleet.sh
 CLORE_MINREL=0.98   # Clore server reliability
 CLORE_MINBAL=2   # below this Clore balance, cancel every order
 CLORE_STOP=0     # 1: cancel every Clore order and exit (STOP=1 does too)
+SALAD_TIERS="batch low"   # salad-fleet.sh: priorities, cheapest first, one container group each
+SALAD_GROUP=c270-sv       # the first tier's group; the others are SALAD_GROUP-<priority>
+SALAD_HEADROOM=5          # replicas a tier asks for beyond those it has
+SALAD_REPLICAS=           # all the tiers together; empty: the organization's quota
+SALAD_STOP=0              # 1: stop and delete every Salad group (STOP=1 does too)

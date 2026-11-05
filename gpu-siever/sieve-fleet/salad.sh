@@ -10,6 +10,13 @@
 #                                            quota stays stopped)
 #   salad.sh logs NAME [MINUTES]             the container output of the last MINUTES (30)
 #   salad.sh delete NAME                    stop and delete a group
+#   salad.sh counts NAME                     the replicas a group asks for, and those it has
+#                                            (creating or running)
+#   salad.sh fit PRIORITY                    the GPU classes whose price at PRIORITY is within CAP
+#                                            dollars per million special-q (SPQ_TABLE)
+#   salad.sh quota                           the replica quota of the organization
+#   salad.sh manage                          start salad-fleet.sh, which fills the quota with
+#                                            batch replicas first and low ones after
 #
 # The API key is read from ~/.config/salad/api_key; SALAD_ORG and SALAD_PROJECT, SERVER,
 # CERTSHA1, MAKEFB and MAKEFB_OUT from $FLEET_DIR/fleet.conf. PRIORITY is high, medium, low or batch; a lower
@@ -67,6 +74,27 @@ for e in reversed(d.get("items",[]) if isinstance(d,dict) else d):
     l=e.get("resource",{}).get("labels",{}); print(e.get("time","")[11:19], l.get("instance_id","")[:8], e.get("message",e.get("text_log",e.get("json_log",""))))
 if isinstance(d,dict) and "items" not in d: print(d)';;
 start) api POST $P/$2/start && echo "$2 started";;
+counts) api GET $P/$2 | python3 -c '
+import json,sys
+g=json.load(sys.stdin)
+if "replicas" not in g: sys.exit("no group: %s" % json.dumps(g)[:200])
+c=g["current_state"]["instance_status_counts"]
+print(g["replicas"], c.get("creating_count",0)+c.get("running_count",0), g["current_state"]["status"])';;
+fit) api GET $A/gpu-classes | python3 -c '
+import json,os,sys
+S={k:float(v) for k,v in (x.split("=") for x in os.environ["SPQ_TABLE"].split())}
+prio,cap=sys.argv[1],float(sys.argv[2])
+for c in json.load(sys.stdin)["items"]:
+    k=c["name"].split(" (")[0].replace(" ","_")      # "RTX 4090 (24 GB)" -> RTX_4090
+    p=[float(x["price"]) for x in c.get("prices",[]) if x["priority"]==prio]
+    if k in S and p and p[0]*S[k]/3600*1e6<=cap: print(c["name"])' "$2" "$CAP";;
+quota) curl -sS -H "Salad-Api-Key: $K" $A/quotas | python3 -c 'import json,sys
+print(json.load(sys.stdin)["container_groups_quotas"]["container_replicas_quota"])';;
+manage)
+  if running salad-fleet.sh; then echo "already running"; exit 0; fi
+  mkdir -p "$FLEET_DIR/salad"; cd "$FLEET_DIR/salad"
+  setsid nohup bash "$HERE/salad-fleet.sh" >> manager.out 2>&1 < /dev/null &
+  echo "started; log in $FLEET_DIR/salad/events.log";;
 delete) api POST $P/$2/stop >/dev/null || true; api DELETE $P/$2 && echo "$2 deleted";;
-*) sed -n '2,18p' "$0"; exit 1;;
+*) sed -n '2,26p' "$0"; exit 1;;
 esac

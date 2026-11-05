@@ -4,7 +4,7 @@
 #
 # Every minute it rents, up to MAXHOSTS, each offer of the GPUS models under the cost cap (CAP
 # dollars per million special-q at the seconds per special-q of SPQ_TABLE, or PRICE_<GPU>
-# dollars per hour where set), at most 8 launches at a time; with BID=1 it also rents
+# dollars per hour where set, the price with the VAST_DISK GB disk), at most 8 launches at a time; with BID=1 it also rents
 # interruptible offers at BID_MARGIN above their minimum bid. Every 10 minutes it probes the
 # hosts over SSH and destroys, and never rents again, those that never come up, stop answering,
 # fail to build, fail two work units in a row, never get a work unit, or run slower than 1/0.75
@@ -26,7 +26,7 @@ kill_host() { l=$1; shift; $V destroy instance $(cat $l/id) -y >/dev/null 2>&1; 
 bad() { cat $1/machine >> machines.bad; }
 offers() { # "gpu offer machine bid" lines under the cap, cheapest per special-q first, skipping bad
   # machines and those in use; bid is the price of an interruptible rental (BID=1), or - for an on-demand one
-  q="num_gpus=1 rentable=true rented=false verified=${VERIFIED:-true} direct_port_count>=4 cpu_cores_effective>=${MINCPU:-16} cpu_ram>=32 gpu_ram>=23 disk_space>=50 reliability>=0.95 cuda_max_good>=12.8 inet_down>=100 gpu_name in [${GPUS}]"
+  q="num_gpus=1 rentable=true rented=false verified=${VERIFIED:-true} direct_port_count>=4 cpu_cores_effective>=${MINCPU:-16} cpu_ram>=32 gpu_ram>=23 disk_space>=${VAST_DISK:-50} reliability>=0.95 cuda_max_good>=12.8 inet_down>=100 gpu_name in [${GPUS}]"
   { $V search offers "$q" --raw --limit 1000 2>/dev/null; echo; [ "${BID:-0}" = 1 ] && $V search offers "$q" --type bid --raw --limit 1000 2>/dev/null; } | python3 -c '
 import json,sys,os
 S={k.replace("_"," "):float(v) for k,v in (x.split("=") for x in os.environ["SPQ_TABLE"].split())}
@@ -35,11 +35,14 @@ parts=[p for p in sys.stdin.read().split("\n\n") if p.strip()]
 for k,p in enumerate(parts):
     for x in json.loads(p):
         if x["gpu_name"] not in S: continue
+        # an instance costs dph_base plus its disk, storage_cost dollars per GB and month (720 h);
+        # dph_total of an offer counts the small default disk of the search instead
+        disk=(x.get("storage_cost") or 0)*float(os.environ.get("VAST_DISK","50"))/720
         bid=None
         if k==1:
             if not x.get("min_bid"): continue
-            bid=round(x["min_bid"]*(1+margin)+0.0005,3); price=bid
-        else: price=x["dph_total"]
+            bid=round(x["min_bid"]*(1+margin)+0.0005,3); price=bid+disk
+        else: price=(x["dph_base"] if x.get("dph_base") is not None else x["dph_total"])+disk
         m=str(x["machine_id"]);e=price*S[x["gpu_name"]]/3600*1e6
         lim=os.environ.get("PRICE_"+x["gpu_name"].replace(" ","_"))
         if m in skip or (price>float(lim) if lim else e>cap) or x.get("inet_down_cost",1)>.03: continue
@@ -55,7 +58,7 @@ launch() { # label gpu offer machine bid; runs in the background
 rm -f m*/launching   # launches of an earlier manager are over
 # state; glas processes; seconds since the client last started a work unit (or since boot.out);
 # whether the build ended; the work unit lines of glas-wu
-PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(grep -c "/workunit to " out/client.log 2>/dev/null)"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "upfail $(awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}" out/client.log 2>/dev/null)"; cat out/wu.log 2>/dev/null'
+PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
 export PROBE
 last_health=0; nidle=0
 while :; do
@@ -87,12 +90,12 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
       echo 0 > $l/miss
       if echo "$s" | grep -q '^state \[done rc=0\]'; then
         timeout 90 "$HERE/vast.sh" ssh $l "$RESTART" > /dev/null 2>&1; log "$l client ended, restarted"; continue; fi
-      if ! echo "$s" | grep -q '^state \[\]'; then bad $l; kill_host $l "$(echo "$s" | head -1)"; continue; fi
+      if ! echo "$s" | grep -q '^state \[\]'; then bad $l; kill_host $l "$(echo "$s" | head -1), log tails in $l/probe"; continue; fi
       # uploads failing since the last one that went through: the host's network does not reach
       # the server (a Clore host in Germany got 3 KB/s to it, 2026-11-06)
       uf=$(echo "$s" | awk '/^upfail/{print $2}')
       if [ "${uf:-0}" -ge 10 ]; then bad $l; kill_host $l "uploads failing ($uf in a row)"; continue; fi
-      wus=$(echo "$s" | awk 'NF==6' )
+      wus=$(echo "$s" | awk 'NF==6 && !/^log\|/')
       # the last two work units failed: glas-wu should have stopped the client already
       if [ "$(echo "$wus" | awk 'NF==6 {r[++n]=$4} END{print (n>=2 && r[n]!=0 && r[n-1]!=0) ? "y" : "n"}')" = y ]; then
         bad $l; kill_host $l "work units failing: $(echo "$wus" | tail -2 | awk '{print $4}' | paste -sd,)"; continue; fi

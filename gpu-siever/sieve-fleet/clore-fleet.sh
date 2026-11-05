@@ -24,7 +24,7 @@ cancel_host() { d=$1; shift
   if [ -f $d/order ] && ! $C cancel $(cat $d/order) > /dev/null 2>&1; then log "$d $(cat $d/gpu 2>/dev/null) cancel failed ($*)"; return; fi
   touch $d/dead; log "$d $(cat $d/gpu 2>/dev/null) cancelled: $*"; }
 bad() { echo ${1#s} >> servers.bad; }
-PROBE='cd /workspace 2>/dev/null || { echo nows; exit 0; }; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y out/boot.log 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(grep -c "/workunit to " out/client.log 2>/dev/null)"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "upfail $(awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}" out/client.log 2>/dev/null)"; cat out/wu.log 2>/dev/null'
+PROBE='cd /workspace 2>/dev/null || { echo nows; exit 0; }; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y out/boot.log 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
 export PROBE KEY
 while :; do
   CAP=40 CLORE_MAXHOSTS=10 CLORE_MINREL=0.98 CLORE_MINBAL=2 CLORE_STOP=0
@@ -53,7 +53,7 @@ while :; do
       age=$(( $(date +%s) - $(cat $d/t0) ))
       if ! echo "$tsv" | awk -v s=${d#s} '$2==s{f=1} END{exit !f}'; then
         [ $age -gt 900 ] && { touch $d/dead; log "$d order is gone"; }; continue; fi
-      s=$(cat $d/probe 2>/dev/null); rm -f $d/probe
+      s=$(cat $d/probe 2>/dev/null); [ -f $d/probe ] && mv $d/probe $d/probe.last
       if [ -z "$s" ] || [ "$s" = nows ]; then
         [ $age -lt 1800 ] && continue
         m=$(( $(cat $d/miss 2>/dev/null || echo 0) + 1 )); echo $m > $d/miss
@@ -62,12 +62,12 @@ while :; do
       if echo "$s" | grep -q '^state \[done rc=0\]'; then read h p < $d/addr
         timeout 240 ssh -i $KEY -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=60 -o ConnectionAttempts=3 -p $p root@$h "$RESTART" > /dev/null 2>&1
         log "$d client ended, restarted"; continue; fi
-      if ! echo "$s" | grep -q '^state \[\]'; then bad $d; cancel_host $d "$(echo "$s" | grep '^state')"; continue; fi
+      if ! echo "$s" | grep -q '^state \[\]'; then bad $d; cancel_host $d "$(echo "$s" | grep '^state'), log tails in clore/$d/probe.last"; continue; fi
       # uploads failing since the last one that went through: the host's network does not reach
       # the server (a Clore host in Germany got 3 KB/s to it, 2026-11-06)
       uf=$(echo "$s" | awk '/^upfail/{print $2}')
       if [ "${uf:-0}" -ge 10 ]; then bad $d; cancel_host $d "uploads failing ($uf in a row)"; continue; fi
-      wus=$(echo "$s" | awk 'NF==6')
+      wus=$(echo "$s" | awk 'NF==6 && !/^log\|/')
       if [ "$(echo "$wus" | awk 'NF==6 {r[++n]=$4} END{print (n>=2 && r[n]!=0 && r[n-1]!=0) ? "y" : "n"}')" = y ]; then
         bad $d; cancel_host $d "work units failing"; continue; fi
       spq=$(echo "$wus" | awk 'NF==6 && $4==0 && $5>0 {t+=$3; sq+=$5; n++} END{if(n>=2) printf "%.4f", t/sq}')

@@ -215,7 +215,8 @@ first: from the server in Singapore, a host in China got under 0.4 MB/s, while
 `clore-fleet.sh`, which does the same with Clore.ai servers rented on demand, and
 `salad.sh` runs SaladCloud container groups, which `salad.sh manage`
 (`salad-fleet.sh`) keeps at the replica quota, batch priority first and low
-priority for the rest, and `nosana.sh` creates Nosana deployments that extend
+priority for the rest (`salad.sh balance` reads the credits through the
+portal API, as the public API has none), and `nosana.sh` creates Nosana deployments that extend
 themselves while the credits last. All three start their containers with
 `host/container-boot.sh`,
 which fetches the pushed commit from GitHub. On 2026-11-06 the data center

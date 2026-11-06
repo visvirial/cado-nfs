@@ -17,6 +17,12 @@
 #   salad.sh quota                           the replica quota of the organization
 #   salad.sh manage                          start salad-fleet.sh, which fills the quota with
 #                                            batch replicas first and low ones after
+#   salad.sh balance                         the credit balance in dollars, with the spending rate
+#                                            and when it runs out, from the earlier readings kept
+#                                            in $FLEET_DIR/salad/balance.log. The public API has
+#                                            no billing, so this logs in to the portal API with
+#                                            the email (first line) and password (second line) in
+#                                            ~/.config/salad/portal, and keeps the session cookie
 #
 # The API key is read from ~/.config/salad/api_key; SALAD_ORG and SALAD_PROJECT, SERVER,
 # CERTSHA1, MAKEFB and MAKEFB_OUT from $FLEET_DIR/fleet.conf. PRIORITY is high, medium, low or batch; a lower
@@ -96,5 +102,30 @@ manage)
   setsid nohup bash "$HERE/salad-fleet.sh" >> manager.out 2>&1 < /dev/null &
   echo "started; log in $FLEET_DIR/salad/events.log";;
 delete) api POST $P/$2/stop >/dev/null || true; api DELETE $P/$2 && echo "$2 deleted";;
-*) sed -n '2,26p' "$0"; exit 1;;
+balance)
+  mkdir -p "$FLEET_DIR/salad"; J="$FLEET_DIR/salad/portal.cookies"; touch "$J"; chmod 600 "$J"
+  PA=https://portal-api.salad.com/api/portal
+  get() { curl -sS -m 30 -b "$J" -c "$J" -w '\n%{http_code}' $PA/organizations/$SALAD_ORG/billing-profile/credits-balance; }
+  r=$(get)
+  if [ "${r##*$'\n'}" = 401 ]; then
+    # the password goes to curl on stdin, not on its command line
+    python3 -c 'import json,sys; e,p=open(sys.argv[1]).read().split("\n")[:2]; print(json.dumps({"email":e.strip(),"password":p}))' ~/.config/salad/portal |
+      curl -sS -m 30 -b "$J" -c "$J" -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" --data @- $PA/users/login |
+      grep -q '^20' || { echo "portal login failed" >&2; exit 1; }
+    r=$(get)
+  fi
+  [ "${r##*$'\n'}" = 200 ] || { echo "credits-balance: ${r##*$'\n'} ${r%$'\n'*}" >&2; exit 1; }
+  echo "$(date +%s) ${r%$'\n'*}" | python3 -c '
+import json,sys,time
+t,b=sys.stdin.read().split(" ",1); t=int(t); amount=json.loads(b)["amount"]/100   # in cents
+log=sys.argv[1]; open(log,"a").write("%d %.2f\n"%(t,amount))
+pts=[tuple(map(float,l.split())) for l in open(log) if l.strip()]
+day=[p for p in pts if t-p[0]<=86400]
+s="balance $%.2f" % amount
+t0,a0=day[0]
+if t-t0>=1800 and a0>amount:
+    rate=(a0-amount)/(t-t0)*3600
+    s+="  rate $%.2f/h over %.1f h, runs out about %s" % (rate,(t-t0)/3600,time.strftime("%m/%d %H:%M",time.localtime(t+amount/rate*3600)))
+print(s)' "$FLEET_DIR/salad/balance.log";;
+*) sed -n '2,32p' "$0"; exit 1;;
 esac

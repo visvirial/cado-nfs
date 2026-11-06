@@ -223,6 +223,10 @@ which fetches the pushed commit from GitHub. On 2026-11-06 the data center
 GPUs measured on Akash sieved at 0.19 (RTX PRO 6000), 0.23 (H100) and 0.39
 (A100) s per special-q for $2.0-2.6 an hour, over three times the cost per
 special-q of the RTX 5090, 4090 and 3090 elsewhere.
+The managers can also run as systemd user services, which start again after a
+reboot: link `systemd/rsa270-{vast,clore,salad}-fleet.service` into
+`~/.config/systemd/user/` and `systemctl --user enable --now` them; they run
+`run-manager.sh`, which keeps a manager in the foreground.
 `resubmit-lost.sh` lists, and with `--apply` resubmits, the work units of hosts
 that are gone.
 

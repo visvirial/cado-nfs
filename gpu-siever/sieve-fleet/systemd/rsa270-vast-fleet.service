@@ -1,0 +1,17 @@
+[Unit]
+Description=RSA-270 sieving fleet manager (vast)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/MEGA/Documents/Programs/rsa-270/cado-nfs/gpu-siever/sieve-fleet/run-manager.sh vast
+# a manager exits 0 when told to stop (STOP=1) or after the server is gone for 2 h
+Restart=on-failure
+RestartSec=60
+KillMode=process
+StandardOutput=append:%h/.local/share/rsa270-sieve-fleet/fleet.out
+StandardError=inherit
+
+[Install]
+WantedBy=default.target

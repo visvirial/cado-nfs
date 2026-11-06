@@ -66,8 +66,8 @@ list) api GET /deployments | python3 -c 'import json,sys
 d=json.load(sys.stdin); d=d.get("deployments",d) if isinstance(d,dict) else d
 for x in d: print(x.get("id"), x.get("status"), x.get("name"), x.get("market"))';;
 jobs) api GET /deployments/$2/jobs | python3 -m json.tool | head -60;;
-stop) shift; for i in "$@"; do echo "$i $(api POST /deployments/$i/stop | head -c 200)"; done;;
-archive) shift; for i in "$@"; do echo "$i $(api POST /deployments/$i/archive | head -c 200)"; done;;
+stop) shift; for i in "$@"; do echo "$i $(api POST /deployments/$i/stop --data {} | head -c 200)"; done;;
+archive) shift; for i in "$@"; do echo "$i $(api POST /deployments/$i/archive --data {} | head -c 200)"; done;;
 balance) api GET /credits/balance | python3 -c 'import json,sys
 b=json.load(sys.stdin)
 if "assignedCredits" not in b: sys.exit(json.dumps(b)[:300])

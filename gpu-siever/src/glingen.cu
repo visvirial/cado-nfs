@@ -1718,6 +1718,11 @@ __global__ void __launch_bounds__(1024) ple_kernel(bc_dev D, unsigned int t, uns
     }
     ple_priority<G>(delta, p2d, d2p, src);
     if (r == 0) np[0] = 0;
+    /* every thread reads np[0] below: without the barrier the other
+     * warps (and lanes) could read the value of the previous launch,
+     * start the pivot search of warp 0 at a different position than
+     * lane 0, and leave lane 0 alone in a __shfl_up_sync (a hang) */
+    __syncthreads();
     for (unsigned int pw = 0; pw < mb; pw++) {
         unsigned int np0 = np[0];
         if (G == 1) {

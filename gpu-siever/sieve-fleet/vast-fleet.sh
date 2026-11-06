@@ -5,7 +5,7 @@
 # Every minute it rents, up to MAXHOSTS, each offer of the GPUS models under the cost cap (CAP
 # dollars per million special-q at the seconds per special-q of SPQ_TABLE, or PRICE_<GPU>
 # dollars per hour where set, the price with the VAST_DISK GB disk), at most 8 launches at a time; with BID=1 it also rents
-# interruptible offers at BID_MARGIN above their minimum bid. Every 10 minutes it probes the
+# interruptible offers at BID_MARGIN above their minimum bid, up to BID_MAX of them. Every 10 minutes it probes the
 # hosts over SSH and destroys, and never rents again, those that never come up, stop answering,
 # fail to build, fail two work units in a row, never get a work unit, or run slower than 1/0.75
 # of their GPU's seconds per special-q. An outbid interruptible host is given up without
@@ -120,7 +120,9 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
   if [ $nidle -eq 0 ] && [ -z "$srv_down_since" ]; then
     want=$(( MAXHOSTS - $(active | wc -l) )); room=$(( 8 - $(launching) )); [ $want -gt $room ] && want=$room
     if [ $want -gt 0 ]; then
-      offers | head -$want > offers.now
+      # at most BID_MAX interruptible hosts at a time (all, when unset)
+      nbid=0; for d in $(active); do [ -f $d/bid ] && nbid=$((nbid + 1)); done
+      offers | awk -v room=$(( ${BID_MAX:-1000000} - nbid )) '$4 == "-" || room-- > 0' | head -$want > offers.now
       while read g o m b; do c=$(( $(cat counter) + 1 )); echo $c > counter; launch $(printf 'm%03d' $c) $g $o $m $b & sleep 2; done < offers.now
     fi
   fi

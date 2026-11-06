@@ -10,6 +10,8 @@ MINCPU=16        # effective cores of an offer; glas runs 8 threads, and fewer c
 VERIFIED=true    # false: also rent unverified machines
 BID=0            # 1: also rent interruptible offers, when cheaper per special-q
 BID_MARGIN=0.05  # bid this much above the offer's minimum bid
+BID_MAX=         # at most this many interruptible hosts at a time (empty: no limit). On 2026-11-06 interruptible
+                 # 5090s lived 21 min (median) whatever the bid, too short for a 25 min work unit: 56 $/Msq
 MINCREDIT=30     # below this Vast.ai credit, destroy everything
 STOP=0           # 1: destroy every host and exit
 # host/client.sh: make the factor base on the host with makefb while downloading it from the
@@ -29,4 +31,6 @@ SALAD_TIERS="batch low"   # salad-fleet.sh: priorities, cheapest first, one cont
 SALAD_GROUP=c270-sv       # the group of each tier is SALAD_GROUP-<priority>
 SALAD_HEADROOM=5          # replicas a tier asks for beyond those it has
 SALAD_REPLICAS=           # all the tiers together; empty: the organization's quota
+SALAD_FIXED=              # fixed replicas per tier, from the quota first, e.g. "medium=80 low=0". On 2026-11-06
+                          # medium returned 0.87 results per instance-hour, low 0.30 (interrupted before a 3090 work unit ends)
 SALAD_STOP=0              # 1: stop and delete every Salad group (STOP=1 does too)

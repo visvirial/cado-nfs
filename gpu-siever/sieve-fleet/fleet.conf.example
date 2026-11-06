@@ -7,6 +7,7 @@ MAXHOSTS=10
 GPUS=RTX_5090,RTX_4090,RTX_3090   # GPU models to rent, of those in SPQ_TABLE (env.sh)
 VAST_DISK=50     # GB of disk per Vast host; its price counts in the cap
 MINCPU=16        # effective cores of an offer; glas runs 8 threads, and fewer cores left it host-bound
+MIN_DAYS=3       # skip offers whose machine leaves the market (end_date) within this many days
 VERIFIED=true    # false: also rent unverified machines
 BID=0            # 1: also rent interruptible offers, when cheaper per special-q
 BID_MARGIN=0.05  # bid this much above the offer's minimum bid

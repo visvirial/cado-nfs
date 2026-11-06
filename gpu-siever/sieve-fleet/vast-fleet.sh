@@ -28,7 +28,7 @@ offers() { # "gpu offer machine bid" lines under the cap, cheapest per special-q
   # machines and those in use; bid is the price of an interruptible rental (BID=1), or - for an on-demand one
   q="num_gpus=1 rentable=true rented=false verified=${VERIFIED:-true} direct_port_count>=4 cpu_cores_effective>=${MINCPU:-16} cpu_ram>=32 gpu_ram>=23 disk_space>=${VAST_DISK:-50} reliability>=0.95 cuda_max_good>=12.8 inet_down>=100 gpu_name in [${GPUS}]"
   { $V search offers "$q" --raw --limit 1000 2>/dev/null; echo; [ "${BID:-0}" = 1 ] && $V search offers "$q" --type bid --raw --limit 1000 2>/dev/null; } | python3 -c '
-import json,sys,os
+import json,sys,os,time
 S={k.replace("_"," "):float(v) for k,v in (x.split("=") for x in os.environ["SPQ_TABLE"].split())}
 cap=float(sys.argv[1]);margin=float(sys.argv[2]);skip=set(open("machines.bad").read().split())|set(sys.argv[3:]);best={}
 parts=[p for p in sys.stdin.read().split("\n\n") if p.strip()]
@@ -46,6 +46,9 @@ for k,p in enumerate(parts):
         m=str(x["machine_id"]);e=price*S[x["gpu_name"]]/3600*1e6
         lim=os.environ.get("PRICE_"+x["gpu_name"].replace(" ","_"))
         if m in skip or (price>float(lim) if lim else e>cap) or x.get("inet_down_cost",1)>.03: continue
+        # an offer whose machine leaves the market within MIN_DAYS (3) would expire, and have to
+        # be replaced, before long (Vast.ai "Instance Expiring Soon")
+        if x.get("end_date") and x["end_date"] - time.time() < float(os.environ.get("MIN_DAYS", "3")) * 86400: continue
         if m not in best or e<best[m][0]: best[m]=(e,x,bid)
 for e,x,bid in sorted(best.values(),key=lambda t:t[0]): print(x["gpu_name"].replace(" ","_"),x["id"],x["machine_id"],bid if bid else "-")' $CAP ${BID_MARGIN:-0.05} $(for d in $(active); do cat $d/machine; done | sort -u); }
 launch() { # label gpu offer machine bid; runs in the background

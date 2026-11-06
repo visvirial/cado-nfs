@@ -24,7 +24,7 @@ cancel_host() { d=$1; shift
   if [ -f $d/order ] && ! $C cancel $(cat $d/order) > /dev/null 2>&1; then log "$d $(cat $d/gpu 2>/dev/null) cancel failed ($*)"; return; fi
   touch $d/dead; log "$d $(cat $d/gpu 2>/dev/null) cancelled: $*"; }
 bad() { echo ${1#s} >> servers.bad; }
-PROBE='cd /workspace 2>/dev/null || { echo nows; exit 0; }; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y out/boot.log 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
+PROBE='cd /workspace 2>/dev/null || { echo nows; exit 0; }; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y out/boot.log 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "first $(w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | head -1 | sed "s/.*\[\(.*\)\].*/\1/"); [ -n "$w" ] && echo $(( $(date +%s) - $(date -d "$w" +%s) )) || echo -1)"; echo "upok $(grep -c "Upload of .* succeeded" out/client.log 2>/dev/null)"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
 export PROBE KEY
 while :; do
   CAP=40 CLORE_MAXHOSTS=10 CLORE_MINREL=0.98 CLORE_MINBAL=2 CLORE_STOP=0
@@ -66,7 +66,8 @@ while :; do
       # uploads failing since the last one that went through: the host's network does not reach
       # the server (a Clore host in Germany got 3 KB/s to it, 2026-11-06)
       uf=$(echo "$s" | awk '/^upfail/{print $2}')
-      if [ "${uf:-0}" -ge 10 ]; then bad $d; cancel_host $d "uploads failing ($uf in a row)"; continue; fi
+      # three in a row while the server answers: one host held work units for hours at 10
+      if [ "${uf:-0}" -ge 3 ] && [ -z "$srv_down_since" ]; then bad $d; cancel_host $d "uploads failing ($uf in a row)"; continue; fi
       wus=$(echo "$s" | awk 'NF==6 && !/^log\|/')
       if [ "$(echo "$wus" | awk 'NF==6 {r[++n]=$4} END{print (n>=2 && r[n]!=0 && r[n-1]!=0) ? "y" : "n"}')" = y ]; then
         bad $d; cancel_host $d "work units failing"; continue; fi
@@ -74,6 +75,13 @@ while :; do
       ref=${SPQ[$(cat $d/gpu)]:-}
       if [ -n "$spq" ] && [ -n "$ref" ] && python3 -c "import sys;sys.exit(0 if $spq > $ref/0.75 else 1)"; then
         bad $d; cancel_host $d "slow: $spq s/sq"; continue; fi
+      # work units taken but no result in 2.5 times a work unit of the GPU (7000 special-q): the
+      # results do not reach the server, or the host is far slower than its GPU (2026-11-06: 11
+      # Clore hosts held 4 work units each for 1.4 to 4.2 h without a result)
+      fs=$(echo "$s" | awk '/^first/{print $2}'); ok=$(echo "$s" | awk '/^upok/{print $2}')
+      if [ -n "$ref" ] && [ "${ok:-1}" = 0 ] && [ -z "$srv_down_since" ] && [ "${fs:--1}" -ge 0 ] && \
+          python3 -c "import sys;sys.exit(0 if $fs > 2.5 * 7000 * $ref else 1)"; then
+        bad $d; cancel_host $d "no result ${fs}s after the first work unit"; continue; fi
       a=$(echo "$s" | awk '/^age/{print $2}')
       if [ "$(echo "$s" | awk '/^built/{print $2}')" = 0 ]; then
         [ $age -gt 1800 ] && { bad $d; cancel_host $d "not built ${age}s after renting"; }; continue; fi

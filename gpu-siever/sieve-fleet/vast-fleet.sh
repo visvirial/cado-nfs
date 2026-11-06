@@ -58,7 +58,7 @@ launch() { # label gpu offer machine bid; runs in the background
 rm -f m*/launching   # launches of an earlier manager are over
 # state; glas processes; seconds since the client last started a work unit (or since boot.out);
 # whether the build ended; the work unit lines of glas-wu
-PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
+PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "first $(w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | head -1 | sed "s/.*\[\(.*\)\].*/\1/"); [ -n "$w" ] && echo $(( $(date +%s) - $(date -d "$w" +%s) )) || echo -1)"; echo "upok $(grep -c "Upload of .* succeeded" out/client.log 2>/dev/null)"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
 export PROBE
 last_health=0; nidle=0
 while :; do
@@ -103,6 +103,13 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
       ref=${SPQ[$(cat $l/gpu)]:-}
       if [ -n "$spq" ] && [ -n "$ref" ] && python3 -c "import sys;sys.exit(0 if $spq > $ref/0.75 else 1)"; then
         bad $l; kill_host $l "slow: $spq s/sq, $(cat $l/gpu)"; continue; fi
+      # work units taken but no result in 2.5 times a work unit of the GPU (7000 special-q): the
+      # results do not reach the server, or the host is far slower than its GPU (2026-11-06: 11
+      # Clore hosts held 4 work units each for 1.4 to 4.2 h without a result)
+      fs=$(echo "$s" | awk '/^first/{print $2}'); ok=$(echo "$s" | awk '/^upok/{print $2}')
+      if [ -n "$ref" ] && [ "${ok:-1}" = 0 ] && [ -z "$srv_down_since" ] && [ "${fs:--1}" -ge 0 ] && \
+          python3 -c "import sys;sys.exit(0 if $fs > 2.5 * 7000 * $ref else 1)"; then
+        bad $l; kill_host $l "no result ${fs}s after the first work unit"; continue; fi
       procs=$(echo "$s" | awk '/^procs/{print $2}'); since=$(echo "$s" | awk '/^age/{print $2}')
       # a client fetching a file (the factor base, when MAKEFB is unset or failed) is not idle
       if [ "$procs" = 0 ] && [ "${since:-0}" -gt 2700 ] && [ -z "$srv_down_since" ] && ! echo "$s" | grep -q '^fetching 1'; then

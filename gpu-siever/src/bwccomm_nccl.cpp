@@ -401,6 +401,37 @@ slice slice_of(comm_state const & s, int d, size_t block_bytes)
     return { lo * sizeof(uint64_t), (hi - lo) * sizeof(uint64_t) };
 }
 
+/* BWC_NCCL_CHUNK_MB=c: the exchange of a device or host buffer runs in
+ * pieces of each lane slice, so that a staging half holds n pieces of
+ * at most c MiB / n instead of n whole slices. Without it (or 0), one
+ * piece is the whole slice. The staging area is then 2 halves plus the
+ * receive area, each about c MiB, and not three times the buffer. The
+ * pieces of a slice are the same on every rank, so the NCCL calls
+ * match. */
+size_t chunk_cap(comm_state const & s)
+{
+    static size_t const mb = getenv("BWC_NCCL_CHUNK_MB")
+        ? strtoull(getenv("BWC_NCCL_CHUNK_MB"), nullptr, 10) : 0;
+    if (!mb)
+        return SIZE_MAX;
+    size_t const cap = (mb << 20) / (size_t) s.njobs;
+    return std::max<size_t>(cap & ~(size_t) (sizeof(uint64_t) - 1), sizeof(uint64_t));
+}
+
+size_t npieces(slice const & sl, size_t cap)
+{
+    return sl.bytes ? (sl.bytes + cap - 1) / std::min(cap, sl.bytes) : 0;
+}
+
+/* piece c of the slice, at most cap bytes */
+slice piece_of(slice const & sl, size_t c, size_t cap)
+{
+    size_t const per = std::min(cap, sl.bytes);
+    size_t const lo = std::min(sl.bytes, c * per);
+    size_t const hi = std::min(sl.bytes, lo + per);
+    return { sl.off + lo, hi - lo };
+}
+
 void reserve(comm_state & s, lane & l, size_t slice_bytes)
 {
     if (l.slice_alloc >= slice_bytes)
@@ -1563,90 +1594,116 @@ void reduce_scatter_xor(void * const * bufs, int nbufs,
             holder_host(s, "reduce-scatter");
         if (v.p)
             request_order(v, n, block_bytes, blk_at);
-        for (size_t d : ds) {
-            lane & l = s.lanes[d];
-            slice const sl = slice_of(s, d, block_bytes);
-            CUDA_CHECK(cudaSetDevice(l.device));
-            reserve(s, l, sl.bytes);
-            /* the staging half is free once the ring before this one
-             * and the fan-out that read the half are done with it */
-            fork(l, l.copy);
-            fresh_half(l);
-            tl_mark(tl, l.copy, l.device, "rs free", tl_k);
-            fork_stage_streams(s, l);
-            for (int i = 0; i < n; i++) {
-                cudaStream_t const st = stage_stream(s, l, i);
-                stage_block(l, st, sl, v, bufs[w], blk_at(i), block_bytes);
-                CUDA_CHECK(cudaEventRecord(l.blk[blk_at(i)], st));
-                tl_mark(tl, st, l.device, tl_name("rs stg", i), tl_k);
-            }
-            join_stage_streams(s, l);
-            if (v.p)
-                segments_read(l.rd[0], l.copy, v.a);
-        }
-        for (size_t i = 0; i < steps.size(); i++) {
-            std::vector<hop> const & step = steps[i];
+        /* the slices go in pieces of at most cap bytes (chunk_cap);
+         * each piece is staged, reduced over the ring and written out
+         * before the next one takes the other staging half */
+        size_t const cap = chunk_cap(s);
+        size_t nc = 1;
+        for (size_t d : ds)
+            nc = std::max(nc, npieces(slice_of(s, d, block_bytes), cap));
+        for (size_t c = 0; c < nc; c++) {
             for (size_t d : ds) {
                 lane & l = s.lanes[d];
+                slice const whole = slice_of(s, d, block_bytes);
+                slice const sl = piece_of(whole, c, cap);
+                if (!sl.bytes)
+                    continue;
                 CUDA_CHECK(cudaSetDevice(l.device));
-                for (hop const & h : step)
-                    CUDA_CHECK(cudaStreamWaitEvent(l.stream, l.blk[h.sblk], 0));
-            }
-            NCCL_CHECK(ncclGroupStart());
-            for (size_t d : ds) {
-                lane & l = s.lanes[d];
-                slice const sl = slice_of(s, d, block_bytes);
-                CUDA_CHECK(cudaSetDevice(l.device));
-                for (size_t k = 0; k < step.size(); k++) {
-                    hop const & h = step[k];
-                    NCCL_CHECK(ncclSend(staging(l) + (size_t) h.sblk * sl.bytes,
-                                sl.bytes, ncclUint8, h.to, l.nccl, l.stream));
-                    NCCL_CHECK(ncclRecv(l.tmp + k * sl.bytes, sl.bytes,
-                                ncclUint8, h.from, l.nccl, l.stream));
-                }
-            }
-            NCCL_CHECK(ncclGroupEnd());
-            for (size_t d : ds) {
-                lane & l = s.lanes[d];
-                slice const sl = slice_of(s, d, block_bytes);
-                CUDA_CHECK(cudaSetDevice(l.device));
-                tl_mark(tl, l.stream, l.device, tl_name("rs net", i), tl_k);
-                for (size_t k = 0; k < step.size(); k++) {
-                    hop const & h = step[k];
-                    CUDA_CHECK(cudaStreamWaitEvent(l.stream, l.blk[h.rblk], 0));
-                    comm_xor_gf2((uint64_t *) (staging(l) + (size_t) h.rblk * sl.bytes),
-                            (const uint64_t *) (l.tmp + k * sl.bytes),
-                            sl.bytes / sizeof(uint64_t), l.stream);
-                }
-                tl_mark(tl, l.stream, l.device, tl_name("rs xor", i), tl_k);
-            }
-        }
-        for (size_t d : ds) {
-            lane & l = s.lanes[d];
-            slice const sl = slice_of(s, d, block_bytes);
-            CUDA_CHECK(cudaSetDevice(l.device));
-            /* the result of the reduce-scatter is the first block of
-             * the buffer */
-            size_t const off = sl.off;
-            uint8_t * const res = staging(l) + (size_t) s.rank * sl.bytes;
-            if (v.p) {
-                /* the mirror copy runs on the copy stream, so the lane
-                 * stream (and the allgather, which reads the result
-                 * from the staging half) does not wait for it; the
-                 * publication waits for it through mir. The write must
-                 * follow every queued access of its range of the
-                 * mirror; the band events of the product carry the
-                 * accesses before the product */
+                reserve(s, l, std::min(cap, whole.bytes));
+                /* the staging half is free once the ring before this one
+                 * and the fan-out that read the half are done with it */
                 fork(l, l.copy);
-                wait_range(l.copy, v.a, v.off + off, sl.bytes);
-                CUDA_CHECK(cudaMemcpyPeerAsync(v.p + off, v.device, res,
-                            l.device, sl.bytes, l.copy));
-                CUDA_CHECK(cudaEventRecord(l.mir, l.copy));
-                tl_mark(tl, l.copy, l.device, "rs out", tl_k);
-            } else {
-                CUDA_CHECK(cudaMemcpyAsync((char *) bufs[w] + off, res,
-                            sl.bytes, cudaMemcpyDeviceToHost, l.stream));
-                host_sync = 1;
+                fresh_half(l);
+                tl_mark(tl, l.copy, l.device, "rs free", tl_k);
+                fork_stage_streams(s, l);
+                for (int i = 0; i < n; i++) {
+                    cudaStream_t const st = stage_stream(s, l, i);
+                    stage_block(l, st, sl, v, bufs[w], blk_at(i), block_bytes);
+                    CUDA_CHECK(cudaEventRecord(l.blk[blk_at(i)], st));
+                    tl_mark(tl, st, l.device, tl_name("rs stg", i), tl_k);
+                }
+                join_stage_streams(s, l);
+                if (v.p)
+                    segments_read(l.rd[0], l.copy, v.a);
+            }
+            for (size_t i = 0; i < steps.size(); i++) {
+                std::vector<hop> const & step = steps[i];
+                for (size_t d : ds) {
+                    lane & l = s.lanes[d];
+                    if (!piece_of(slice_of(s, d, block_bytes), c, cap).bytes)
+                        continue;
+                    CUDA_CHECK(cudaSetDevice(l.device));
+                    for (hop const & h : step)
+                        CUDA_CHECK(cudaStreamWaitEvent(l.stream, l.blk[h.sblk], 0));
+                }
+                NCCL_CHECK(ncclGroupStart());
+                for (size_t d : ds) {
+                    lane & l = s.lanes[d];
+                    slice const sl = piece_of(slice_of(s, d, block_bytes), c, cap);
+                    if (!sl.bytes)
+                        continue;
+                    CUDA_CHECK(cudaSetDevice(l.device));
+                    for (size_t k = 0; k < step.size(); k++) {
+                        hop const & h = step[k];
+                        NCCL_CHECK(ncclSend(staging(l) + (size_t) h.sblk * sl.bytes,
+                                    sl.bytes, ncclUint8, h.to, l.nccl, l.stream));
+                        NCCL_CHECK(ncclRecv(l.tmp + k * sl.bytes, sl.bytes,
+                                    ncclUint8, h.from, l.nccl, l.stream));
+                    }
+                }
+                NCCL_CHECK(ncclGroupEnd());
+                for (size_t d : ds) {
+                    lane & l = s.lanes[d];
+                    slice const sl = piece_of(slice_of(s, d, block_bytes), c, cap);
+                    if (!sl.bytes)
+                        continue;
+                    CUDA_CHECK(cudaSetDevice(l.device));
+                    tl_mark(tl, l.stream, l.device, tl_name("rs net", i), tl_k);
+                    for (size_t k = 0; k < step.size(); k++) {
+                        hop const & h = step[k];
+                        CUDA_CHECK(cudaStreamWaitEvent(l.stream, l.blk[h.rblk], 0));
+                        comm_xor_gf2((uint64_t *) (staging(l) + (size_t) h.rblk * sl.bytes),
+                                (const uint64_t *) (l.tmp + k * sl.bytes),
+                                sl.bytes / sizeof(uint64_t), l.stream);
+                    }
+                    tl_mark(tl, l.stream, l.device, tl_name("rs xor", i), tl_k);
+                }
+            }
+            for (size_t d : ds) {
+                lane & l = s.lanes[d];
+                slice const sl = piece_of(slice_of(s, d, block_bytes), c, cap);
+                if (!sl.bytes)
+                    continue;
+                CUDA_CHECK(cudaSetDevice(l.device));
+                /* the result of the reduce-scatter is the block of the
+                 * rank in the staging half */
+                size_t const off = sl.off;
+                uint8_t * const res = staging(l) + (size_t) s.rank * sl.bytes;
+                if (v.p) {
+                    /* the mirror copy runs on the copy stream, so the lane
+                     * stream (and the allgather, which reads the result
+                     * from the staging half) does not wait for it; the
+                     * publication waits for it through mir. The write must
+                     * follow every queued access of its range of the
+                     * mirror; the band events of the product carry the
+                     * accesses before the product */
+                    fork(l, l.copy);
+                    wait_range(l.copy, v.a, v.off + off, sl.bytes);
+                    CUDA_CHECK(cudaMemcpyPeerAsync(v.p + off, v.device, res,
+                                l.device, sl.bytes, l.copy));
+                    CUDA_CHECK(cudaEventRecord(l.mir, l.copy));
+                    /* in pieces, the half is staged again two pieces on,
+                     * behind this copy */
+                    if (nc > 1)
+                        CUDA_CHECK(cudaEventRecord(l.fanned[l.cur], l.copy));
+                    tl_mark(tl, l.copy, l.device, "rs out", tl_k);
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync((char *) bufs[w] + off, res,
+                                sl.bytes, cudaMemcpyDeviceToHost, l.stream));
+                    if (nc > 1)
+                        CUDA_CHECK(cudaEventRecord(l.fanned[l.cur], l.stream));
+                    host_sync = 1;
+                }
             }
         }
         if (v.p) {
@@ -1654,7 +1711,12 @@ void reduce_scatter_xor(void * const * bufs, int nbufs,
             for (size_t d : ds)
                 CUDA_CHECK(cudaStreamWaitEvent(s.pub, s.lanes[d].mir, 0));
             publish(s, v.a);
-            results_out(s, ds, v, block_bytes);
+            /* in pieces, the staging halves hold the last piece only, so
+             * the mirror is the result: the output segments go */
+            if (nc == 1)
+                results_out(s, ds, v, block_bytes);
+            else
+                written(v, false);
             tl_mark(tl, s.pub, s.lanes[0].device, "rs pub", tl_k);
         }
     }
@@ -1705,93 +1767,117 @@ void allgather(void * const * bufs, int nbufs,
             holder_host(s, "allgather");
         bwc_dev_pieces const * const reps =
             replicas_of(v, (size_t) n * block_bytes);
-        for (size_t d : ds) {
-            lane & l = s.lanes[d];
-            slice const sl = slice_of(s, d, block_bytes);
-            CUDA_CHECK(cudaSetDevice(l.device));
-            reserve(s, l, sl.bytes);
-            fresh_half(l);
-            tl_mark(tl, l.stream, l.device, "ag free", tl_k);
-            uint8_t * const own = staging(l) + (size_t) s.rank * sl.bytes;
-            size_t const own_off = (size_t) s.rank * block_bytes + sl.off;
-            if (v.p) {
-                arena_in(l, l.stream, v.a, v.off + own_off, sl.bytes, own);
-                segments_read(l.rd[1], l.stream, v.a);
-                /* the block writes below must follow every queued
-                 * mirror and replica access */
-                wait_before(l.stream, v.a, v.off + own_off, sl.bytes);
-                for (int k = 0; reps && k < reps->nrep; k++)
-                    CUDA_CHECK(cudaStreamWaitEvent(l.stream,
-                                reps->rep[k].ready, 0));
-                fork_fans(l);
-                replicas_out(l, v, reps, own_off, sl.bytes, own);
-                join_fans(l, l.fan);
-                CUDA_CHECK(cudaEventRecord(l.blk[s.rank], l.fan));
-                tl_mark(tl, l.fan, l.device, "ag own", tl_k);
-                tl_mark(tl, l.stream, l.device, "ag stg", tl_k);
-            } else {
-                CUDA_CHECK(cudaMemcpyAsync(own,
-                            (const uint8_t *) bufs[w] + own_off,
-                            sl.bytes, cudaMemcpyHostToDevice, l.stream));
-            }
-        }
-        if (v.p) {
-            /* the publication events must also cover the accesses the
-             * old ready marker holds */
-            if (v.a->ready)
-                CUDA_CHECK(cudaStreamWaitEvent(s.pub,
-                            (cudaEvent_t) v.a->ready, 0));
-            band_ready(s, ds, *bs, s.rank);
-        }
-        for (size_t i = 0; i < steps.size(); i++) {
-            std::vector<hop> const & step = steps[i];
-            NCCL_CHECK(ncclGroupStart());
+        /* the slices go in pieces of at most cap bytes, as in the
+         * reduce-scatter; the block events and the bands fire with the
+         * last piece of each block */
+        size_t const cap = chunk_cap(s);
+        size_t nc = 1;
+        for (size_t d : ds)
+            nc = std::max(nc, npieces(slice_of(s, d, block_bytes), cap));
+        for (size_t c = 0; c < nc; c++) {
+            bool const last = c + 1 == nc;
             for (size_t d : ds) {
                 lane & l = s.lanes[d];
-                slice const sl = slice_of(s, d, block_bytes);
+                slice const whole = slice_of(s, d, block_bytes);
+                slice const sl = piece_of(whole, c, cap);
+                if (!sl.bytes)
+                    continue;
                 CUDA_CHECK(cudaSetDevice(l.device));
-                for (hop const & h : step) {
-                    NCCL_CHECK(ncclSend(staging(l) + (size_t) h.sblk * sl.bytes,
-                                sl.bytes, ncclUint8, h.to, l.nccl, l.stream));
-                    NCCL_CHECK(ncclRecv(staging(l) + (size_t) h.rblk * sl.bytes,
-                                sl.bytes, ncclUint8, h.from, l.nccl, l.stream));
-                }
-            }
-            NCCL_CHECK(ncclGroupEnd());
-            for (size_t d : ds) {
-                lane & l = s.lanes[d];
-                slice const sl = slice_of(s, d, block_bytes);
-                CUDA_CHECK(cudaSetDevice(l.device));
+                reserve(s, l, std::min(cap, whole.bytes));
+                fresh_half(l);
+                tl_mark(tl, l.stream, l.device, "ag free", tl_k);
+                uint8_t * const own = staging(l) + (size_t) s.rank * sl.bytes;
+                size_t const own_off = (size_t) s.rank * block_bytes + sl.off;
                 if (v.p) {
+                    arena_in(l, l.stream, v.a, v.off + own_off, sl.bytes, own);
+                    segments_read(l.rd[1], l.stream, v.a);
+                    /* the block writes below must follow every queued
+                     * mirror and replica access */
+                    wait_before(l.stream, v.a, v.off + own_off, sl.bytes);
+                    for (int k = 0; reps && k < reps->nrep; k++)
+                        CUDA_CHECK(cudaStreamWaitEvent(l.stream,
+                                    reps->rep[k].ready, 0));
                     fork_fans(l);
-                    tl_mark(tl, l.stream, l.device, tl_name("ag net", i), tl_k);
+                    replicas_out(l, v, reps, own_off, sl.bytes, own);
+                    join_fans(l, l.fan);
+                    CUDA_CHECK(cudaEventRecord(l.blk[s.rank], l.fan));
+                    tl_mark(tl, l.fan, l.device, "ag own", tl_k);
+                    tl_mark(tl, l.stream, l.device, "ag stg", tl_k);
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync(own,
+                                (const uint8_t *) bufs[w] + own_off,
+                                sl.bytes, cudaMemcpyHostToDevice, l.stream));
                 }
-                for (hop const & h : step) {
-                    size_t const off = (size_t) h.rblk * block_bytes + sl.off;
-                    uint8_t * const got = staging(l) + (size_t) h.rblk * sl.bytes;
-                    if (v.p) {
-                        arena_out(l, v, reps, off, sl.bytes, got);
-                        join_fans(l, l.fan);
-                        CUDA_CHECK(cudaEventRecord(l.blk[h.rblk], l.fan));
-                        tl_mark(tl, l.fan, l.device, tl_name("ag blk", h.rblk), tl_k);
-                    } else {
-                        CUDA_CHECK(cudaMemcpyAsync((uint8_t *) bufs[w] + off,
-                                    got, sl.bytes, cudaMemcpyDeviceToHost,
-                                    l.stream));
-                        host_sync = 1;
+            }
+            if (v.p && last) {
+                /* the publication events must also cover the accesses the
+                 * old ready marker holds */
+                if (v.a->ready)
+                    CUDA_CHECK(cudaStreamWaitEvent(s.pub,
+                                (cudaEvent_t) v.a->ready, 0));
+                band_ready(s, ds, *bs, s.rank);
+            }
+            for (size_t i = 0; i < steps.size(); i++) {
+                std::vector<hop> const & step = steps[i];
+                NCCL_CHECK(ncclGroupStart());
+                for (size_t d : ds) {
+                    lane & l = s.lanes[d];
+                    slice const sl = piece_of(slice_of(s, d, block_bytes), c, cap);
+                    if (!sl.bytes)
+                        continue;
+                    CUDA_CHECK(cudaSetDevice(l.device));
+                    for (hop const & h : step) {
+                        NCCL_CHECK(ncclSend(staging(l) + (size_t) h.sblk * sl.bytes,
+                                    sl.bytes, ncclUint8, h.to, l.nccl, l.stream));
+                        NCCL_CHECK(ncclRecv(staging(l) + (size_t) h.rblk * sl.bytes,
+                                    sl.bytes, ncclUint8, h.from, l.nccl, l.stream));
                     }
                 }
+                NCCL_CHECK(ncclGroupEnd());
+                for (size_t d : ds) {
+                    lane & l = s.lanes[d];
+                    slice const sl = piece_of(slice_of(s, d, block_bytes), c, cap);
+                    if (!sl.bytes)
+                        continue;
+                    CUDA_CHECK(cudaSetDevice(l.device));
+                    if (v.p) {
+                        fork_fans(l);
+                        tl_mark(tl, l.stream, l.device, tl_name("ag net", i), tl_k);
+                    }
+                    for (hop const & h : step) {
+                        size_t const off = (size_t) h.rblk * block_bytes + sl.off;
+                        uint8_t * const got = staging(l) + (size_t) h.rblk * sl.bytes;
+                        if (v.p) {
+                            arena_out(l, v, reps, off, sl.bytes, got);
+                            join_fans(l, l.fan);
+                            CUDA_CHECK(cudaEventRecord(l.blk[h.rblk], l.fan));
+                            tl_mark(tl, l.fan, l.device, tl_name("ag blk", h.rblk), tl_k);
+                        } else {
+                            CUDA_CHECK(cudaMemcpyAsync((uint8_t *) bufs[w] + off,
+                                        got, sl.bytes, cudaMemcpyDeviceToHost,
+                                        l.stream));
+                            host_sync = 1;
+                        }
+                    }
+                }
+                for (hop const & h : step)
+                    if (v.p && last)
+                        band_ready(s, ds, *bs, h.rblk);
             }
-            for (hop const & h : step)
-                if (v.p)
-                    band_ready(s, ds, *bs, h.rblk);
-        }
-        if (v.p) {
+            /* the fan-out (or the host copies) read the half: the piece
+             * two on, or the next exchange, stages behind them */
             for (size_t d : ds) {
                 lane & l = s.lanes[d];
+                if (!piece_of(slice_of(s, d, block_bytes), c, cap).bytes)
+                    continue;
                 CUDA_CHECK(cudaSetDevice(l.device));
-                CUDA_CHECK(cudaEventRecord(l.fanned[l.cur], l.fan));
+                if (v.p)
+                    CUDA_CHECK(cudaEventRecord(l.fanned[l.cur], l.fan));
+                else if (nc > 1)
+                    CUDA_CHECK(cudaEventRecord(l.fanned[l.cur], l.stream));
             }
+        }
+        if (v.p) {
             /* the publication stream has waited for every band, so
              * its event covers the whole exchange */
             publish(s, v.a);

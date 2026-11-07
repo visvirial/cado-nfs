@@ -13,7 +13,8 @@
 # gives a tier a fixed number of replicas instead, taken from the quota first. The instances of
 # each group are logged to $FLEET_DIR/salad/members.log, to tell the tiers apart in the server
 # log (client vast-svsalad-<first 18 characters of the machine id>). Every group is stopped when
-# STOP or SALAD_STOP is 1, or SERVER has not answered for 2 h.
+# STOP or SALAD_STOP is 1, or SERVER has not answered for 2 h. Every 10 minutes it also runs
+# bad-clients.sh --apply, which replaces the Salad and Nosana clients that keep failing.
 D=$FLEET_DIR/salad; mkdir -p $D; cd $D; E=$D/events.log; C="bash $HERE/salad.sh"
 echo $$ > $FLEET_DIR/salad-fleet.sh.pid   # for running() in env.sh
 log() { echo "$(date '+%F %T') $*" >> $E; }
@@ -60,6 +61,8 @@ while :; do
   done
   for i in $(seq 0 $((n - 1))); do [ "${asks[$i]}" = - ] || $C status $(name $i) 2>/dev/null |
     awk -v t="$(date +%s)" -v p=${tiers[$i]} '{print t, p, $1, $2}' >> $D/members.log; done
+  # Salad and Nosana clients that keep failing work units: replaced (see bad-clients.sh)
+  timeout 300 bash $HERE/bad-clients.sh --apply > /dev/null 2>&1 || true
   log "quota $q: $(for i in $(seq 0 $((n - 1))); do printf '%s %s/%s  ' ${tiers[$i]} ${have[$i]} ${target[$i]}; done)"
   sleep 600
 done

@@ -24,7 +24,7 @@ cancel_host() { d=$1; shift
   if [ -f $d/order ] && ! $C cancel $(cat $d/order) > /dev/null 2>&1; then log "$d $(cat $d/gpu 2>/dev/null) cancel failed ($*)"; return; fi
   touch $d/dead; log "$d $(cat $d/gpu 2>/dev/null) cancelled: $*"; }
 bad() { echo ${1#s} >> servers.bad; }
-PROBE='cd /workspace 2>/dev/null || { echo nows; exit 0; }; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y out/boot.log 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "first $(w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | head -1 | sed "s/.*\[\(.*\)\].*/\1/"); [ -n "$w" ] && echo $(( $(date +%s) - $(date -d "$w" +%s) )) || echo -1)"; echo "upok $(grep -c "Upload of .* succeeded" out/client.log 2>/dev/null)"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
+PROBE='cd /workspace 2>/dev/null || { echo nows; exit 0; }; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y out/boot.log 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "first $(w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | head -1 | sed "s/.*\[\(.*\)\].*/\1/"); [ -n "$w" ] && echo $(( $(date +%s) - $(date -d "$w" +%s) )) || echo -1)"; echo "upok $(grep -c "Upload of .* succeeded" out/client.log 2>/dev/null)"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; echo "cmdfail $(cat out/client.log 2>/dev/null | awk "/because the command failed/ {p = 1} /Upload of .* succeeded/ {r[++n] = p; p = 0} END {c = 0; for (i = n; i > n - 3 && i > 0; i--) c += r[i]; print (n >= 3) ? c : 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
 export PROBE KEY
 while :; do
   CAP=40 CLORE_MAXHOSTS=10 CLORE_MINREL=0.98 CLORE_MINBAL=2 CLORE_STOP=0
@@ -68,6 +68,12 @@ while :; do
       uf=$(echo "$s" | awk '/^upfail/{print $2}')
       # three in a row while the server answers: one host held work units for hours at 10
       if [ "${uf:-0}" -ge 3 ] && [ -z "$srv_down_since" ]; then bad $d; cancel_host $d "uploads failing ($uf in a row)"; continue; fi
+      # the last 3 work units failed in the client (glas exits at once, its wu.log line never
+      # written): such a host takes a work unit every few seconds and fails it, and the server
+      # resubmits a failed one only once (maxwuerror 2), so the ranges are lost (2026-11-07: m202
+      # failed 16842 work units in a day, 10816 ranges left unsieved)
+      cf=$(echo "$s" | awk '/^cmdfail/{print $2}')
+      if [ "${cf:-0}" -ge 3 ]; then bad $d; cancel_host $d "work units failing in the client ($cf of the last 3)"; continue; fi
       wus=$(echo "$s" | awk 'NF==6 && !/^log\|/')
       if [ "$(echo "$wus" | awk 'NF==6 {r[++n]=$4} END{print (n>=2 && r[n]!=0 && r[n-1]!=0) ? "y" : "n"}')" = y ]; then
         bad $d; cancel_host $d "work units failing"; continue; fi

@@ -10,6 +10,9 @@
 #                                            quota stays stopped)
 #   salad.sh logs NAME [MINUTES]             the container output of the last MINUTES (30)
 #   salad.sh delete NAME                    stop and delete a group
+#   salad.sh reallocate MACHINE              restart on another machine the instance (of any
+#                                            group) whose machine id starts with MACHINE (the
+#                                            client id keeps its first 18 characters)
 #   salad.sh counts NAME                     the replicas a group asks for, and those it has
 #                                            (creating or running)
 #   salad.sh fit PRIORITY                    the GPU classes whose price at PRIORITY is within CAP
@@ -71,6 +74,17 @@ for g in json.load(sys.stdin)["items"]:
   else api GET $P/$2/instances | python3 -c '
 import json,sys
 for i in json.load(sys.stdin)["instances"]: print(i.get("machine_id"),i.get("state"),i.get("update_time"),i.get("ready"),i.get("started"))'; fi;;
+reallocate)
+  for g in $(api GET $P | python3 -c 'import json,sys
+for g in json.load(sys.stdin)["items"]: print(g["name"])'); do
+    i=$(api GET $P/$g/instances | python3 -c 'import json,sys
+for i in json.load(sys.stdin)["instances"]:
+    if i.get("machine_id","").startswith(sys.argv[1]): print(i["id"])' "$2" | head -1)
+    if [ -n "$i" ]; then
+      c=$(api POST $P/$g/instances/$i/reallocate -o /dev/null -w '%{http_code}')
+      echo "$g instance $i (machine $2...) reallocate: HTTP $c"; [ "$c" = 202 ]; exit; fi
+  done
+  echo "no instance on machine $2..."; exit 1;;
 replicas) CT=application/merge-patch+json api PATCH $P/$2 --data "{\"replicas\": $3}" >/dev/null && echo "$2 replicas $3";;
 logs) q="resource.type = \"container\" and resource.labels.project_name = \"$SALAD_PROJECT\" and resource.labels.container_group_name = \"$2\""
   api POST $A/log-entries --data "$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1],"start_time":sys.argv[2],"end_time":sys.argv[3],"page_size":100,"sort_order":"desc"}))' "$q" $(date -u -d "-${3:-30} min" +%FT%TZ) $(date -u +%FT%TZ))" | python3 -c '

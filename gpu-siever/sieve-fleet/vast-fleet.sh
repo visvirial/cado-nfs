@@ -61,7 +61,7 @@ launch() { # label gpu offer machine bid; runs in the background
 rm -f m*/launching   # launches of an earlier manager are over
 # state; glas processes; seconds since the client last started a work unit (or since boot.out);
 # whether the build ended; the work unit lines of glas-wu
-PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "first $(w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | head -1 | sed "s/.*\[\(.*\)\].*/\1/"); [ -n "$w" ] && echo $(( $(date +%s) - $(date -d "$w" +%s) )) || echo -1)"; echo "upok $(grep -c "Upload of .* succeeded" out/client.log 2>/dev/null)"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
+PROBE='cd /workspace; echo "state [$(cat state 2>/dev/null)]"; echo "procs $(pgrep -xc glas-gpu)"; w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | tail -1 | sed "s/.*\[\(.*\)\].*/\1/"); if [ -n "$w" ]; then t=$(date -d "$w" +%s); else t=$(stat -c %Y boot.out 2>/dev/null || date +%s); fi; echo "age $(( $(date +%s) - t ))"; echo "built $(grep -c ^built out/boot.log 2>/dev/null)"; echo "gotwu $(cat out/client.log 2>/dev/null | grep -c "/workunit to ")"; echo "fetching $(tail -1 out/client.log 2>/dev/null | grep -c "Downloading .*/file/")"; echo "first $(w=$(grep "Subprocess has PID" out/client.log 2>/dev/null | head -1 | sed "s/.*\[\(.*\)\].*/\1/"); [ -n "$w" ] && echo $(( $(date +%s) - $(date -d "$w" +%s) )) || echo -1)"; echo "upok $(grep -c "Upload of .* succeeded" out/client.log 2>/dev/null)"; echo "upfail $(cat out/client.log 2>/dev/null | awk "/Upload of .* succeeded/ {n = 0} /Upload failed/ {n++} END {print n + 0}")"; echo "cmdfail $(cat out/client.log 2>/dev/null | awk "/because the command failed/ {p = 1} /Upload of .* succeeded/ {r[++n] = p; p = 0} END {c = 0; for (i = n; i > n - 3 && i > 0; i--) c += r[i]; print (n >= 3) ? c : 0}")"; cat out/wu.log 2>/dev/null; [ -s state ] && tail -n 15 out/setup.log out/boot.log out/client.log 2>/dev/null | sed "s/^/log| /"'
 export PROBE
 last_health=0; nidle=0
 while :; do
@@ -98,6 +98,12 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
       # the server (a Clore host in Germany got 3 KB/s to it, 2026-11-06)
       uf=$(echo "$s" | awk '/^upfail/{print $2}')
       if [ "${uf:-0}" -ge 10 ]; then bad $l; kill_host $l "uploads failing ($uf in a row)"; continue; fi
+      # the last 3 work units failed in the client (glas exits at once, its wu.log line never
+      # written): such a host takes a work unit every few seconds and fails it, and the server
+      # resubmits a failed one only once (maxwuerror 2), so the ranges are lost (2026-11-07: m202
+      # failed 16842 work units in a day, 10816 ranges left unsieved)
+      cf=$(echo "$s" | awk '/^cmdfail/{print $2}')
+      if [ "${cf:-0}" -ge 3 ]; then bad $l; kill_host $l "work units failing in the client ($cf of the last 3)"; continue; fi
       wus=$(echo "$s" | awk 'NF==6 && !/^log\|/')
       # the last two work units failed: glas-wu should have stopped the client already
       if [ "$(echo "$wus" | awk 'NF==6 {r[++n]=$4} END{print (n>=2 && r[n]!=0 && r[n-1]!=0) ? "y" : "n"}')" = y ]; then

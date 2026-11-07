@@ -106,6 +106,14 @@ for i in json.load(sys.stdin): print(i["id"],i.get("actual_status"),round(i.get(
       ref=${SPQ[$(cat $l/gpu)]:-}
       if [ -n "$spq" ] && [ -n "$ref" ] && python3 -c "import sys;sys.exit(0 if $spq > $ref/0.75 else 1)"; then
         bad $l; kill_host $l "slow: $spq s/sq, $(cat $l/gpu)"; continue; fi
+      # the cost of the special-q this host gives, over at least 4 work units: above CAP by more
+      # than COST_MARGIN (5 %), the host goes and its machine is not rented again. The offer filter
+      # prices a GPU at SPQ_TABLE, but hosts of one model differ (2026-11-07: Vast 5090s from 32 to
+      # 47 $/Msq at $0.53 to $0.71/h)
+      spq4=$(echo "$wus" | awk 'NF==6 && $4==0 && $5>0 {t+=$3; sq+=$5; n++} END{if(n>=4) printf "%.4f", t/sq}')
+      dph=$(echo "$st" | awk -v i=$id '$1==i{print $3}')
+      if [ -n "$spq4" ] && [ -n "$dph" ] && python3 -c "import sys;sys.exit(0 if $dph * $spq4 / 3600e-6 > $CAP * (1 + ${COST_MARGIN:-0.05}) else 1)"; then
+        bad $l; kill_host $l "costly: $(python3 -c "print(round($dph * $spq4 / 3600e-6, 1))") \$/Msq ($spq4 s/sq at \$$dph/h), $(cat $l/gpu)"; continue; fi
       # work units taken but no result in 2.5 times a work unit of the GPU (7000 special-q): the
       # results do not reach the server, or the host is far slower than its GPU (2026-11-06: 11
       # Clore hosts held 4 work units each for 1.4 to 4.2 h without a result)

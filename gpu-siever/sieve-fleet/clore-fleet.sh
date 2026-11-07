@@ -75,6 +75,11 @@ while :; do
       ref=${SPQ[$(cat $d/gpu)]:-}
       if [ -n "$spq" ] && [ -n "$ref" ] && python3 -c "import sys;sys.exit(0 if $spq > $ref/0.75 else 1)"; then
         bad $d; cancel_host $d "slow: $spq s/sq"; continue; fi
+      # the cost of the special-q this host gives, over at least 4 work units, as in vast-fleet.sh
+      spq4=$(echo "$wus" | awk 'NF==6 && $4==0 && $5>0 {t+=$3; sq+=$5; n++} END{if(n>=4) printf "%.4f", t/sq}')
+      dph=$(cat $d/price 2>/dev/null)
+      if [ -n "$spq4" ] && [ -n "$dph" ] && python3 -c "import sys;sys.exit(0 if $dph * $spq4 / 3600e-6 > $CAP * (1 + ${COST_MARGIN:-0.05}) else 1)"; then
+        bad $d; cancel_host $d "costly: $(python3 -c "print(round($dph * $spq4 / 3600e-6, 1))") \$/Msq ($spq4 s/sq at \$$dph/h)"; continue; fi
       # work units taken but no result in 2.5 times a work unit of the GPU (7000 special-q): the
       # results do not reach the server, or the host is far slower than its GPU (2026-11-06: 11
       # Clore hosts held 4 work units each for 1.4 to 4.2 h without a result)

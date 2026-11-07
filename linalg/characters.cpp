@@ -367,28 +367,6 @@ struct big_characters_data {
         return nrows;
     }
 
-    /* Read the full decompressed purged file into one buffer. */
-    static std::vector<char> read_all_bytes(std::string const & name)
-    {
-        FILE * f = fopen_maybe_compressed(name.c_str(), "r");
-        ASSERT_ALWAYS(f != nullptr);
-        std::vector<char> buf;
-        for(;;) {
-            constexpr size_t chunk = size_t(1) << 24;
-            size_t const old = buf.size();
-            buf.resize(old + chunk);
-            size_t const nr = fread(buf.data() + old, 1, chunk, f);
-            buf.resize(old + nr);
-            if (nr < chunk) break;
-        }
-        ASSERT_ALWAYS(!ferror(f));
-        fclose_maybe_compressed(f, name.c_str());
-        ASSERT_ALWAYS(!buf.empty());
-        if (buf.back() != '\n')
-            buf.push_back('\n');
-        return buf;
-    }
-
     static void run_on_threads(size_t T, std::function<void(size_t)> const & f)
     {
         std::vector<std::thread> pool;
@@ -412,10 +390,13 @@ struct big_characters_data {
     /* For each rel, read the a,b-pair, compute the characters and
      * store them in res.
      *
-     * Each thread parses one byte range of the file. A range starts at
-     * the start of a line. A first pass counts the relations in each
-     * range, so that each relation gets the same row number as with a
-     * serial read.
+     * The decompressed file is read in chunks of CHARACTERS_CHUNK_MB
+     * (default 4096) megabytes, cut at a line boundary, so that memory
+     * stays bounded (the purged file of RSA-270, some 6e9 relations,
+     * is about 1.7 TB decompressed). Each thread parses one byte range
+     * of a chunk. A range starts at the start of a line. A first pass
+     * counts the relations in each range, so that each relation gets
+     * the same row number as with a serial read.
      */
     template<typename relation_type>
     void filter(int nthreads) {
@@ -423,40 +404,78 @@ struct big_characters_data {
                            res.nrows(), purgedname, chars.size());
 
         double const wct = wct_seconds();
-        std::vector<char> const buf = read_all_bytes(purgedname);
-        fmt::print(stderr, "Read {} bytes from {} at wct={:.1f}s\n",
-                           buf.size(), purgedname, wct_seconds() - wct);
+        size_t chunk = size_t(4096) << 20;
+        if (const char * e = getenv("CHARACTERS_CHUNK_MB"))
+            chunk = std::max<size_t>(1, strtoull(e, nullptr, 0)) << 20;
+        FILE * f = fopen_maybe_compressed(purgedname.c_str(), "r");
+        ASSERT_ALWAYS(f != nullptr);
 
         size_t const T = std::max(nthreads, 1);
-        std::vector<size_t> range(T + 1, buf.size());
+        std::vector<char> buf;
+        uint64_t num = 0;
+        size_t total_bytes = 0;
+        for(bool eof = false ; !eof ; ) {
+            /* buf holds the partial line left by the previous chunk */
+            size_t const old = buf.size();
+            buf.resize(old + chunk);
+            size_t const nr = fread(buf.data() + old, 1, chunk, f);
+            ASSERT_ALWAYS(!ferror(f));
+            buf.resize(old + nr);
+            total_bytes += nr;
+            eof = nr < chunk;
+            size_t end;
+            if (eof) {
+                if (!buf.empty() && buf.back() != '\n')
+                    buf.push_back('\n');
+                end = buf.size();
+            } else {
+                const char * nl = (const char *) memrchr(buf.data(), '\n', buf.size());
+                end = nl ? size_t(nl - buf.data()) + 1 : 0;
+            }
+            if (end)
+                num += parse_range<relation_type>(buf, end, num, T);
+            buf.erase(buf.begin(), buf.begin() + end);
+        }
+        fclose_maybe_compressed(f, purgedname.c_str());
+        ASSERT_ALWAYS(num == res.nrows());
+        fmt::print(stderr, "Parsed {} relations ({} bytes) with {} threads at wct={:.1f}s\n",
+                           num, total_bytes, T, wct_seconds() - wct);
+    }
+
+    /* the relations of buf[0..end), whole lines, the first one being
+     * relation number num0; returns how many there were */
+    template<typename relation_type>
+    uint64_t parse_range(std::vector<char> const & buf, size_t end, uint64_t num0, size_t T)
+    {
+        std::vector<size_t> range(T + 1, end);
         range[0] = 0;
         for(size_t i = 1 ; i < T ; i++) {
-            size_t const pos = i * (buf.size() / T);
-            const char * nl = (const char *) memchr(buf.data() + pos, '\n', buf.size() - pos);
-            range[i] = nl ? size_t(nl - buf.data()) + 1 : buf.size();
+            size_t const pos = std::max(i * (end / T), range[i-1]);
+            const char * nl = pos < end ? (const char *) memchr(buf.data() + pos, '\n', end - pos) : nullptr;
+            range[i] = nl ? size_t(nl - buf.data()) + 1 : end;
         }
 
-        auto next_line = [&](size_t pos, size_t end) {
-            const char * nl = (const char *) memchr(buf.data() + pos, '\n', end - pos);
+        auto next_line = [&](size_t pos, size_t stop) {
+            const char * nl = (const char *) memchr(buf.data() + pos, '\n', stop - pos);
             return size_t(nl - buf.data()) + 1;
         };
         auto is_relation = [&](size_t pos) {
             return buf[pos] != '#' && buf[pos] != '\n';
         };
 
-        std::vector<size_t> base(T + 1, 0);
+        std::vector<uint64_t> base(T + 1, 0);
         run_on_threads(T, [&](size_t i) {
-            size_t n = 0;
+            uint64_t n = 0;
             for(size_t pos = range[i] ; pos < range[i+1] ; pos = next_line(pos, range[i+1]))
                 n += is_relation(pos);
             base[i + 1] = n;
         });
         std::partial_sum(base.begin(), base.end(), base.begin());
-        ASSERT_ALWAYS(base[T] == res.nrows());
+        ASSERT_ALWAYS(num0 + base[T] <= res.nrows());
 
         run_on_threads(T, [&](size_t i) {
             relation_type rel;
-            rel.num = base[i];
+            rel.num = num0 + base[i];
             for(size_t pos = range[i] ; pos < range[i+1] ; pos = next_line(pos, range[i+1])) {
                 if (!is_relation(pos))
                     continue;
@@ -468,8 +487,7 @@ struct big_characters_data {
                 rel.num++;
             }
         });
-        fmt::print(stderr, "Parsed {} relations with {} threads at wct={:.1f}s\n",
-                           base[T], T, wct_seconds() - wct);
+        return base[T];
     }
 };
 

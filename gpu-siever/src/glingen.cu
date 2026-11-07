@@ -815,6 +815,20 @@ static int devices()
         int n;
         CUDA_CHECK(cudaGetDeviceCount(&n));
         n = std::min(n, MAX_DEV);
+        if (const char * env = getenv("GLINGEN_GPUS")) n = std::max(1, std::min(n, atoi(env)));
+        /* the transforms spread over the devices read each other's
+         * memory: without peer access between every pair (GPUs on PCIe
+         * without P2P, e.g. 4 x RTX 3090), keep to the first device */
+        for (int q = 0; q < n && n > 1; q++)
+            for (int r = 0; r < n; r++) {
+                int ok = 0;
+                if (r != q) CUDA_CHECK(cudaDeviceCanAccessPeer(&ok, q, r));
+                if (r != q && !ok) {
+                    fprintf(stderr, "# glingen: no peer access from device %d to %d, using one device\n", q, r);
+                    n = 1;
+                    break;
+                }
+            }
         for (int q = 0; q < n; q++) {
             CUDA_CHECK(cudaSetDevice(q));
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[q], cudaStreamNonBlocking));

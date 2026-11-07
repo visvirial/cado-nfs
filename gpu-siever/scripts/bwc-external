@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Linear algebra launcher for cadofactor when bwc runs elsewhere (a GPU
+# cluster, scripts/la-run), so that the filter host need not stay up for it:
+#
+#   tasks.linalg.bwc.execpath=<this directory> tasks.linalg.bwc.execbin=bwc-external
+#
+# cadofactor calls it as it would call bwc.pl (:complete matrix=<m> wdir=<w>
+# ...). Without <w>/W it prints the files to copy to the cluster and fails,
+# so cado-nfs.py stops right after the filter. Once the kernel of the
+# cluster run (its <wdir>/W) is copied to <w>/W, the same cado-nfs.py command
+# (or cado-nfs.py <workdir>/<name>.parameters_snapshot.<k>) finds it, checks
+# its size against the matrix, and goes on to the characters and the square
+# root.
+set -Eeuo pipefail
+matrix= wdir=
+for a in "$@"; do
+  case "$a" in
+    matrix=*) matrix=${a#matrix=} ;;
+    wdir=*) wdir=${a#wdir=} ;;
+  esac
+done
+: "${matrix:?no matrix= argument}" "${wdir:?no wdir= argument}"
+stem=${matrix%.bin}
+rw=$stem.rw.bin
+# W holds 64 kernel vectors, one 64-bit word per matrix row (nullspace=left)
+nrows=$(( $(stat -c %s "$rw") / 4 ))
+want=$(( nrows * 8 ))
+if [ -f "$wdir/W" ]; then
+  have=$(stat -c %s "$wdir/W")
+  if [ "$have" -ne "$want" ]; then
+    echo "bwc-external: $wdir/W has $have bytes, the matrix of $nrows rows needs $want" >&2
+    exit 1
+  fi
+  n=$(( have < 67108864 ? have : 67108864 ))
+  if cmp -s -n "$n" "$wdir/W" /dev/zero; then
+    echo "bwc-external: $wdir/W starts with 64 MB of zeros" >&2
+    exit 1
+  fi
+  echo "bwc-external: using $wdir/W ($nrows rows), computed outside cadofactor"
+  exit 0
+fi
+cat >&2 <<EOF
+bwc-external: no kernel yet. Copy to the linear algebra cluster:
+  $matrix ($(du -h "$matrix" | cut -f1))
+  $rw
+  $stem.cw.bin
+run scripts/la-run there with LA_MATRIX pointing to the copy of $(basename "$matrix"),
+and copy its <LA_WDIR>/W ($want bytes; a symbolic link to W.sols0-64, so cp -L) to
+  $wdir/W
+then run cado-nfs.py again with the same arguments.
+EOF
+exit 1

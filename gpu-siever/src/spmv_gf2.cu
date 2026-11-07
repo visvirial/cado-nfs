@@ -3802,11 +3802,18 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
         resplit_probed(m, asrc);
     double const t0 = now();
     spmv_dev & r = m->devs[0];
+    /* The first device reads a source mirror on its own device in place
+     * and writes into a destination mirror on its own device, so it
+     * needs no scratch for them: with one device per instance (one GPU
+     * per MPI rank) the two scratch buffers of each vector would only
+     * duplicate the mirrors. The other devices always need theirs. */
+    bool const src_local = asrc && asrc->device == r.device;
+    bool const dst_local = adst && adst->device == r.device;
     uint64_t ** const vsrc = scratch(m, m->vsrc, asrc,
-            [&](size_t) { return (size_t) nsrc; });
+            [&](size_t d) { return d || !src_local ? (size_t) nsrc : 0; });
     uint64_t ** const vdst = scratch(m, m->vdst, adst,
-            [&](size_t d) { return std::max<size_t>(out_rows(m, d),
-                    d ? 0 : ndst); });
+            [&](size_t d) { return d ? out_rows(m, d)
+                    : dst_local ? 0 : std::max<size_t>(out_rows(m, 0), ndst); });
     pieces_release(m, adst);
     std::vector<bwc_device_band> const sb = src_bands(asrc);
     bool const in_place = asrc && asrc->device == r.device;
@@ -4008,10 +4015,14 @@ void spmv_gf2_scatter(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
     if (!asrc || !adst)
         copies.lock();
     spmv_dev & r = m->devs[0];
+    /* as in spmv_gf2_gather: no scratch on the first device for a
+     * mirror that lives on it */
+    bool const src_local = asrc && asrc->device == r.device;
+    bool const dst_local = adst && adst->device == r.device;
     uint64_t ** const vsrc = scratch(m, m->vsrc, asrc,
-            [&](size_t) { return (size_t) nsrc; });
+            [&](size_t d) { return d || !src_local ? (size_t) nsrc : 0; });
     uint64_t ** const vdst = scratch(m, m->vdst, adst,
-            [&](size_t) { return (size_t) ndst; });
+            [&](size_t d) { return d || !dst_local ? (size_t) ndst : 0; });
     pieces_release(m, adst);
     replicas_release(m, asrc);
     std::vector<bwc_device_band> const sb = src_bands(asrc);

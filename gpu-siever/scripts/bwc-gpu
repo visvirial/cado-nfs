@@ -9,10 +9,25 @@
 # from the parameter file and appends the GPU configuration:
 #
 #   BWC_LA_BUILD   the MPI build tree of cado-nfs (build.sh: $CADO_LA_BUILD)
-#   BWC_MPI        the process grid, one rank per node (default 1x1)
+#   BWC_MPI        the process grid (default 1x1)
 #   BWC_HOSTS      the hosts of the grid, comma separated (default: this host)
+#   BWC_RANKS_PER_HOST  ranks on each host (default 1). Above 1 every rank
+#                  drives one GPU (SPMV_GF2_NGPU=1, the device of its local
+#                  rank). bwc.pl starts the ranks round robin over the hosts
+#                  (--map-by node) and rank r sits at row r / C, column r % C
+#                  of the grid RxC, so with H hosts of G ranks give the grid
+#                  as G x H: a column then lies on one host (NVLink) and a row
+#                  spreads over the hosts. The run prints the node of every
+#                  grid cell at its start.
 #   BWC_MPI_EXTRA  extra mpirun arguments (transport, -x NAME exports)
 #   BWC_INTERVAL   the checkpoint interval (default 1024)
+#   BWC_SIMD       the width of one Krylov sequence (default n, at most 256):
+#                  the GPU product at width 256 does 3.4 times the work of
+#                  width 64 per second, and bwc.pl runs n/simd sequences.
+#                  mksol and gather get solutions=0-64 unless told otherwise
+#   BWC_LINGEN     the lingen program (default glingen; lingen_b64 runs on
+#                  the CPU, e.g. where glingen's product kernel does not fit
+#                  the shared memory of the device, as on sm_86)
 #   BWC_EXTRA      verbatim bwc.pl arguments appended last
 #   SPMV_GF2_NGPU  the devices of one rank (default: the GPUs of this host)
 #
@@ -25,23 +40,50 @@ la_build=${BWC_LA_BUILD:?BWC_LA_BUILD is required: the MPI build tree of cado-nf
 mpi=${BWC_MPI:-1x1}
 hosts=${BWC_HOSTS:-$(hostname)}
 interval=${BWC_INTERVAL:-1024}
-ngpu=${SPMV_GF2_NGPU:-$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)}
+rph=${BWC_RANKS_PER_HOST:-1}
+if (( rph > 1 )); then ngpu=${SPMV_GF2_NGPU:-1}
+else ngpu=${SPMV_GF2_NGPU:-$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)}; fi
 export SPMV_GF2_NGPU=$ngpu
-export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$(nproc)}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$(( $(nproc) / rph > 0 ? $(nproc) / rph : 1 ))}
 
-args=()
+args=(); wdir=.
 for a in "$@"; do
   case "$a" in
     thr=*|interval=*) ;;
+    wdir=*) wdir=${a#wdir=}; args+=("$a") ;;
     *) args+=("$a") ;;
   esac
 done
-args+=(mpi="$mpi" thr=1x1 hosts="$hosts" interval="$interval"
-       mm_impl=cuda krylov_prog=gkrylov mksol_prog=gmksol lingen_prog=glingen
+if (( rph > 1 )); then
+  # a host file with the slots of every host, instead of hosts= (one slot each)
+  mkdir -p "$wdir"; tr ',' '\n' <<< "$hosts" | sed "/^$/d; s/\$/ slots=$rph/" > "$wdir/hostfile"
+  args+=(hostfile="$wdir/hostfile")
+else
+  args+=(hosts="$hosts")
+fi
+args+=(mpi="$mpi" thr=1x1 interval="$interval"
+       mm_impl=cuda krylov_prog=gkrylov mksol_prog=gmksol lingen_prog="${BWC_LINGEN:-glingen}"
        lingen_thr=8x8)
+# one Krylov sequence as wide as n (bwc.pl's default is 64)
+# (unless the arguments or BWC_EXTRA give one: bwc.pl takes each parameter once)
+if [[ " $* ${BWC_EXTRA:-} " != *" simd="* ]]; then
+  if [ -n "${BWC_SIMD:-}" ]; then args+=(simd="$BWC_SIMD")
+  else
+    w=; for a in "$@"; do case "$a" in n=*|mn=*) w=${a#*=} ;; esac; done
+    if [ -n "$w" ]; then (( w > 256 )) && w=256; args+=(simd="$w"); fi
+  fi
+fi
+# mksol and gather on 64 solutions: bwc.pl's default is solutions=0-<simd>,
+# but the device combine of mksol handles 64 columns only (wider ones go
+# to the host: 193 ms per iteration against 15 for Krylov on 4 x RTX 3090,
+# 2026-11-07), 64 kernel vectors are what cadofactor uses (W.sols0-64),
+# and wider solutions cost more for nothing
+if [[ " $* ${BWC_EXTRA:-} " != *" solutions="* ]]; then args+=(solutions=0-64); fi
 ranks=$(( ${mpi%x*} * ${mpi#*x} ))
 if (( ranks > 1 )); then
-  args+=(comm_impl=nccl "mpi_extra_args=-x SPMV_GF2_NGPU -x OMP_NUM_THREADS${BWC_MPI_EXTRA:+ $BWC_MPI_EXTRA}")
+  # the GPU and NCCL settings of this shell go to every rank
+  xs=$(env | sed -n 's/^\(SPMV_GF2_[A-Z0-9_]*\|BWC_NCCL_[A-Z0-9_]*\|NCCL_[A-Z0-9_]*\|OMP_NUM_THREADS\)=.*/-x \1/p' | sort -u | tr '\n' ' ')
+  args+=(comm_impl=nccl "mpi_extra_args=$xs${BWC_MPI_EXTRA:+ $BWC_MPI_EXTRA}")
 fi
 if [ -n "${BWC_EXTRA:-}" ]; then
   # shellcheck disable=SC2206

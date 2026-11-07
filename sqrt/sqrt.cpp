@@ -687,12 +687,15 @@ calculateSqrtRat (std::string const & prefix, unsigned int numdep, cxx_cado_poly
   cxx_mpz prod;
 
   /* The full product can exceed what an mpz_t holds (its limb count is
-   * an int, so at most 2^31-1 limbs; a large factorization with 1e9
-   * relations of 155 bits each needs more). The two halves of the product fit, so
-   * accumulate them separately, and form the full product and its
-   * square root with mpn calls, whose counts are mp_size_t.
+   * an int, so at most 2^31-1 limbs), and so can half of it: RSA-270
+   * gives about 3e9 (a,b) pairs of 161 bits each, 4.8e11 bits. The
+   * leaves are therefore split into as many consecutive parts as it
+   * takes for each part to stay below SQRT_PART_LIMBS limbs (default
+   * 2^30), each part is accumulated as an mpz, and the parts are
+   * multiplied together, and the square root taken, with mpn calls,
+   * whose counts are mp_size_t.
    */
-  cxx_mpz half0, half1;
+  std::vector<cxx_mpz> parts;
   {
       const cxx_mpz_functions M(F);
       const std::string message = fmt::format("Rat({})", numdep);
@@ -701,38 +704,86 @@ calculateSqrtRat (std::string const & prefix, unsigned int numdep, cxx_cado_poly
               get_depname (prefix, "", numdep),
               M, message, nab, nfree);
 
-      std::vector<cxx_mpz> prd1(
-              std::make_move_iterator(prd.begin() + prd.size() / 2),
-              std::make_move_iterator(prd.end()));
-      prd.erase(prd.begin() + prd.size() / 2, prd.end());
-      half0 = prd.empty() ? cxx_mpz(1) : accumulate(prd, M, message + " half 0");
-      half1 = prd1.empty() ? cxx_mpz(1) : accumulate(prd1, M, message + " half 1");
+      size_t part_limbs = size_t(1) << 30;
+      if (const char * e = getenv("SQRT_PART_LIMBS"))
+          part_limbs = std::max<size_t>(1, strtoull(e, nullptr, 0));
+      size_t total = 0;
+      for (auto const & x : prd)
+          total += mpz_size(x);
+      /* a product has at most the sum of the sizes of its factors */
+      size_t const nparts = std::max<size_t>(2, iceildiv(total, part_limbs));
+      size_t const target = iceildiv(total, nparts);
+      std::vector<std::vector<cxx_mpz>> groups(1);
+      size_t acc = 0;
+      for (auto & x : prd) {
+          size_t const sz = mpz_size(x);
+          if (acc && acc + sz > target && groups.size() < nparts) {
+              groups.emplace_back();
+              acc = 0;
+          }
+          groups.back().emplace_back(std::move(x));
+          acc += sz;
+      }
+      prd.clear();
+      {
+          const std::scoped_lock<std::mutex> dummy(stdio_guard);
+          fmt::print (stderr, "{}: {} limbs in the leaves, {} parts of at most {} limbs\n",
+                  message, total, groups.size(), part_limbs);
+      }
+      for (size_t i = 0 ; i < groups.size() ; i++)
+          parts.emplace_back(accumulate(groups[i], M,
+                      fmt::format("{} part {}", message, i)));
   }
 
   /* we must divide by g1^nab: if the number of (a,b) pairs is odd, we
      multiply by g1, and divide by g1^(nab+1) */
   if (nab & 1U)
-    mpz_mul (half0, half0, mpz_poly_coeff_const(F, 1));
+    mpz_mul (parts[0], parts[0], mpz_poly_coeff_const(F, 1));
 
-  if (mpz_sgn (half0) * mpz_sgn (half1) < 0)
+  int sign = 1;
+  for (auto const & x : parts)
+      sign *= mpz_sgn(x);
+  if (sign < 0)
     {
       fmt::print (stderr, "Error, product is negative: try another dependency\n");
       exit(EXIT_FAILURE);
     }
 
-  const mp_size_t n0 = mpz_size(half0);
-  const mp_size_t n1 = mpz_size(half1);
-  ASSERT_ALWAYS(n0 > 0 && n1 > 0);
-  mp_size_t np = n0 + n1;
-  std::unique_ptr<mp_limb_t[]> P(new mp_limb_t[np]);
-  if (n0 >= n1)
-      par_mul(P.get(), mpz_limbs_read(half0), n0, mpz_limbs_read(half1), n1);
-  else
-      par_mul(P.get(), mpz_limbs_read(half1), n1, mpz_limbs_read(half0), n0);
-  mpz_realloc2 (half0, 1);
-  mpz_realloc2 (half1, 1);
-  while (np > 0 && P[np - 1] == 0)
-      np--;
+  /* the product of the parts, as a tree of mpn products */
+  struct limbs {
+      std::unique_ptr<mp_limb_t[]> p;
+      mp_size_t n;
+  };
+  std::vector<limbs> lv;
+  for (auto & x : parts) {
+      mp_size_t const n = mpz_size(x);
+      ASSERT_ALWAYS(n > 0);
+      limbs l { std::unique_ptr<mp_limb_t[]>(new mp_limb_t[n]), n };
+      mpn_copyi(l.p.get(), mpz_limbs_read(x), n);
+      mpz_realloc2 (x, 1);
+      lv.push_back(std::move(l));
+  }
+  parts.clear();
+  while (lv.size() > 1) {
+      std::vector<limbs> next;
+      for (size_t i = 0 ; i + 1 < lv.size() ; i += 2) {
+          limbs & a = lv[i].n >= lv[i+1].n ? lv[i] : lv[i+1];
+          limbs & b = lv[i].n >= lv[i+1].n ? lv[i+1] : lv[i];
+          mp_size_t np = a.n + b.n;
+          limbs r { std::unique_ptr<mp_limb_t[]>(new mp_limb_t[np]), np };
+          par_mul(r.p.get(), a.p.get(), a.n, b.p.get(), b.n);
+          a.p.reset(); b.p.reset();
+          while (r.n > 0 && r.p[r.n - 1] == 0)
+              r.n--;
+          next.push_back(std::move(r));
+      }
+      if (lv.size() & 1)
+          next.push_back(std::move(lv.back()));
+      lv = std::move(next);
+  }
+  std::unique_ptr<mp_limb_t[]> P = std::move(lv[0].p);
+  mp_size_t np = lv[0].n;
+  lv.clear();
   ASSERT_ALWAYS(np > 0);
 
 #pragma omp critical
